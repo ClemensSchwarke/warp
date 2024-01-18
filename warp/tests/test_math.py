@@ -5,13 +5,13 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from typing import NamedTuple
 import unittest
+from typing import NamedTuple
 
 import numpy as np
 
 import warp as wp
-from warp.tests.test_base import *
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -84,16 +84,110 @@ def test_scalar_math(test, device):
         )
 
 
-def register(parent):
-    devices = get_test_devices()
+def test_vec_type(test, device):
+    vec5 = wp.vec(length=5, dtype=float)
+    v = vec5()
+    w = vec5()
+    a = vec5(1.0)
+    b = vec5(0.0, 0.0, 0.0, 0.0, 0.0)
+    c = vec5(0.0)
 
-    class TestMath(parent):
-        pass
+    v[0] = 1.0
+    v.x = 0.0
+    v[1:] = [1.0, 1.0, 1.0, 1.0]
 
-    add_function_test(TestMath, "test_scalar_math", test_scalar_math, devices=devices)
-    return TestMath
+    w[0] = 1.0
+    w[1:] = [0.0, 0.0, 0.0, 0.0]
+
+    if v[0] != w[1] or v.x != w.y:
+        raise ValueError("vec setter error")
+
+    for x in v[1:]:
+        if x != 1.0:
+            raise ValueError("vec slicing error")
+
+    if b != c:
+        raise ValueError("vec equality error")
+
+    if str(v) != "[0.0, 1.0, 1.0, 1.0, 1.0]":
+        raise ValueError("vec to string error")
+
+
+def test_mat_type(test, device):
+    mat55 = wp.mat(shape=(5, 5), dtype=float)
+    m1 = mat55()
+    m2 = mat55()
+
+    for i in range(5):
+        for j in range(5):
+            if i == j:
+                m1[i, j] = 1.0
+            else:
+                m1[i, j] = 0.0
+
+    for i in range(5):
+        m2[i] = [1.0, 1.0, 1.0, 1.0, 1.0]
+
+    a = mat55(1.0)
+    b = mat55(
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    )
+
+    if m1 != b:
+        raise ValueError("mat element setting error")
+
+    if m2 != a:
+        raise ValueError("mat row setting error")
+
+    if m1[0, 0] != 1.0:
+        raise ValueError("mat element getting error")
+
+    if m2[0] != [1.0, 1.0, 1.0, 1.0, 1.0]:
+        raise ValueError("mat row getting error")
+
+    if (
+        str(b)
+        != "[[1.0, 0.0, 0.0, 0.0, 0.0],\n [0.0, 1.0, 0.0, 0.0, 0.0],\n [0.0, 0.0, 1.0, 0.0, 0.0],\n [0.0, 0.0, 0.0, 1.0, 0.0],\n [0.0, 0.0, 0.0, 0.0, 1.0]]"
+    ):
+        raise ValueError("mat to string error")
+
+
+devices = get_test_devices()
+
+
+class TestMath(unittest.TestCase):
+    pass
+
+
+add_function_test(TestMath, "test_scalar_math", test_scalar_math, devices=devices)
+add_function_test(TestMath, "test_vec_type", test_vec_type, devices=devices)
+add_function_test(TestMath, "test_mat_type", test_mat_type, devices=devices)
 
 
 if __name__ == "__main__":
-    _ = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

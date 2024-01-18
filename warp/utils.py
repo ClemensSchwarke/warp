@@ -6,11 +6,10 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import cProfile
-import math
 import sys
 import timeit
 import warnings
-from typing import Any, Tuple, Union
+from typing import Any
 
 import numpy as np
 
@@ -31,157 +30,9 @@ def warn(message, category=None, stacklevel=1):
         warnings.warn(message, category, stacklevel + 1)  # Increment stacklevel by 1 since we are in a wrapper
 
 
-def length(a):
-    return np.linalg.norm(a)
-
-
-def length_sq(a):
-    return np.dot(a, a)
-
-
-def cross(a, b):
-    return np.array((a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]), dtype=np.float32)
-
-
-# NumPy has no normalize() method..
-def normalize(v):
-    norm = np.linalg.norm(v)
-    if norm == 0.0:
-        return v
-    return v / norm
-
-
-def skew(v):
-    return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-
-
-# math utils
-# def quat(i, j, k, w):
-#     return np.array([i, j, k, w])
-
-
-def quat_identity():
-    return np.array((0.0, 0.0, 0.0, 1.0))
-
-
-def quat_inverse(q):
-    return np.array((-q[0], -q[1], -q[2], q[3]))
-
-
-def quat_from_axis_angle(axis, angle):
-    v = normalize(np.array(axis))
-
-    half = angle * 0.5
-    w = math.cos(half)
-
-    sin_theta_over_two = math.sin(half)
-    v *= sin_theta_over_two
-
-    return np.array((v[0], v[1], v[2], w))
-
-
-def quat_to_axis_angle(quat):
-    w2 = quat[3] * quat[3]
-    if w2 > 1 - 1e-7:
-        return np.zeros(3), 0.0
-
-    angle = 2 * np.arccos(quat[3])
-    xyz = quat[:3] / np.sqrt(1 - w2)
-    return xyz, angle
-
-
-# quat_rotate a vector
-def quat_rotate(q, x):
-    x = np.array(x)
-    axis = np.array((q[0], q[1], q[2]))
-    return x * (2.0 * q[3] * q[3] - 1.0) + np.cross(axis, x) * q[3] * 2.0 + axis * np.dot(axis, x) * 2.0
-
-
-# multiply two quats
-def quat_multiply(a, b):
-    return np.array(
-        (
-            a[3] * b[0] + b[3] * a[0] + a[1] * b[2] - b[1] * a[2],
-            a[3] * b[1] + b[3] * a[1] + a[2] * b[0] - b[2] * a[0],
-            a[3] * b[2] + b[3] * a[2] + a[0] * b[1] - b[0] * a[1],
-            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-        )
-    )
-
-
-# convert to mat33
-def quat_to_matrix(q):
-    c1 = quat_rotate(q, np.array((1.0, 0.0, 0.0)))
-    c2 = quat_rotate(q, np.array((0.0, 1.0, 0.0)))
-    c3 = quat_rotate(q, np.array((0.0, 0.0, 1.0)))
-
-    return np.array([c1, c2, c3]).T
-
-
-def quat_rpy(roll, pitch, yaw):
-    cy = math.cos(yaw * 0.5)
-    sy = math.sin(yaw * 0.5)
-    cr = math.cos(roll * 0.5)
-    sr = math.sin(roll * 0.5)
-    cp = math.cos(pitch * 0.5)
-    sp = math.sin(pitch * 0.5)
-
-    w = cy * cr * cp + sy * sr * sp
-    x = cy * sr * cp - sy * cr * sp
-    y = cy * cr * sp + sy * sr * cp
-    z = sy * cr * cp - cy * sr * sp
-
-    return (x, y, z, w)
-
-
-def quat_from_matrix(m):
-    tr = m[0, 0] + m[1, 1] + m[2, 2]
-    h = 0.0
-
-    if tr >= 0.0:
-        h = math.sqrt(tr + 1.0)
-        w = 0.5 * h
-        h = 0.5 / h
-
-        x = (m[2, 1] - m[1, 2]) * h
-        y = (m[0, 2] - m[2, 0]) * h
-        z = (m[1, 0] - m[0, 1]) * h
-
-    else:
-        i = 0
-        if m[1, 1] > m[0, 0]:
-            i = 1
-        if m[2, 2] > m[i, i]:
-            i = 2
-
-        if i == 0:
-            h = math.sqrt((m[0, 0] - (m[1, 1] + m[2, 2])) + 1.0)
-            x = 0.5 * h
-            h = 0.5 / h
-
-            y = (m[0, 1] + m[1, 0]) * h
-            z = (m[2, 0] + m[0, 2]) * h
-            w = (m[2, 1] - m[1, 2]) * h
-
-        elif i == 1:
-            h = math.sqrt((m[1, 1] - (m[2, 2] + m[0, 0])) + 1.0)
-            y = 0.5 * h
-            h = 0.5 / h
-
-            z = (m[1, 2] + m[2, 1]) * h
-            x = (m[0, 1] + m[1, 0]) * h
-            w = (m[0, 2] - m[2, 0]) * h
-
-        elif i == 2:
-            h = math.sqrt((m[2, 2] - (m[0, 0] + m[1, 1])) + 1.0)
-            z = 0.5 * h
-            h = 0.5 / h
-
-            x = (m[2, 0] + m[0, 2]) * h
-            y = (m[1, 2] + m[2, 1]) * h
-            w = (m[1, 0] - m[0, 1]) * h
-
-    return normalize(np.array([x, y, z, w]))
+# expand a 7-vec to a tuple of arrays
+def transform_expand(t):
+    return wp.transform(np.array(t[0:3]), np.array(t[3:7]))
 
 
 @wp.func
@@ -411,6 +262,9 @@ def array_scan(in_array, out_array, inclusive=True):
     if in_array.dtype != out_array.dtype:
         raise RuntimeError("Array data types do not match")
 
+    if in_array.size == 0:
+        return
+
     from warp.context import runtime
 
     if in_array.device.is_cpu:
@@ -432,6 +286,9 @@ def array_scan(in_array, out_array, inclusive=True):
 def radix_sort_pairs(keys, values, count: int):
     if keys.device != values.device:
         raise RuntimeError("Array storage devices do not match")
+
+    if count == 0:
+        return
 
     if keys.size < 2 * count or values.size < 2 * count:
         raise RuntimeError("Array storage must be large enough to contain 2*count elements")
@@ -469,14 +326,19 @@ def runlength_encode(values, run_values, run_lengths, run_count=None, value_coun
     # User can provide a device output array for storing the number of runs
     # For convenience, if no such array is provided, number of runs is returned on host
     if run_count is None:
-        host_return = True
+        if value_count == 0:
+            return 0
         run_count = wp.empty(shape=(1,), dtype=int, device=values.device)
+        host_return = True
     else:
-        host_return = False
         if run_count.device != values.device:
-            raise RuntimeError("run_count storage devices does not match other arrays")
+            raise RuntimeError("run_count storage device does not match other arrays")
         if run_count.dtype != wp.int32:
             raise RuntimeError("run_count array must be of type int32")
+        if value_count == 0:
+            run_count.zero_()
+            return 0
+        host_return = False
 
     from warp.context import runtime
 
@@ -532,6 +394,12 @@ def array_sum(values, out=None, value_count=None, axis=None):
         if out.shape != output_shape:
             raise RuntimeError(f"out array should have shape {output_shape}")
 
+    if value_count == 0:
+        out.zero_()
+        if axis is None and host_return:
+            return out.numpy()[0]
+        return out
+
     from warp.context import runtime
 
     if values.device.is_cpu:
@@ -578,7 +446,7 @@ def array_inner(a, b, out=None, count=None, axis=None):
         raise RuntimeError("Array storage sizes do not match")
 
     if a.device != b.device:
-        raise RuntimeError("Array storage sizes do not match")
+        raise RuntimeError("Array storage devices do not match")
 
     if a.dtype != b.dtype:
         raise RuntimeError("Array data types do not match")
@@ -614,6 +482,12 @@ def array_inner(a, b, out=None, count=None, axis=None):
             raise RuntimeError(f"out array should have type {scalar_type.__name__}")
         if out.shape != output_shape:
             raise RuntimeError(f"out array should have shape {output_shape}")
+
+    if count == 0:
+        if axis is None and host_return:
+            return 0.0
+        out.zero_()
+        return out
 
     from warp.context import runtime
 
@@ -662,29 +536,16 @@ def array_inner(a, b, out=None, count=None, axis=None):
             return out
 
 
-_copy_kernel_cache = dict()
+@wp.kernel
+def _array_cast_kernel(
+    dest: Any,
+    src: Any,
+):
+    i = wp.tid()
+    dest[i] = dest.dtype(src[i])
 
 
 def array_cast(in_array, out_array, count=None):
-    def make_copy_kernel(dest_dtype, src_dtype):
-        import re
-
-        import warp.context
-
-        def copy_kernel(
-            dest: Any,
-            src: Any,
-        ):
-            dest[wp.tid()] = dest_dtype(src[wp.tid()])
-
-        module = wp.get_module(copy_kernel.__module__)
-        key = f"{copy_kernel.__name__}_{warp.context.type_str(src_dtype)}_{warp.context.type_str(dest_dtype)}"
-        key = re.sub("[^0-9a-zA-Z_]+", "", key)
-
-        if key not in _copy_kernel_cache:
-            _copy_kernel_cache[key] = wp.Kernel(func=copy_kernel, key=key, module=module)
-        return _copy_kernel_cache[key]
-
     if in_array.device != out_array.device:
         raise RuntimeError("Array storage devices do not match")
 
@@ -739,8 +600,7 @@ def array_cast(in_array, out_array, count=None):
         # Same data type, can simply copy
         wp.copy(dest=out_array, src=in_array, count=count)
     else:
-        copy_kernel = make_copy_kernel(src_dtype=in_array.dtype, dest_dtype=out_array.dtype)
-        wp.launch(kernel=copy_kernel, dim=dim, inputs=[out_array, in_array], device=out_array.device)
+        wp.launch(kernel=_array_cast_kernel, dim=dim, inputs=[out_array, in_array], device=out_array.device)
 
 
 # code snippet for invoking cProfile
@@ -816,11 +676,8 @@ class MeshAdjacency:
 
         self.edges[key] = edge
 
-    def opposite_vertex(self, edge):
-        pass
 
-
-def mem_report():
+def mem_report(): #pragma: no cover
     def _mem_report(tensors, mem_type):
         """Print the selected tensors of type
         There are two major storage types in our major concern:
@@ -871,12 +728,6 @@ def mem_report():
     _mem_report(host_tensors, "CPU")
     print("=" * LEN)
 
-
-def lame_parameters(E, nu):
-    l = (E * nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
-    mu = E / (2.0 * (1.0 + nu))
-
-    return (l, mu)
 
 
 class ScopedDevice:
@@ -1019,3 +870,17 @@ class ScopedTimer:
                 print("{}{} took {:.2f} ms".format(indent, self.name, self.elapsed))
 
             ScopedTimer.indent -= 1
+
+
+# helper kernels for adj_matmul
+@wp.kernel
+def add_kernel_2d(x: wp.array2d(dtype=Any), acc: wp.array2d(dtype=Any), beta: Any):
+    i, j = wp.tid()
+
+    x[i,j] = x[i,j] + beta * acc[i,j]
+
+@wp.kernel
+def add_kernel_3d(x: wp.array3d(dtype=Any), acc: wp.array3d(dtype=Any), beta: Any):
+    i, j, k = wp.tid()
+
+    x[i,j,k] = x[i,j,k] + beta * acc[i,j,k]

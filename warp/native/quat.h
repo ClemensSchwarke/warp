@@ -19,6 +19,15 @@ struct quat_t
     // zero constructor for adjoint variable initialization
     inline CUDA_CALLABLE quat_t(Type x=Type(0), Type y=Type(0), Type z=Type(0), Type w=Type(0)) : x(x), y(y), z(z), w(w) {}    
     explicit inline CUDA_CALLABLE quat_t(const vec_t<3,Type>& v, Type w=Type(0)) : x(v[0]), y(v[1]), z(v[2]), w(w) {}
+    
+    template<typename OtherType>
+    explicit inline CUDA_CALLABLE quat_t(const quat_t<OtherType>& other)
+    {
+        x = static_cast<Type>(other.x);
+        y = static_cast<Type>(other.y);
+        z = static_cast<Type>(other.z);
+        w = static_cast<Type>(other.w);
+    }
 
     // imaginary part
     Type x;
@@ -73,7 +82,17 @@ inline CUDA_CALLABLE void adj_quat_t(const vec_t<3,Type>& v, Type w, vec_t<3,Typ
     adj_v[0] += adj_ret.x;
     adj_v[1] += adj_ret.y;
     adj_v[2] += adj_ret.z;
-    adj_w   += adj_ret.w;
+    adj_w    += adj_ret.w;
+}
+
+// casting constructor adjoint
+template<typename Type, typename OtherType>
+inline CUDA_CALLABLE void adj_quat_t(const quat_t<OtherType>& other, quat_t<OtherType>& adj_other, const quat_t<Type>& adj_ret)
+{
+    adj_other.x += static_cast<OtherType>(adj_ret.x);
+    adj_other.y += static_cast<OtherType>(adj_ret.y);
+    adj_other.z += static_cast<OtherType>(adj_ret.z);
+    adj_other.w += static_cast<OtherType>(adj_ret.w);
 }
 
 // forward methods
@@ -207,9 +226,21 @@ inline CUDA_CALLABLE quat_t<Type> div(quat_t<Type> q, Type s)
 }
 
 template<typename Type>
+inline CUDA_CALLABLE quat_t<Type> div(Type s, quat_t<Type> q)
+{
+    return quat_t<Type>(s/q.x, s/q.y, s/q.z, s/q.w);
+}
+
+template<typename Type>
 inline CUDA_CALLABLE quat_t<Type> operator / (quat_t<Type> a, Type s)
 {
     return div(a,s);
+}
+
+template<typename Type>
+inline CUDA_CALLABLE quat_t<Type> operator / (Type s, quat_t<Type> a)
+{
+    return div(s,a);
 }
 
 template<typename Type>
@@ -321,7 +352,7 @@ inline CUDA_CALLABLE quat_t<Type> quat_from_matrix(const mat_t<3,3,Type>& m)
 }
 
 template<typename Type>
-inline CUDA_CALLABLE Type index(const quat_t<Type>& a, int idx)
+inline CUDA_CALLABLE Type extract(const quat_t<Type>& a, int idx)
 {
 #if FP_CHECK
     if (idx < 0 || idx > 3)
@@ -357,7 +388,7 @@ CUDA_CALLABLE inline void adj_lerp(const quat_t<Type>& a, const quat_t<Type>& b,
 }
 
 template<typename Type>
-inline CUDA_CALLABLE void adj_index(const quat_t<Type>& a, int idx, quat_t<Type>& adj_a, int & adj_idx, Type & adj_ret)
+inline CUDA_CALLABLE void adj_extract(const quat_t<Type>& a, int idx, quat_t<Type>& adj_a, int & adj_idx, Type & adj_ret)
 {
 #if FP_CHECK
     if (idx < 0 || idx > 3)
@@ -367,7 +398,7 @@ inline CUDA_CALLABLE void adj_index(const quat_t<Type>& a, int idx, quat_t<Type>
     }
 #endif
 
-    // See wp::index(const quat_t<Type>& a, int idx) note
+    // See wp::extract(const quat_t<Type>& a, int idx) note
     if (idx == 0)       {adj_a.x += adj_ret;}
     else if (idx == 1)  {adj_a.y += adj_ret;}
     else if (idx == 2)  {adj_a.z += adj_ret;}
@@ -504,9 +535,14 @@ inline CUDA_CALLABLE void tensordot(const quat_t<Type>& a, const quat_t<Type>& b
 }
 
 template<typename Type>
-inline CUDA_CALLABLE void adj_length(const quat_t<Type>& a, quat_t<Type>& adj_a, const Type adj_ret)
+inline CUDA_CALLABLE void adj_length(const quat_t<Type>& a, Type ret, quat_t<Type>& adj_a, const Type adj_ret)
 {
-    adj_a += normalize(a)*adj_ret;
+    if (ret > Type(kEps))
+    {
+        Type inv_l = Type(1)/ret;
+
+        adj_a += quat_t<Type>(a.x*inv_l, a.y*inv_l, a.z*inv_l, a.w*inv_l) * adj_ret;
+    }
 }
 
 template<typename Type>
@@ -590,6 +626,13 @@ inline CUDA_CALLABLE void adj_div(quat_t<Type> a, Type s, quat_t<Type>& adj_a, T
 }
 
 template<typename Type>
+inline CUDA_CALLABLE void adj_div(Type s, quat_t<Type> a, Type& adj_s, quat_t<Type>& adj_a, const quat_t<Type>& adj_ret)
+{
+    adj_s -= dot(a, adj_ret)/ (s * s); // - a / s^2
+    adj_a += s / adj_ret;
+}
+
+template<typename Type>
 inline CUDA_CALLABLE void adj_quat_rotate(const quat_t<Type>& q, const vec_t<3,Type>& p, quat_t<Type>& adj_q, vec_t<3,Type>& adj_p, const vec_t<3,Type>& adj_ret)
 {
 
@@ -658,7 +701,7 @@ inline CUDA_CALLABLE void adj_quat_rotate_inv(const quat_t<Type>& q, const vec_t
 }
 
 template<typename Type>
-inline CUDA_CALLABLE void adj_quat_slerp(const quat_t<Type>& q0, const quat_t<Type>& q1, Type t, quat_t<Type>& adj_q0, quat_t<Type>& adj_q1, Type& adj_t, const quat_t<Type>& adj_ret)
+inline CUDA_CALLABLE void adj_quat_slerp(const quat_t<Type>& q0, const quat_t<Type>& q1, Type t, quat_t<Type>& ret, quat_t<Type>& adj_q0, quat_t<Type>& adj_q1, Type& adj_t, const quat_t<Type>& adj_ret)
 {
     vec_t<3,Type> axis;
     Type angle;
@@ -669,7 +712,7 @@ inline CUDA_CALLABLE void adj_quat_slerp(const quat_t<Type>& q0, const quat_t<Ty
     angle = angle * 0.5;
     
     // adj_t
-    adj_t += dot(mul(quat_slerp(q0, q1, t), quat_t<Type>(angle*axis[0], angle*axis[1], angle*axis[2], Type(0))), adj_ret);
+    adj_t += dot(mul(ret, quat_t<Type>(angle*axis[0], angle*axis[1], angle*axis[2], Type(0))), adj_ret);
 
     // adj_q0
     quat_t<Type> q_inc_x_q0;

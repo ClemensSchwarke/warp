@@ -45,7 +45,7 @@ def parse_mjcf(
     Args:
         mjcf_filename (str): The filename of the MuJoCo file to parse.
         builder (ModelBuilder): The :class:`ModelBuilder` to add the bodies and joints to.
-        xform (wp.transform): The transform to apply to the imported mechanism.
+        xform (:ref:`transform <transform>`): The transform to apply to the imported mechanism.
         density (float): The density of the shapes in kg/m^3 which will be used to calculate the body mass and inertia.
         stiffness (float): The stiffness of the joints.
         damping (float): The damping of the joints.
@@ -151,9 +151,15 @@ def parse_mjcf(
 
     def parse_vec(attrib, key, default):
         if key in attrib:
-            return np.fromstring(attrib[key], sep=" ")
+            out = np.fromstring(attrib[key], sep=" ", dtype=np.float32)
         else:
-            return np.array(default)
+            out = np.array(default, dtype=np.float32)
+
+        length = len(out)
+        if length == 1:
+            return wp.vec(len(default), wp.float32)(out[0], out[0], out[0])
+
+        return wp.vec(length, wp.float32)(out)
 
     def parse_orientation(attrib):
         if "quat" in attrib:
@@ -233,15 +239,20 @@ def parse_mjcf(
         angular_axes = []
         joint_type = None
 
-        joints = body.findall("joint")
-        for i, joint in enumerate(joints):
-            if "joint" in defaults:
-                joint_attrib = merge_attrib(defaults["joint"], joint.attrib)
-            else:
-                joint_attrib = joint.attrib
+        freejoint_tags = body.findall("freejoint")
+        if len(freejoint_tags) > 0:
+            joint_type = wp.sim.JOINT_FREE
+            joint_name.append(freejoint_tags[0].attrib.get("name", f"{body_name}_freejoint"))
+        else:
+            joints = body.findall("joint")
+            for i, joint in enumerate(joints):
+                if "joint" in defaults:
+                    joint_attrib = merge_attrib(defaults["joint"], joint.attrib)
+                else:
+                    joint_attrib = joint.attrib
 
-            # default to hinge if not specified
-            joint_type_str = joint_attrib.get("type", "hinge")
+                # default to hinge if not specified
+                joint_type_str = joint_attrib.get("type", "hinge")
 
             joint_name.append(joint_attrib["name"])
             joint_pos.append(parse_vec(joint_attrib, "pos", (0.0, 0.0, 0.0)) * scale)
@@ -251,31 +262,31 @@ def parse_mjcf(
             else:
                 joint_armature.append(armature_joint * armature_scale)
 
-            if joint_type_str == "free":
-                joint_type = wp.sim.JOINT_FREE
-                break
-            if joint_type_str == "fixed":
-                joint_type = wp.sim.JOINT_FIXED
-                break
-            is_angular = joint_type_str == "hinge"
-            mode = wp.sim.JOINT_MODE_LIMIT
-            if stiffness > 0.0 or "stiffness" in joint_attrib:
-                mode = wp.sim.JOINT_MODE_TARGET_POSITION
-            axis_vec = parse_vec(joint_attrib, "axis", (0.0, 0.0, 0.0))
-            ax = wp.sim.model.JointAxis(
-                axis=axis_vec,
-                limit_lower=(np.deg2rad(joint_range[0]) if is_angular and use_degrees else joint_range[0]),
-                limit_upper=(np.deg2rad(joint_range[1]) if is_angular and use_degrees else joint_range[1]),
-                target_ke=parse_float(joint_attrib, "stiffness", stiffness),
-                target_kd=parse_float(joint_attrib, "damping", damping),
-                limit_ke=limit_ke,
-                limit_kd=limit_kd,
-                mode=mode,
-            )
-            if is_angular:
-                angular_axes.append(ax)
-            else:
-                linear_axes.append(ax)
+                if joint_type_str == "free":
+                    joint_type = wp.sim.JOINT_FREE
+                    break
+                if joint_type_str == "fixed":
+                    joint_type = wp.sim.JOINT_FIXED
+                    break
+                is_angular = joint_type_str == "hinge"
+                mode = wp.sim.JOINT_MODE_LIMIT
+                if stiffness > 0.0 or "stiffness" in joint_attrib:
+                    mode = wp.sim.JOINT_MODE_TARGET_POSITION
+                axis_vec = parse_vec(joint_attrib, "axis", (0.0, 0.0, 0.0))
+                ax = wp.sim.model.JointAxis(
+                    axis=axis_vec,
+                    limit_lower=(np.deg2rad(joint_range[0]) if is_angular and use_degrees else joint_range[0]),
+                    limit_upper=(np.deg2rad(joint_range[1]) if is_angular and use_degrees else joint_range[1]),
+                    target_ke=parse_float(joint_attrib, "stiffness", stiffness),
+                    target_kd=parse_float(joint_attrib, "damping", damping),
+                    limit_ke=limit_ke,
+                    limit_kd=limit_kd,
+                    mode=mode,
+                )
+                if is_angular:
+                    angular_axes.append(ax)
+                else:
+                    linear_axes.append(ax)
 
         link = builder.add_body(
             origin=wp.transform(body_pos, body_ori),  # will be evaluated in fk()
@@ -397,19 +408,19 @@ def parse_mjcf(
                 if "fromto" in geom_attrib:
                     geom_fromto = parse_vec(geom_attrib, "fromto", (0.0, 0.0, 0.0, 1.0, 0.0, 0.0))
 
-                    start = geom_fromto[0:3] * scale
-                    end = geom_fromto[3:6] * scale
+                    start = wp.vec3(geom_fromto[0:3]) * scale
+                    end = wp.vec3(geom_fromto[3:6]) * scale
 
                     # compute rotation to align the Warp capsule (along x-axis), with mjcf fromto direction
                     axis = wp.normalize(end - start)
-                    angle = math.acos(np.dot(axis, (0.0, 1.0, 0.0)))
-                    axis = wp.normalize(np.cross(axis, (0.0, 1.0, 0.0)))
+                    angle = math.acos(wp.dot(axis, wp.vec3(0.0, 1.0, 0.0)))
+                    axis = wp.normalize(wp.cross(axis, wp.vec3(0.0, 1.0, 0.0)))
 
                     geom_pos = (start + end) * 0.5
                     geom_rot = wp.quat_from_axis_angle(axis, -angle)
 
                     geom_radius = geom_size[0]
-                    geom_height = np.linalg.norm(end - start) * 0.5
+                    geom_height = wp.length(end - start) * 0.5
                     geom_up_axis = 1
 
                 else:

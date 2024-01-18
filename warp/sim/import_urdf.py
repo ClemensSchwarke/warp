@@ -48,7 +48,7 @@ def parse_urdf(
     Args:
         urdf_filename (str): The filename of the URDF file to parse.
         builder (ModelBuilder): The :class:`ModelBuilder` to add the bodies and joints to.
-        xform (wp.transform): The transform to apply to the root body.
+        xform (:ref:`transform <transform>`): The transform to apply to the root body.
         floating (bool): If True, the root body is a free joint. If False, the root body is connected via a fixed joint to the world, unless a `base_joint` is defined.
         base_joint (Union[str, dict]): The joint by which the root body is connected to the world. This can be either a string defining the joint axes of a D6 joint with comma-separated positional and angular axis names (e.g. "px,py,rz" for a D6 joint with linear axes in x, y and an angular axis in z) or a dict with joint parameters (see :meth:`ModelBuilder.add_joint`).
         density (float): The density of the shapes in kg/m^3 which will be used to calculate the body mass and inertia.
@@ -101,8 +101,8 @@ def parse_urdf(
                 size = [float(x) for x in size.split()]
                 builder.add_shape_box(
                     body=link,
-                    pos=tf.p,
-                    rot=tf.q,
+                    pos=wp.vec3(tf.p),
+                    rot=wp.quat(tf.q),
                     hx=size[0] * 0.5 * scale,
                     hy=size[1] * 0.5 * scale,
                     hz=size[2] * 0.5 * scale,
@@ -118,8 +118,8 @@ def parse_urdf(
             for sphere in geo.findall("sphere"):
                 builder.add_shape_sphere(
                     body=link,
-                    pos=tf.p,
-                    rot=tf.q,
+                    pos=wp.vec3(tf.p),
+                    rot=wp.quat(tf.q),
                     radius=float(sphere.get("radius") or "1") * scale,
                     density=density,
                     ke=shape_ke,
@@ -133,8 +133,8 @@ def parse_urdf(
             for cylinder in geo.findall("cylinder"):
                 builder.add_shape_capsule(
                     body=link,
-                    pos=tf.p,
-                    rot=tf.q,
+                    pos=wp.vec3(tf.p),
+                    rot=wp.quat(tf.q),
                     radius=float(cylinder.get("radius") or "1") * scale,
                     half_height=float(cylinder.get("length") or "1") * 0.5 * scale,
                     density=density,
@@ -181,12 +181,12 @@ def parse_urdf(
                     # multiple meshes are contained in a scene
                     for geom in m.geometry.values():
                         vertices = np.array(geom.vertices, dtype=np.float32) * scaling
-                        faces = np.array(geom.faces, dtype=np.int32)
+                        faces = np.array(geom.faces.flatten(), dtype=np.int32)
                         mesh = Mesh(vertices, faces)
                         builder.add_shape_mesh(
                             body=link,
-                            pos=tf.p,
-                            rot=tf.q,
+                            pos=wp.vec3(tf.p),
+                            rot=wp.quat(tf.q),
                             mesh=mesh,
                             density=density,
                             ke=shape_ke,
@@ -199,7 +199,7 @@ def parse_urdf(
                 else:
                     # a single mesh
                     vertices = np.array(m.vertices, dtype=np.float32) * scaling
-                    faces = np.array(m.faces, dtype=np.int32)
+                    faces = np.array(m.faces.flatten(), dtype=np.int32)
                     mesh = Mesh(vertices, faces)
                     builder.add_shape_mesh(
                         body=link,
@@ -253,22 +253,22 @@ def parse_urdf(
             I_m[2, 0] = I_m[0, 2]
             I_m[2, 1] = I_m[1, 2]
             rot = wp.quat_to_matrix(inertial_frame.q)
-            I_m = rot @ I_m
+            I_m = rot @ wp.mat33(I_m)
             m = float(inertial.find("mass").get("value") or "0")
             builder.body_mass[link] = m
             builder.body_inv_mass[link] = 1.0 / m
             builder.body_com[link] = com
             builder.body_inertia[link] = I_m
-            builder.body_inv_inertia[link] = np.linalg.inv(I_m)
+            builder.body_inv_inertia[link] = wp.inverse(I_m)
         if m == 0.0 and ensure_nonstatic_links:
             # set the mass to something nonzero to ensure the body is dynamic
             m = static_link_mass
             # cube with side length 0.5
-            I_m = np.eye(3) * m / 12.0 * (0.5 * scale) ** 2 * 2.0
+            I_m = wp.mat33(np.eye(3)) * m / 12.0 * (0.5 * scale) ** 2 * 2.0
             builder.body_mass[link] = m
             builder.body_inv_mass[link] = 1.0 / m
             builder.body_inertia[link] = I_m
-            builder.body_inv_inertia[link] = np.linalg.inv(I_m)
+            builder.body_inv_inertia[link] = wp.inverse(I_m)
 
     end_shape_count = len(builder.shape_geo_type)
 

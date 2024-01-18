@@ -5,12 +5,15 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+import unittest
+
 import numpy as np
+
+import warp as wp
+from warp.tests.unittest_utils import *
 
 # import matplotlib.pyplot as plt
 
-import warp as wp
-from warp.tests.test_base import *
 
 wp.init()
 
@@ -60,7 +63,7 @@ def test_rand(test, device):
     wp.copy(int_ab_host, int_ab_device)
     wp.copy(float_01_host, float_01_device)
     wp.copy(float_ab_host, float_ab_device)
-    wp.synchronize()
+    wp.synchronize_device(device)
 
     int_a = int_a_host.numpy()
     int_ab = int_ab_host.numpy()
@@ -243,10 +246,10 @@ def test_poisson(test, device):
     # _ = plt.hist(poisson_high.numpy(), bins)
     # plt.show()
 
-    np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
 
-    np_poisson_low = np.random.poisson(3.0, N)
-    np_poisson_high = np.random.poisson(42.0, N)
+    np_poisson_low = rng.poisson(lam=3.0, size=N)
+    np_poisson_high = rng.poisson(lam=42.0, size=N)
 
     poisson_low_mean = np.mean(poisson_low.numpy())
     np_poisson_low_mean = np.mean(np_poisson_low)
@@ -267,20 +270,19 @@ def test_poisson(test, device):
     test.assertTrue(np.abs(poisson_high_std - np_poisson_high_std) <= 2e-1)
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestNoise(parent):
-        pass
 
-    add_function_test(TestNoise, "test_rand", test_rand, devices=devices)
-    add_function_test(TestNoise, "test_sample_cdf", test_sample_cdf, devices=devices)
-    add_function_test(TestNoise, "test_sampling_methods", test_sampling_methods, devices=devices)
-    add_function_test(TestNoise, "test_poisson", test_poisson, devices=devices)
+class TestRand(unittest.TestCase):
+    pass
 
-    return TestNoise
+
+add_function_test(TestRand, "test_rand", test_rand, devices=devices)
+add_function_test(TestRand, "test_sample_cdf", test_sample_cdf, devices=devices)
+add_function_test(TestRand, "test_sampling_methods", test_sampling_methods, devices=devices)
+add_function_test(TestRand, "test_poisson", test_poisson, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

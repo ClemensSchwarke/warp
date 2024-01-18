@@ -1,9 +1,16 @@
+# Copyright (c) 2023 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
 import unittest
 
 import numpy as np
 
 import warp as wp
-from warp.tests.test_base import *
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -80,11 +87,13 @@ def mul_half(input: wp.array(dtype=wp.float16), output: wp.array(dtype=wp.float1
 
 
 def test_fp16_grad(test, device):
+    rng = np.random.default_rng(123)
+
     # checks that gradients are correctly propagated for
     # fp16 arrays, even when intermediate calculations
     # are performed in e.g.: fp32
 
-    s = np.random.rand(15).astype(np.float16)
+    s = rng.random(size=15).astype(np.float16)
 
     input = wp.array(s, dtype=wp.float16, device=device, requires_grad=True)
     output = wp.zeros_like(input)
@@ -100,24 +109,22 @@ def test_fp16_grad(test, device):
     assert_np_equal(input.grad.numpy(), np.ones(len(s)) * 2.0)
 
 
-def register(parent):
-    class TestFp16(parent):
-        pass
+class TestFp16(unittest.TestCase):
+    pass
 
-    devices = []
-    if wp.is_cpu_available():
-        devices.append("cpu")
-    for cuda_device in wp.get_cuda_devices():
-        if cuda_device.arch >= 70:
-            devices.append(cuda_device)
 
-    add_function_test(TestFp16, "test_fp16_conversion", test_fp16_conversion, devices=devices)
-    add_function_test(TestFp16, "test_fp16_grad", test_fp16_grad, devices=devices)
-    add_function_test(TestFp16, "test_fp16_kernel_parameter", test_fp16_kernel_parameter, devices=devices)
+devices = []
+if wp.is_cpu_available():
+    devices.append("cpu")
+for cuda_device in get_unique_cuda_test_devices():
+    if cuda_device.arch >= 70:
+        devices.append(cuda_device)
 
-    return TestFp16
+add_function_test(TestFp16, "test_fp16_conversion", test_fp16_conversion, devices=devices)
+add_function_test(TestFp16, "test_fp16_grad", test_fp16_grad, devices=devices)
+add_function_test(TestFp16, "test_fp16_kernel_parameter", test_fp16_kernel_parameter, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

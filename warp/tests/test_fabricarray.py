@@ -5,7 +5,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# include parent path
 import math
 import unittest
 from typing import Any
@@ -13,7 +12,7 @@ from typing import Any
 import numpy as np
 
 import warp as wp
-from warp.tests.test_base import *
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -87,6 +86,8 @@ def _create_fabric_array_interface(data: wp.array, attrib: str, bucket_sizes: li
             raise RuntimeError("Bucket sizes don't add up to the size of data array")
 
     elif data.size > 0:
+        rng = np.random.default_rng(123)
+
         # generate random bucket sizes
         bucket_min = 1
         bucket_max = math.ceil(0.5 * data.size)
@@ -95,7 +96,7 @@ def _create_fabric_array_interface(data: wp.array, attrib: str, bucket_sizes: li
 
         bucket_sizes = []
         while size_remaining >= bucket_max:
-            bucket_size = np.random.randint(bucket_min, bucket_max)
+            bucket_size = rng.integers(bucket_min, high=bucket_max, dtype=int)
             bucket_sizes.append(bucket_size)
             size_remaining -= bucket_size
 
@@ -156,6 +157,8 @@ def _create_fabric_array_array_interface(data: list, attrib: str, bucket_sizes: 
             raise RuntimeError("Bucket sizes don't add up to the number of given arrays")
 
     else:
+        rng = np.random.default_rng(123)
+
         # generate random bucket sizes
         bucket_min = 1
         bucket_max = math.ceil(0.5 * num_arrays)
@@ -164,7 +167,7 @@ def _create_fabric_array_array_interface(data: list, attrib: str, bucket_sizes: 
 
         bucket_sizes = []
         while size_remaining >= bucket_max:
-            bucket_size = np.random.randint(bucket_min, bucket_max)
+            bucket_size = rng.integers(bucket_min, high=bucket_max, dtype=int)
             bucket_sizes.append(bucket_size)
             size_remaining -= bucket_size
 
@@ -927,31 +930,26 @@ for T in _fabric_types:
     wp.overload(fa_generic_sums_kernel_indexed, [wp.indexedfabricarrayarray(dtype=T), wp.array(dtype=T)])
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestFabricArray(parent):
-        pass
 
-    # fabric arrays
-    add_function_test(TestFabricArray, "test_fabricarray_kernel", test_fabricarray_kernel, devices=devices)
-    add_function_test(TestFabricArray, "test_fabricarray_empty", test_fabricarray_empty, devices=devices)
-    add_function_test(
-        TestFabricArray, "test_fabricarray_generic_dtype", test_fabricarray_generic_dtype, devices=devices
-    )
-    add_function_test(
-        TestFabricArray, "test_fabricarray_generic_array", test_fabricarray_generic_array, devices=devices
-    )
-    add_function_test(TestFabricArray, "test_fabricarray_fill_scalar", test_fabricarray_fill_scalar, devices=devices)
-    add_function_test(TestFabricArray, "test_fabricarray_fill_vector", test_fabricarray_fill_vector, devices=devices)
-    add_function_test(TestFabricArray, "test_fabricarray_fill_matrix", test_fabricarray_fill_matrix, devices=devices)
+class TestFabricArray(unittest.TestCase):
+    pass
 
-    # fabric arrays of arrays
-    add_function_test(TestFabricArray, "test_fabricarrayarray", test_fabricarrayarray, devices=devices)
 
-    return TestFabricArray
+# fabric arrays
+add_function_test(TestFabricArray, "test_fabricarray_kernel", test_fabricarray_kernel, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_empty", test_fabricarray_empty, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_generic_dtype", test_fabricarray_generic_dtype, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_generic_array", test_fabricarray_generic_array, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_fill_scalar", test_fabricarray_fill_scalar, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_fill_vector", test_fabricarray_fill_vector, devices=devices)
+add_function_test(TestFabricArray, "test_fabricarray_fill_matrix", test_fabricarray_fill_matrix, devices=devices)
+
+# fabric arrays of arrays
+add_function_test(TestFabricArray, "test_fabricarrayarray", test_fabricarrayarray, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

@@ -1,8 +1,17 @@
-import numpy as np
-import warp as wp
+# Copyright (c) 2023 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from warp.utils import array_sum, array_inner
-from warp.tests.test_base import *
+import unittest
+
+import numpy as np
+
+import warp as wp
+from warp.tests.unittest_utils import *
+from warp.utils import array_inner, array_sum
 
 wp.init()
 
@@ -11,9 +20,11 @@ def make_test_array_sum(dtype):
     N = 1000
 
     def test_array_sum(test, device):
+        rng = np.random.default_rng(123)
+
         cols = wp.types.type_length(dtype)
 
-        values_np = np.random.rand(N, cols)
+        values_np = rng.random(size=(N, cols))
         values = wp.array(values_np, device=device, dtype=dtype)
 
         vsum = array_sum(values)
@@ -32,7 +43,9 @@ def make_test_array_sum_axis(dtype):
     N = I * J * K
 
     def test_array_sum(test, device):
-        values_np = np.random.rand(I, J, K)
+        rng = np.random.default_rng(123)
+
+        values_np = rng.random(size=(I, J, K))
         values = wp.array(values_np, shape=(I, J, K), device=device, dtype=dtype)
 
         for axis in range(3):
@@ -44,14 +57,24 @@ def make_test_array_sum_axis(dtype):
     return test_array_sum
 
 
+def test_array_sum_empty(test, device):
+    values = wp.array([], device=device, dtype=wp.vec2)
+    assert_np_equal(array_sum(values), np.zeros(2))
+
+    values = wp.array([], shape=(0, 3), device=device, dtype=float)
+    assert_np_equal(array_sum(values, axis=0).numpy(), np.zeros(3))
+
+
 def make_test_array_inner(dtype):
     N = 1000
 
     def test_array_inner(test, device):
+        rng = np.random.default_rng(123)
+
         cols = wp.types.type_length(dtype)
 
-        a_np = np.random.rand(N, cols)
-        b_np = np.random.rand(N, cols)
+        a_np = rng.random(size=(N, cols))
+        b_np = rng.random(size=(N, cols))
 
         a = wp.array(a_np, device=device, dtype=dtype)
         b = wp.array(b_np, device=device, dtype=dtype)
@@ -72,8 +95,10 @@ def make_test_array_inner_axis(dtype):
     N = I * J * K
 
     def test_array_inner(test, device):
-        a_np = np.random.rand(I, J, K)
-        b_np = np.random.rand(I, J, K)
+        rng = np.random.default_rng(123)
+
+        a_np = rng.random(size=(I, J, K))
+        b_np = rng.random(size=(I, J, K))
 
         a = wp.array(a_np, shape=(I, J, K), device=device, dtype=dtype)
         b = wp.array(b_np, shape=(I, J, K), device=device, dtype=dtype)
@@ -93,24 +118,33 @@ def make_test_array_inner_axis(dtype):
     return test_array_inner
 
 
-def register(parent):
-    devices = get_test_devices()
+def test_array_inner_empty(test, device):
+    values = wp.array([], device=device, dtype=wp.vec2)
+    test.assertEqual(array_inner(values, values), 0.0)
 
-    class TestArraySym(parent):
-        pass
+    values = wp.array([], shape=(0, 3), device=device, dtype=float)
+    assert_np_equal(array_inner(values, values, axis=0).numpy(), np.zeros(3))
 
-    add_function_test(TestArraySym, "test_array_sum_double", make_test_array_sum(wp.float64), devices=devices)
-    add_function_test(TestArraySym, "test_array_sum_vec3", make_test_array_sum(wp.vec3), devices=devices)
-    add_function_test(TestArraySym, "test_array_sum_axis_float", make_test_array_sum_axis(wp.float32), devices=devices)
-    add_function_test(TestArraySym, "test_array_inner_double", make_test_array_inner(wp.float64), devices=devices)
-    add_function_test(TestArraySym, "test_array_inner_vec3", make_test_array_inner(wp.vec3), devices=devices)
-    add_function_test(
-        TestArraySym, "test_array_inner_axis_float", make_test_array_inner_axis(wp.float32), devices=devices
-    )
 
-    return TestArraySym
+devices = get_test_devices()
+
+
+class TestArrayReduce(unittest.TestCase):
+    pass
+
+
+add_function_test(TestArrayReduce, "test_array_sum_double", make_test_array_sum(wp.float64), devices=devices)
+add_function_test(TestArrayReduce, "test_array_sum_vec3", make_test_array_sum(wp.vec3), devices=devices)
+add_function_test(TestArrayReduce, "test_array_sum_axis_float", make_test_array_sum_axis(wp.float32), devices=devices)
+add_function_test(TestArrayReduce, "test_array_sum_empty", test_array_sum_empty, devices=devices)
+add_function_test(TestArrayReduce, "test_array_inner_double", make_test_array_inner(wp.float64), devices=devices)
+add_function_test(TestArrayReduce, "test_array_inner_vec3", make_test_array_inner(wp.vec3), devices=devices)
+add_function_test(
+    TestArrayReduce, "test_array_inner_axis_float", make_test_array_inner_axis(wp.float32), devices=devices
+)
+add_function_test(TestArrayReduce, "test_array_inner_empty", test_array_inner_empty, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

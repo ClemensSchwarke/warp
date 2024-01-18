@@ -1,7 +1,16 @@
+# Copyright (c) 2023 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+import unittest
+
 import numpy as np
 
 import warp as wp
-from warp.tests.test_base import *
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -45,9 +54,11 @@ def identity_test(data: wp.array(dtype=wp.bool)):
 
 
 def test_bool_identity_ops(test, device):
+    rng = np.random.default_rng(123)
+
     dim_x = 10
 
-    rand_np = np.random.rand(dim_x) > 0.5
+    rand_np = rng.random(dim_x) > 0.5
 
     data_array = wp.array(data=rand_np, device=device)
 
@@ -67,23 +78,22 @@ def check_compile_constant(result: wp.array(dtype=wp.bool)):
 
 
 def test_bool_constant(test, device):
-    compile_constant_value = wp.zeros(1, dtype=wp.bool)
-    wp.launch(check_compile_constant, 1, inputs=[compile_constant_value])
+    compile_constant_value = wp.zeros(1, dtype=wp.bool, device=device)
+    wp.launch(check_compile_constant, 1, inputs=[compile_constant_value], device=device)
     test.assertTrue(compile_constant_value.numpy()[0])
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestBool(parent):
-        pass
 
-    add_function_test(TestBool, "test_bool_identity_ops", test_bool_identity_ops, devices=devices)
-    add_function_test(TestBool, "test_bool_constant", test_bool_constant, devices=devices)
+class TestBool(unittest.TestCase):
+    pass
 
-    return TestBool
+
+add_function_test(TestBool, "test_bool_identity_ops", test_bool_identity_ops, devices=devices)
+add_function_test(TestBool, "test_bool_constant", test_bool_constant, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

@@ -5,10 +5,12 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import warp as wp
-from warp.tests.test_base import *
+import unittest
 
 import numpy as np
+
+import warp as wp
+from warp.tests.unittest_utils import *
 
 # import matplotlib.pyplot as plt
 
@@ -229,19 +231,18 @@ def test_adj_noise(test, device):
     test.assertTrue(err < 1.0e-8)
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestNoise(parent):
-        pass
 
-    add_function_test(TestNoise, "test_pnoise", test_pnoise, devices=devices)
-    add_function_test(TestNoise, "test_curlnoise", test_curlnoise, devices=devices)
-    add_function_test(TestNoise, "test_adj_noise", test_adj_noise, devices=devices)
+class TestNoise(unittest.TestCase):
+    pass
 
-    return TestNoise
+
+add_function_test(TestNoise, "test_pnoise", test_pnoise, devices=devices)
+add_function_test(TestNoise, "test_curlnoise", test_curlnoise, devices=devices)
+add_function_test(TestNoise, "test_adj_noise", test_adj_noise, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

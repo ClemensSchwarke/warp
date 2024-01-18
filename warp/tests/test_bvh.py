@@ -5,13 +5,12 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-# include parent path
+import unittest
+
 import numpy as np
 
 import warp as wp
-from warp.tests.test_base import *
-
-np.random.seed(42)
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -71,9 +70,11 @@ def intersect_ray_aabb(start, dir, lower, upper):
 
 
 def test_bvh(test, type, device):
+    rng = np.random.default_rng(123)
+
     num_bounds = 100
-    lowers = np.random.rand(num_bounds, 3) * 5.0
-    uppers = lowers + np.random.rand(num_bounds, 3) * 5.0
+    lowers = rng.random(size=(num_bounds, 3)) * 5.0
+    uppers = lowers + rng.random(size=(num_bounds, 3)) * 5.0
 
     device_lowers = wp.array(lowers, dtype=wp.vec3, device=device)
     device_uppers = wp.array(uppers, dtype=wp.vec3, device=device)
@@ -114,10 +115,10 @@ def test_bvh(test, type, device):
             test.assertEqual(host_intersected, device_intersected[i])
 
         if test_case == 0:
-            lowers = np.random.rand(num_bounds, 3) * 5.0
-            uppers = lowers + np.random.rand(num_bounds, 3) * 5.0
-            wp.copy(device_lowers, wp.array(lowers, dtype=wp.vec3))
-            wp.copy(device_uppers, wp.array(uppers, dtype=wp.vec3))
+            lowers = rng.random(size=(num_bounds, 3)) * 5.0
+            uppers = lowers + rng.random(size=(num_bounds, 3)) * 5.0
+            wp.copy(device_lowers, wp.array(lowers, dtype=wp.vec3, device=device))
+            wp.copy(device_uppers, wp.array(uppers, dtype=wp.vec3, device=device))
             bvh.refit()
             bounds_intersected.zero_()
 
@@ -130,18 +131,17 @@ def test_bvh_query_ray(test, device):
     test_bvh(test, "ray", device)
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestBvh(parent):
-        pass
 
-    add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
-    add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
+class TestBvh(unittest.TestCase):
+    pass
 
-    return TestBvh
+
+add_function_test(TestBvh, "test_bvh_aabb", test_bvh_query_aabb, devices=devices)
+add_function_test(TestBvh, "test_bvh_ray", test_bvh_query_ray, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

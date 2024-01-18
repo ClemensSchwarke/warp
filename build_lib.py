@@ -1,3 +1,10 @@
+# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
 # This script is an 'offline' build of the core warp runtime libraries
 # designed to be executed as part of CI / developer workflows, not
 # as part of the user runtime (since it requires CUDA toolkit, etc)
@@ -12,6 +19,7 @@ import os
 
 import warp.config
 from warp.build_dll import build_dll, find_host_compiler, set_msvc_compiler
+from warp.context import export_builtins
 
 parser = argparse.ArgumentParser(description="Warp build script")
 parser.add_argument("--msvc_path", type=str, help="Path to MSVC compiler (optional if already on PATH)")
@@ -47,6 +55,10 @@ parser.add_argument("--quick", action="store_true", help="Only generate PTX code
 parser.add_argument("--build_llvm", action="store_true", help="Build Clang/LLVM compiler from source, default disabled")
 parser.add_argument("--no_build_llvm", dest="build_llvm", action="store_false")
 parser.set_defaults(build_llvm=False)
+
+parser.add_argument(
+    "--llvm_source_path", type=str, help="Path to the LLVM project source code (optional, repo cloned if not set)"
+)
 
 parser.add_argument("--debug_llvm", action="store_true", help="Enable LLVM compiler code debugging, default disabled")
 parser.add_argument("--no_debug_llvm", dest="debug_llvm", action="store_false")
@@ -113,7 +125,31 @@ def lib_name(name):
         return f"{name}.so"
 
 
+def generate_exports_header_file():
+    """Generates warp/native/exports.h, which lets built-in functions be callable from outside kernels"""
+
+    # set build output path off this file
+    export_path = os.path.join(base_path, "warp", "native", "exports.h")
+
+    try:
+        with open(export_path, "w") as f:
+            export_builtins(f)
+
+        print(f"Finished writing {export_path}")
+    except FileNotFoundError:
+        print(f"Error: The file '{export_path}' was not found.")
+    except PermissionError:
+        print(f"Error: Permission denied. Unable to write to '{export_path}'.")
+    except OSError as e:
+        print(f"Error: An OS-related error occurred: {e}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+
 try:
+    # Generate warp/native/export.h
+    generate_exports_header_file()
+
     # build warp.dll
     cpp_sources = [
         "native/warp.cpp",

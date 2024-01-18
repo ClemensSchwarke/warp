@@ -1,6 +1,16 @@
-import warp as wp
+# Copyright (c) 2022 NVIDIA CORPORATION.  All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+import unittest
+
 import numpy as np
-from warp.tests.test_base import *
+
+import warp as wp
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -42,17 +52,16 @@ def test_intersect_tri(test, device):
     assert_np_equal(result.numpy(), np.array([0]))
 
 
-def register(parent):
-    devices = get_test_devices()
+devices = get_test_devices()
 
-    class TestIntersect(parent):
-        pass
 
-    add_function_test(TestIntersect, "test_intersect_tri", test_intersect_tri, devices=devices)
+class TestIntersect(unittest.TestCase):
+    pass
 
-    return TestIntersect
+
+add_function_test(TestIntersect, "test_intersect_tri", test_intersect_tri, devices=devices)
 
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2, failfast=False)

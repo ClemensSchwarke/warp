@@ -1,5 +1,76 @@
 # CHANGELOG
 
+## [1.0.0-beta.6] - 2024-01-10
+
+- Do not create CPU copy of grad array when calling `array.numpy()`
+- Fix `assert_np_equal()` bug
+- Support Linux AArch64 platforms, including Jetson/Tegra devices
+- Add parallel testing runner (invoke with `python -m warp.tests`, use `warp/tests/unittest_serial.py` for serial testing)
+- Fix support for function calls in `range()`
+- `matmul` adjoints now accumulate
+- Expand available operators (e.g. vector @ matrix, scalar as dividend) and improve support for calling native built-ins
+- Fix multi-gpu synchronization issue in `sparse.py`
+- Add depth rendering to `OpenGLRenderer`, document `warp.render`
+- Make `atomic_min`, `atomic_max` differentiable
+- Fix error reporting using the exact source segment
+- Add user-friendly mesh query overloads, returning a struct instead of overwriting parameters
+- Address multiple differentiability issues
+- Fix backpropagation for returning array element references
+- Support passing the return value to adjoints
+- Add point basis space and explicit point-based quadrature for `warp.fem`
+- Support overriding the LLVM project source directory path using `build_lib.py --build_llvm --llvm_source_path=`
+- Fix the error message for accessing non-existing attributes
+- Flatten faces array for Mesh constructor in URDF parser
+
+## [1.0.0-beta.5] - 2023-11-22
+
+- Fix for kernel caching when function argument types change
+- Fix code-gen ordering of dependent structs
+- Fix for `wp.Mesh` build on MGPU systems
+- Fix for name clash bug with adjoint code: https://github.com/NVIDIA/warp/issues/154
+- Add `wp.frac()` for returning the fractional part of a floating point value
+- Add support for custom native CUDA snippets using `@wp.func_native` decorator
+- Add support for batched matmul with batch size > 2^16-1
+- Add support for transposed CUTLASS `wp.matmul()` and additional error checking
+- Add support for quad and hex meshes in `wp.fem`
+- Detect and warn when C++ runtime doesn't match compiler during build, e.g.: ``libstdc++.so.6: version `GLIBCXX_3.4.30' not found``
+- Documentation update for `wp.BVH`
+- Documentation and simplified API for runtime kernel specialization `wp.Kernel`
+
+## [1.0.0-beta.4] - 2023-11-01
+
+- Add `wp.cbrt()` for cube root calculation
+- Add `wp.mesh_furthest_point_no_sign()` to compute furthest point on a surface from a query point
+- Add support for GPU BVH builds, 10-100x faster than CPU builds for large meshes
+- Add support for chained comparisons, i.e.: `0 < x < 2`
+- Add support for running `warp.fem` examples headless
+- Fix for unit test determinism
+- Fix for possible GC collection of array during graph capture
+- Fix for `wp.utils.array_sum()` output initialization when used with vector types
+- Coverage and documentation updates
+
+## [1.0.0-beta.3] - 2023-10-19
+
+- Add support for code coverage scans (test_coverage.py), coverage at 85% in omni.warp.core
+- Add support for named component access for vector types, e.g.: `a = v.x`
+- Add support for lvalue expressions, e.g.: `array[i] += b`
+- Add casting constructors for matrix and vector types
+- Add support for `type()` operator that can be used to return type inside kernels
+- Add support for grid-stride kernels to support kernels with > 2^31-1 thread blocks
+- Fix for multi-process initialization warnings
+- Fix alignment issues with empty `wp.struct`
+- Fix for return statement warning with tuple-returning functions
+- Fix for `wp.batched_matmul()` registering the wrong function in the Tape
+- Fix and document for `wp.sim` forward + inverse kinematics
+- Fix for `wp.func` to return a default value if function does not return on all control paths
+- Refactor `wp.fem` support for new basis functions, decoupled function spaces
+- Optimizations for `wp.noise` functions, up to 10x faster in most cases
+- Optimizations for `type_size_in_bytes()` used in array construction'
+
+### Breaking Changes
+
+- To support grid-stride kernels, `wp.tid()` can no longer be called inside `wp.func` functions.
+
 ## [1.0.0-beta.2] - 2023-09-01
 
 - Fix for passing bool into `wp.func` functions
@@ -24,7 +95,7 @@
 - Add support for `wp.volume_sample_grad_f()` which returns the value + gradient efficiently from an NVDB volume
 - Add support for LLVM fp16 intrinsics for half-precision arithmetic
 - Add implementation of stochastic gradient descent, see `wp.optim.SGD`
-- Add `warp.fem` framework for solving weak-form PDE problems (see https://gdaviet.gitlab-master-pages.nvidia.com/warp/modules/fem.html)
+- Add `warp.fem` framework for solving weak-form PDE problems (see https://nvidia.github.io/warp/_build/html/modules/fem.html)
 - Optimizations for `omni.warp` extension load time (2.2s to 625ms cold start)
 - Make all `omni.ui` dependencies optional so that Warp unit tests can run headless
 - Deprecation of `wp.tid()` outside of kernel functions, users should pass `tid()` values to `wp.func` functions explicitly
@@ -49,15 +120,15 @@
 
 - Add support for macOS universal binaries (x86 + aarch64) for M1+ support
 - Add additional methods for SDF generation please see the following new methods:
-  -  `wp.mesh_query_point_nosign()` - closest point query with no sign determination
-  -  `wp.mesh_query_point_sign_normal()` - closest point query with sign from angle-weighted normal
-  -  `wp.mesh_query_point_sign_winding_number()` - closest point query with fast winding number sign determination
+  - `wp.mesh_query_point_nosign()` - closest point query with no sign determination
+  - `wp.mesh_query_point_sign_normal()` - closest point query with sign from angle-weighted normal
+  - `wp.mesh_query_point_sign_winding_number()` - closest point query with fast winding number sign determination
 - Add CSR/BSR sparse matrix support, see `warp.sparse` module:
   - `wp.sparse.BsrMatrix`
   - `wp.sparse.bsr_zeros()`, `wp.sparse.bsr_set_from_triplets()` for construction
   - `wp.sparse.bsr_mm()`, `wp.sparse_bsr_mv()` for matrix-matrix and matrix-vector products respectively
 - Add array-wide utilities:
-  - `wp.utils.array_scan()` - prefix sum (inclusive or exlusive)
+  - `wp.utils.array_scan()` - prefix sum (inclusive or exclusive)
   - `wp.utils.array_sum()` - sum across array
   - `wp.utils.radix_sort_pairs()` - in-place radix sort (key,value) pairs
 - Add support for calling `@wp.func` functions from Python (outside of kernel scope)
@@ -99,7 +170,7 @@
 ## [0.9.0] - 2023-06-01
 
 - Add support for in-place modifications to vector, matrix, and struct types inside kernels (will warn during backward pass with `wp.verbose` if using gradients)
-- Add support for step-through VSCode debugging of kernel code with standalone LLVM compiler, see `wp.breakpoint()`, and `test_debug.py`
+- Add support for step-through VSCode debugging of kernel code with standalone LLVM compiler, see `wp.breakpoint()`, and `walkthrough_debug.py`
 - Add support for default values on built-in functions
 - Add support for multi-valued `@wp.func` functions
 - Add support for `pass`, `continue`, and `break` statements
@@ -136,7 +207,7 @@
 ## [0.8.1] - 2023-04-13
 
 - Fix for regression when passing flattened numeric lists as matrix arguments to kernels
-- Fix for regressions when passing wp.struct types with uninitialized (None) member attributes
+- Fix for regressions when passing `wp.struct` types with uninitialized (`None`) member attributes
 
 ## [0.8.0] - 2023-04-05
 
@@ -170,20 +241,18 @@
 - Optimizations for `wp.launch()`, up to 3x faster launches in common cases
 - Fix `wp.randf()` conversion to float to reduce bias for uniform sampling
 - Fix capture of `wp.func` and `wp.constant` types from inside Python closures
-- Fix for CUDA on WSL 
+- Fix for CUDA on WSL
 - Fix for matrices in structs
-- Fix for tranpose indexing for some non-square matrices
+- Fix for transpose indexing for some non-square matrices
 - Enable Python faulthandler by default
 - Update to VS2019
 
-Breaking Changes
-----------------
+### Breaking Changes
 
 - `wp.constant` variables can now be treated as their true type, accessing the underlying value through `constant.val` is no longer supported
 - `wp.sim.model.ground_plane` is now a `wp.array` to support gradient, users should call `builder.set_ground_plane()` to create the ground 
 - `wp.sim` capsule, cones, and cylinders are now aligned with the default USD up-axis
 
-  
 ## [0.7.2] - 2023-02-15
 
 - Reduce test time for vec/math types
@@ -203,9 +272,9 @@ Breaking Changes
 - Add support for slicing `wp.array` types in Python
 - Add `wp.from_ptr()` helper to construct arrays from an existing allocation
 - Add support for `break` statements in ranged-for and while loops (backward pass support currently not implemented)
-- Add built-in mathematic constants, see `wp.pi`, `wp.e`, `wp.log2e`, etc
+- Add built-in mathematic constants, see `wp.pi`, `wp.e`, `wp.log2e`, etc.
 - Add built-in conversion between degrees and radians, see `wp.degrees()`, `wp.radians()`
-- Add security pop-up for Kernel Node 
+- Add security pop-up for Kernel Node
 - Improve error handling for kernel return values
 
 ## [0.6.3] - 2023-01-31
@@ -227,7 +296,7 @@ Breaking Changes
 - Allow optional attributes for Kernel Node
 - Allow disabling backward pass code-gen on a per-kernel basis, use `@wp.kernel(enable_backward=False)`
 - Replace Python `imp` package with `importlib`
-- Fix for quaterion slerp gradients (`wp.quat_slerp()`)
+- Fix for quaternion slerp gradients (`wp.quat_slerp()`)
 
 ## [0.6.1] - 2022-12-05
 
@@ -283,7 +352,7 @@ Breaking Changes
 - Add NVDB volume allocation API, see `wp.Volume.allocate()`, and `wp.Volume.allocate_by_tiles()`
 - Add NVDB volume write methods, see `wp.volume_store_i()`, `wp.volume_store_f()`, `wp.volume_store_v()`
 - Add MGPU documentation
-- Add example showing how to compute Jacobian of multiple environements in parallel, see `example_jacobian_ik.py`
+- Add example showing how to compute Jacobian of multiple environments in parallel, see `example_jacobian_ik.py`
 - Add `wp.Tape.zero()` support for `wp.struct` types
 - Make SampleBrowser an optional dependency for Kit extension
 - Make `wp.Mesh` object accept both 1d and 2d arrays of face vertex indices
@@ -291,7 +360,7 @@ Breaking Changes
 - Fix for hashing of `wp.constants()` not invalidating kernels
 - Fix for reload when multiple `.ptx` versions are present
 - Improved error reporting during code-gen
- 
+
 ## [0.4.3] - 2022-09-20
 
 - Update all samples to use GPU interop path by default
@@ -315,7 +384,6 @@ Breaking Changes
 - Fix for debug flags not being set correctly on CUDA when `wp.config.mode == "debug"`, this enables bounds checking on CUDA kernels in debug mode
 - Fix for code gen of functions that do not return a value
 
-
 ## [0.4.0] - 2022-08-09
 
 - Fix for FP16 conversions on GPUs without hardware support
@@ -328,17 +396,14 @@ Breaking Changes
 - Add support for cross-module `@wp.struct` references
 - Support running even if CUDA initialization failed, use `wp.is_cuda_available()` to check availability
 - Statically linking with the CUDA runtime library to avoid deployment issues
-  
 
 ### Breaking Changes
 
 - Removed `wp.runtime` reference from the top-level module, as it should be considered private
 
-
 ## [0.3.2] - 2022-07-19
 
 - Remove Torch import from `__init__.py`, defer import to `wp.from_torch()`, `wp.to_torch()`
-
 
 ## [0.3.1] - 2022-07-12
 
@@ -351,14 +416,12 @@ Breaking Changes
 - Add support for using arbitrary external CUDA contexts, see `wp.map_cuda_device()`, `wp.unmap_cuda_device()`
 - Add PyTorch device aliasing functions, see `wp.device_from_torch()`, `wp.device_to_torch()`
 
-
 ### Breaking Changes
 
 - A CUDA device is used by default, if available (aligned with `wp.get_preferred_device()`)
 - `wp.ScopedCudaGuard` is deprecated, use `wp.ScopedDevice` instead
 - `wp.synchronize()` now synchronizes all devices; for finer-grained control, use `wp.synchronize_device()`
 - Device alias `"cuda"` now refers to the current CUDA context, rather than a specific device like `"cuda:0"` or `"cuda:1"`
-
 
 ## [0.3.0] - 2022-07-08
 
@@ -373,7 +436,7 @@ Breaking Changes
 - Add support for retrieving a single row from builtin types, e.g.: `r = m33[i]`
 - Add  `wp.log2()` and `wp.log10()` builtins
 - Add support for quickly instancing `wp.sim.ModelBuilder` objects to improve env. creation performance for RL
-- Remove custom CUB version and improve compatability with CUDA 11.7
+- Remove custom CUB version and improve compatibility with CUDA 11.7
 - Fix to preserve external user-gradients when calling `wp.Tape.zero()`
 - Fix to only allocate gradient of a Torch tensor if `requires_grad=True`
 - Fix for missing `wp.mat22` constructor adjoint
@@ -384,7 +447,6 @@ Breaking Changes
 - Fix for reload of generated CPU kernel code on Linux
 - Fix for example scripts to output USD at 60 timecodes per-second (better Kit compatibility)
 
-
 ## [0.2.3] - 2022-06-13
 
 - Fix for incorrect 4d array bounds checking
@@ -392,7 +454,6 @@ Breaking Changes
 - Fix for stale CUDA kernel cache when CPU kernels launched first
 - Array gradients are now allocated along with the arrays and accessible as `wp.array.grad`, users should take care to always call `wp.Tape.zero()` to clear gradients between different invocations of `wp.Tape.backward()`
 - Added `wp.array.fill_()` to set all entries to a scalar value (4-byte values only currently)
-
 
 ### Breaking Changes
 
@@ -412,7 +473,7 @@ Breaking Changes
 - Add support for overloading `@wp.func` functions based on argument type
 - Add support for calling built-in functions directly from Python interpreter outside kernels (experimental)
 - Add support for auto-complete and docstring lookup for builtins in IDEs like VSCode, PyCharm, etc
-- Add support for doing partial array copys, see `wp.copy()` for details
+- Add support for doing partial array copies, see `wp.copy()` for details
 - Add support for accessing mesh data directly in kernels, see `wp.mesh_get_point()`, `wp.mesh_get_index()`, `wp.mesh_eval_face_normal()`
 - Change to only compile for targets where kernel is launched (e.g.: will not compile CPU unless explicitly requested)
 
@@ -426,7 +487,7 @@ Breaking Changes
 ## [0.2.1] - 2022-05-11
 
 - Fix for unit tests in Kit
-- 
+
 ## [0.2.0] - 2022-05-02
 
 ### Warp Core
@@ -464,14 +525,13 @@ Breaking Changes
 - Fix for URDF importer and floating base support
 - Add examples showing how to use differentiable forward kinematics to solve inverse kinematics
 - Add examples for URDF cartpole and quadruped simulation
- 
+
 ### Breaking Changes
 
 - `wp.volume_sample_world()` is now replaced by `wp.volume_sample_f/i/vec()` which operate in index (local) space. Users should use `wp.volume_world_to_index()` to transform points from world space to index space before sampling.
 - `wp.mlp()` expects multi-dimensional arrays instead of one-dimensional arrays for inference, all other semantics remain the same as earlier versions of this API.
 - `wp.array.length` member has been removed, please use `wp.array.shape` to access array dimensions, or use `wp.array.size` to get total element count
 - Marking `dense_gemm()`, `dense_chol()`, etc methods as experimental until we revisit them
-
 
 ## [0.1.25] - 2022-03-20
 
@@ -482,7 +542,6 @@ Breaking Changes
 - Add hyperbolic trigonometric functions, see wp.tanh(), wp.sinh(), wp.cosh()
 - Add support for floored division on integer types
 - Move tests into core library so they can be run in Kit environment
-
 
 ## [0.1.24] - 2022-03-03
 
@@ -550,7 +609,7 @@ Breaking Changes
 
 ## [0.1.19] - 2021-10-15
 
-- Publish from 2021.3 to avoid omni.graph database incompatabilities
+- Publish from 2021.3 to avoid omni.graph database incompatibilities
 
 ## [0.1.18] - 2021-10-08
 
@@ -642,7 +701,7 @@ Breaking Changes
 
 - Add support for unary negation operator
 - Add support for mutating variables during dynamic loops (non-differentiable)
-- Add support for inplace operators
+- Add support for in-place operators
 - Improve kernel cache start up times (avoids adjointing before cache check)
 - Update README.md with requirements / examples
 
@@ -663,5 +722,3 @@ Breaking Changes
 ## [0.1.0] - 2021-05-17
 
 - Initial publish for alpha testing
-
-

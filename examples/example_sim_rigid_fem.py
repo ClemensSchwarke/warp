@@ -40,9 +40,9 @@ class Example:
         builder.default_particle_radius = 0.01
 
         builder.add_soft_grid(
-            pos=(0.0, 0.0, 0.0),
+            pos=wp.vec3(0.0, 0.0, 0.0),
             rot=wp.quat_identity(),
-            vel=(0.0, 0.0, 0.0),
+            vel=wp.vec3(0.0, 0.0, 0.0),
             dim_x=20,
             dim_y=10,
             dim_z=10,
@@ -69,7 +69,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
 
-        self.renderer = wp.sim.render.SimRendererOpenGL(self.model, stage, scaling=1.0)
+        self.renderer = wp.sim.render.SimRenderer(self.model, stage, scaling=1.0)
 
     def update(self):
         with wp.ScopedTimer("simulate", active=True):

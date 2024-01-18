@@ -12,15 +12,16 @@
 #
 ##############################################################################
 
+import os
+
+import numpy as np
+from pxr import Usd, UsdGeom
+
 import warp as wp
 import warp.render
 
-import numpy as np
-
 np.random.seed(42)
 
-from pxr import Usd, UsdGeom
-import os
 
 wp.init()
 
@@ -82,6 +83,9 @@ def intersect(
 
 class Example:
     def __init__(self, stage):
+        rng = np.random.default_rng()
+
+        self.device = wp.get_device()
         self.query_count = 1024
         self.has_queried = False
 
@@ -101,10 +105,10 @@ class Example:
 
         for i in range(self.query_count):
             # random offset
-            p = (np.random.rand(3) * 0.5 - 0.5) * 5.0
+            p = wp.vec3(rng.random(3) * 0.5 - 0.5) * 5.0
 
             # random orientation
-            axis = wp.normalize(np.random.rand(3) * 0.5 - 0.5)
+            axis = wp.normalize(wp.vec3(rng.random(3) * 0.5 - 0.5))
             angle = float(np.random.rand(1)[0])
 
             q = wp.quat_from_axis_angle(wp.normalize(axis), angle)
@@ -114,8 +118,8 @@ class Example:
         self.array_result = wp.zeros(self.query_count, dtype=int)
         self.array_xforms = wp.array(self.xforms, dtype=wp.transform)
 
-        # force module load (for accurate profiling)
-        wp.force_load()
+        # compile and load the module up front (for accurate profiling)
+        wp.load_module(device=self.device)
 
     def update(self):
         with wp.ScopedTimer("intersect", active=True):
@@ -124,12 +128,10 @@ class Example:
                 dim=self.query_num_faces * self.query_count,
                 inputs=[self.mesh_0.id, self.mesh_1.id, self.query_num_faces, self.array_xforms, self.array_result],
             )
-            wp.synchronize()
 
-    def render(self, is_live=False):
+    def render(self):
         # bring results back to host
         result = self.array_result.numpy()
-        print(result)
 
         with wp.ScopedTimer("render", active=True):
             self.renderer.begin_frame(0.0)
@@ -144,14 +146,14 @@ class Example:
                     os.path.join(os.path.dirname(__file__), self.path_0),
                     pos=wp.vec3(xform.p[0] + offset, xform.p[1], xform.p[2]),
                     rot=xform.q,
-                    scale=(1.0, 1.0, 1.0),
+                    scale=wp.vec3(1.0, 1.0, 1.0),
                 )
                 self.renderer.render_ref(
                     f"mesh_{i}_1",
                     os.path.join(os.path.dirname(__file__), self.path_1),
-                    pos=(offset, 0.0, 0.0),
+                    pos=wp.vec3(offset, 0.0, 0.0),
                     rot=wp.quat_identity(),
-                    scale=(1.0, 1.0, 1.0),
+                    scale=wp.vec3(1.0, 1.0, 1.0),
                 )
 
                 # if pair intersects then draw a small box above the pair

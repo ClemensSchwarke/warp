@@ -33,7 +33,7 @@ struct vec_t
     {
         for( unsigned i=0; i < Length; ++i )
         {
-            c[i] = other[i];
+            c[i] = static_cast<Type>(other[i]);
         }
     }
 
@@ -285,9 +285,38 @@ inline CUDA_CALLABLE vec_t<2, Type> div(vec_t<2, Type> a, Type s)
 }
 
 template<unsigned Length, typename Type>
+inline CUDA_CALLABLE vec_t<Length, Type> div(Type s, vec_t<Length, Type> a)
+{
+    vec_t<Length, Type> ret;
+    for (unsigned i=0; i < Length; ++i)
+    {
+        ret[i] = s / a[i];
+    }
+    return ret;
+}
+
+template<typename Type>
+inline CUDA_CALLABLE vec_t<3, Type> div(Type s, vec_t<3, Type> a)
+{
+    return vec_t<3, Type>(s/a.c[0],s/a.c[1],s/a.c[2]);
+}
+
+template<typename Type>
+inline CUDA_CALLABLE vec_t<2, Type> div(Type s, vec_t<2, Type> a)
+{
+    return vec_t<2, Type>(s/a.c[0],s/a.c[1]);
+}
+
+template<unsigned Length, typename Type>
 inline CUDA_CALLABLE vec_t<Length, Type> operator / (vec_t<Length, Type> a, Type s)
 {
     return div(a,s);
+}
+
+template<unsigned Length, typename Type>
+inline CUDA_CALLABLE vec_t<Length, Type> operator / (Type s, vec_t<Length, Type> a)
+{
+    return div(s, a);
 }
 
 // component wise division
@@ -383,7 +412,7 @@ inline CUDA_CALLABLE Type tensordot(vec_t<Length, Type> a, vec_t<Length, Type> b
 
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE Type index(const vec_t<Length, Type> & a, int idx)
+inline CUDA_CALLABLE Type extract(const vec_t<Length, Type> & a, int idx)
 {
 #ifndef NDEBUG
     if (idx < 0 || idx >= Length)
@@ -397,7 +426,21 @@ inline CUDA_CALLABLE Type index(const vec_t<Length, Type> & a, int idx)
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void indexset(vec_t<Length, Type>& v, int idx, Type value)
+inline CUDA_CALLABLE Type* index(vec_t<Length, Type>& v, int idx)
+{
+#ifndef NDEBUG
+    if (idx < 0 || idx >= Length)
+    {
+        printf("vec index %d out of bounds at %s %d\n", idx, __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    return &v[idx];
+}
+
+template<unsigned Length, typename Type>
+inline CUDA_CALLABLE Type* indexref(vec_t<Length, Type>* v, int idx)
 {
 #ifndef NDEBUG
     if (idx < 0 || idx >= Length)
@@ -407,17 +450,23 @@ inline CUDA_CALLABLE void indexset(vec_t<Length, Type>& v, int idx, Type value)
     }
 #endif
 
-    v[idx] = value;
+    return &((*v)[idx]);
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_indexset(vec_t<Length, Type>& v, int idx, const Type& value,
+inline CUDA_CALLABLE void adj_index(vec_t<Length, Type>& v, int idx,
                                        vec_t<Length, Type>& adj_v, int adj_idx, const Type& adj_value)
 {
     // nop
 }
 
 
+template<unsigned Length, typename Type>
+inline CUDA_CALLABLE void adj_indexref(vec_t<Length, Type>* v, int idx, 
+                                       vec_t<Length, Type>& adj_v, int adj_idx, const Type& adj_value)
+{
+    // nop
+}
 
 
 template<unsigned Length, typename Type>
@@ -645,7 +694,7 @@ inline CUDA_CALLABLE void adj_vec_t(const vec_t<Length, OtherType>& other, vec_t
 {
     for( unsigned i=0; i < Length; ++i )
     {
-        adj_other[i] += adj_ret[i];
+        adj_other[i] += static_cast<OtherType>(adj_ret[i]);
     }
 }
 
@@ -715,9 +764,30 @@ inline CUDA_CALLABLE void adj_div(vec_t<Length, Type> a, Type s, vec_t<Length, T
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_cw_div(vec_t<Length, Type> a, vec_t<Length, Type> b, vec_t<Length, Type>& adj_a, vec_t<Length, Type>& adj_b, const vec_t<Length, Type>& adj_ret) {
+inline CUDA_CALLABLE void adj_div(Type s, vec_t<Length, Type> a, Type& adj_s, vec_t<Length, Type>& adj_a, const vec_t<Length, Type>& adj_ret)
+{
+
+    adj_s -= dot(a , adj_ret)/ (s * s); // - a / s^2
+
+    for( unsigned i=0; i < Length; ++i )
+    {
+        adj_a[i] += s / adj_ret[i];
+    }
+
+#if FP_CHECK
+    if (!isfinite(a) || !isfinite(s) || !isfinite(adj_a) || !isfinite(adj_s) || !isfinite(adj_ret))
+    {
+        // \TODO: How shall we implement this error message?
+        // printf("adj_div((%f %f %f %f), %f, (%f %f %f %f), %f, (%f %f %f %f)\n", a.x, a.y, a.z, a.w, s, adj_a.x, adj_a.y, adj_a.z, adj_a.w, adj_s, adj_ret.x, adj_ret.y, adj_ret.z, adj_ret.w);
+        assert(0);
+    }
+#endif
+}
+
+template<unsigned Length, typename Type>
+inline CUDA_CALLABLE void adj_cw_div(vec_t<Length, Type> a, vec_t<Length, Type> b, vec_t<Length, Type>& ret, vec_t<Length, Type>& adj_a, vec_t<Length, Type>& adj_b, const vec_t<Length, Type>& adj_ret) {
   adj_a += cw_div(adj_ret, b);
-  adj_b -= cw_mul(adj_ret, cw_div(cw_div(a, b), b));
+  adj_b -= cw_mul(adj_ret, cw_div(ret, b));
 }
 
 template<unsigned Length, typename Type>
@@ -816,7 +886,7 @@ inline CUDA_CALLABLE void adj_dot(vec_t<3, Type> a, vec_t<3, Type> b, vec_t<3, T
 
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_index(const vec_t<Length, Type> & a, int idx, vec_t<Length, Type> & adj_a, int & adj_idx, Type & adj_ret)
+inline CUDA_CALLABLE void adj_extract(const vec_t<Length, Type> & a, int idx, vec_t<Length, Type> & adj_a, int & adj_idx, Type & adj_ret)
 {
 #ifndef NDEBUG
     if (idx < 0 || idx > Length)
@@ -830,9 +900,12 @@ inline CUDA_CALLABLE void adj_index(const vec_t<Length, Type> & a, int idx, vec_
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_length(vec_t<Length, Type> a, vec_t<Length, Type>& adj_a, const Type adj_ret)
+inline CUDA_CALLABLE void adj_length(vec_t<Length, Type> a, Type ret, vec_t<Length, Type>& adj_a, const Type adj_ret)
 {
-    adj_a += normalize(a)*adj_ret;
+    if (ret > Type(kEps))
+    {
+        adj_a += div(a, ret) * adj_ret;
+    }
 
 #if FP_CHECK
     if (!isfinite(adj_a))
@@ -860,7 +933,7 @@ inline CUDA_CALLABLE void adj_length_sq(vec_t<Length, Type> a, vec_t<Length, Typ
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE void adj_normalize(vec_t<Length, Type> a, vec_t<Length, Type>& adj_a, const vec_t<Length, Type>& adj_ret)
+inline CUDA_CALLABLE void adj_normalize(vec_t<Length, Type> a, vec_t<Length, Type>& ret, vec_t<Length, Type>& adj_a, const vec_t<Length, Type>& adj_ret)
 {
     Type d = length(a);
     
@@ -868,9 +941,7 @@ inline CUDA_CALLABLE void adj_normalize(vec_t<Length, Type> a, vec_t<Length, Typ
     {
         Type invd = Type(1.0f)/d;
 
-        vec_t<Length, Type> ahat = normalize(a);
-
-        adj_a += (adj_ret*invd - ahat*(dot(ahat, adj_ret))*invd);
+        adj_a += (adj_ret*invd - ret*(dot(ret, adj_ret))*invd);
 
 #if FP_CHECK
         if (!isfinite(adj_a))
@@ -931,8 +1002,8 @@ inline CUDA_CALLABLE void adj_max(const vec_t<Length,Type> &v, vec_t<Length,Type
 
 // Do I need to specialize these for different lengths?
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE vec_t<Length, Type> atomic_add(vec_t<Length, Type> * addr, vec_t<Length, Type> value) {
-
+inline CUDA_CALLABLE vec_t<Length, Type> atomic_add(vec_t<Length, Type> * addr, vec_t<Length, Type> value)
+{
     vec_t<Length, Type> ret;
     for( unsigned i=0; i < Length; ++i )
     {
@@ -943,8 +1014,8 @@ inline CUDA_CALLABLE vec_t<Length, Type> atomic_add(vec_t<Length, Type> * addr, 
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE vec_t<Length, Type> atomic_min(vec_t<Length, Type> * addr, vec_t<Length, Type> value) {
-
+inline CUDA_CALLABLE vec_t<Length, Type> atomic_min(vec_t<Length, Type> * addr, vec_t<Length, Type> value)
+{
     vec_t<Length, Type> ret;
     for( unsigned i=0; i < Length; ++i )
     {
@@ -955,8 +1026,8 @@ inline CUDA_CALLABLE vec_t<Length, Type> atomic_min(vec_t<Length, Type> * addr, 
 }
 
 template<unsigned Length, typename Type>
-inline CUDA_CALLABLE vec_t<Length, Type> atomic_max(vec_t<Length, Type> * addr, vec_t<Length, Type> value) {
-
+inline CUDA_CALLABLE vec_t<Length, Type> atomic_max(vec_t<Length, Type> * addr, vec_t<Length, Type> value)
+{
     vec_t<Length, Type> ret;
     for( unsigned i=0; i < Length; ++i )
     {
@@ -964,6 +1035,17 @@ inline CUDA_CALLABLE vec_t<Length, Type> atomic_max(vec_t<Length, Type> * addr, 
     }
 
     return ret;
+}
+
+template<unsigned Length, typename Type>
+inline CUDA_CALLABLE void adj_atomic_minmax(
+    vec_t<Length,Type> *addr,
+    vec_t<Length,Type> *adj_addr,
+    const vec_t<Length,Type> &value,
+    vec_t<Length,Type> &adj_value)
+{
+    for (unsigned i=0; i < Length; ++i)
+        adj_atomic_minmax(&(addr->c[i]), &(adj_addr->c[i]), value[i], adj_value[i]);
 }
 
 // ok, the original implementation of this didn't take the absolute values.

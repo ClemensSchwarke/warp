@@ -5,12 +5,13 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import numpy as np
 import unittest
 from typing import Any
 
+import numpy as np
+
 import warp as wp
-from warp.tests.test_base import *
+from warp.tests.unittest_utils import *
 
 wp.init()
 
@@ -363,54 +364,198 @@ wp.overload(test_generic_struct_kernel, [Foo])
 wp.overload(test_generic_struct_kernel, [Bar])
 
 
-def register(parent):
-    class TestGenerics(parent):
-        pass
+@wp.kernel
+def test_generic_type_cast_kernel(a: Any, b: Any):
+    a = type(a)(b)
+    c = type(generic_adder(b, b))(a)
+    wp.expect_eq(b, c)
 
-    devices = get_test_devices()
 
-    add_kernel_test(TestGenerics, name="test_generic_adder", kernel=test_generic_adder, dim=1, devices=devices)
-    add_kernel_test(TestGenerics, name="test_specialized_func", kernel=test_specialized_func, dim=1, devices=devices)
+wp.overload(test_generic_type_cast_kernel, [wp.float32, wp.float64])
+wp.overload(test_generic_type_cast_kernel, [wp.float32, wp.int32])
+wp.overload(test_generic_type_cast_kernel, [wp.vec3f, wp.vec3d])
+wp.overload(test_generic_type_cast_kernel, [wp.mat22f, wp.mat22d])
 
-    add_function_test(TestGenerics, "test_generic_array_kernel", test_generic_array_kernel, devices=devices)
-    add_function_test(TestGenerics, "test_generic_accumulator_kernel", test_generic_accumulator_kernel, devices=devices)
-    add_function_test(TestGenerics, "test_generic_fill", test_generic_fill, devices=devices)
-    add_function_test(TestGenerics, "test_generic_fill_overloads", test_generic_fill_overloads, devices=devices)
-    add_function_test(TestGenerics, "test_generic_transform_kernel", test_generic_transform_kernel, devices=devices)
-    add_function_test(
-        TestGenerics, "test_generic_transform_array_kernel", test_generic_transform_array_kernel, devices=devices
-    )
 
-    foo = Foo()
-    foo.x = 17.0
-    foo.y = 25.0
-    foo.z = 42.0
+def test_generic_type_cast(test, device):
+    with wp.ScopedDevice(device):
+        wp.launch(test_generic_type_cast_kernel, dim=1, inputs=[1.0, 2.0])
+        wp.launch(test_generic_type_cast_kernel, dim=1, inputs=[2.0, -5])
+        wp.launch(test_generic_type_cast_kernel, dim=1, inputs=[wp.vec3f(1.0, 2.0, 3.0), wp.vec3d(4.0, 5.0, 6.0)])
+        wp.launch(test_generic_type_cast_kernel, dim=1, inputs=[wp.mat22f(0.0), wp.mat22d(np.eye(2))])
 
-    bar = Bar()
-    bar.x = wp.vec3(1, 2, 3)
-    bar.y = wp.vec3(10, 20, 30)
-    bar.z = wp.vec3(11, 22, 33)
+        wp.synchronize()
 
-    add_kernel_test(
-        TestGenerics,
-        name="test_generic_struct_kernel",
-        kernel=test_generic_struct_kernel,
-        dim=1,
-        inputs=[foo],
-        devices=devices,
-    )
-    add_kernel_test(
-        TestGenerics,
-        name="test_generic_struct_kernel",
-        kernel=test_generic_struct_kernel,
-        dim=1,
-        inputs=[bar],
-        devices=devices,
-    )
 
-    return TestGenerics
+@wp.kernel
+def test_generic_scalar_construction_kernel(a: wp.array(dtype=Any)):
+    zero = type(a[0])(0)
+    copy = a.dtype(a[0])
+    copy += zero
+    wp.expect_eq(copy, a[0])
 
+
+wp.overload(test_generic_scalar_construction_kernel, [wp.array(dtype=wp.int32)])
+wp.overload(test_generic_scalar_construction_kernel, [wp.array(dtype=wp.float64)])
+
+
+def test_generic_scalar_construction(test, device):
+    with wp.ScopedDevice(device):
+        wp.launch(test_generic_scalar_construction_kernel, dim=1, inputs=[wp.array([1.0], dtype=wp.int32)])
+        wp.launch(test_generic_scalar_construction_kernel, dim=1, inputs=[wp.array([-5], dtype=wp.float64)])
+
+        wp.synchronize()
+
+
+@wp.kernel
+def test_generic_type_construction_kernel(a: wp.array(dtype=Any)):
+    zero = type(a[0])()
+    copy = type(a).dtype(a[0]) * a.dtype.dtype(1.0)
+    copy += zero
+    wp.expect_eq(copy, a[0])
+
+
+wp.overload(test_generic_type_construction_kernel, [wp.array(dtype=wp.vec3f)])
+wp.overload(test_generic_type_construction_kernel, [wp.array(dtype=wp.mat22d)])
+
+
+def test_generic_type_construction(test, device):
+    with wp.ScopedDevice(device):
+        wp.launch(test_generic_type_construction_kernel, dim=1, inputs=[wp.array([1.0, 2.0, 3.0], dtype=wp.vec3f)])
+        wp.launch(test_generic_type_construction_kernel, dim=1, inputs=[wp.array([np.eye(2)], dtype=wp.mat22d)])
+
+        wp.synchronize()
+
+
+@wp.kernel
+def test_generic_struct_construction_kernel(a: Any):
+    b = type(a)(a.x, a.y, a.z)
+    wp.expect_eq(a.x, b.x)
+    wp.expect_eq(a.y, b.y)
+    wp.expect_eq(a.z, b.z)
+
+
+wp.overload(test_generic_struct_construction_kernel, [Foo])
+wp.overload(test_generic_struct_construction_kernel, [Bar])
+
+
+@wp.kernel
+def test_generic_type_as_argument_kernel(a: Any):
+    vec = wp.vector(length=2, dtype=type(a))
+    matrix = wp.identity(n=vec.length, dtype=vec.dtype) * a
+    wp.expect_eq(wp.trace(matrix), type(a)(2.0) * a)
+
+
+wp.overload(test_generic_type_as_argument_kernel, [wp.float32])
+wp.overload(test_generic_type_as_argument_kernel, [wp.float64])
+
+
+def test_generic_type_as_argument(test, device):
+    with wp.ScopedDevice(device):
+        wp.launch(test_generic_type_as_argument_kernel, dim=1, inputs=[2.0])
+        wp.launch(test_generic_type_as_argument_kernel, dim=1, inputs=[-1.0])
+
+        wp.synchronize()
+
+
+def test_type_operator_mispell(test, device):
+    @wp.kernel
+    def kernel():
+        i = wp.tid()
+        _ = typez(i)(0)
+
+    with test.assertRaisesRegex(RuntimeError, r"Unknown function or operator: 'typez'$"):
+        wp.launch(
+            kernel,
+            dim=1,
+            inputs=[],
+            device=device,
+        )
+
+
+def test_type_attribute_error(test, device):
+    @wp.kernel
+    def kernel():
+        a = wp.vec3(0.0)
+        _ = a.dtype.shape
+
+    with test.assertRaisesRegex(AttributeError, r"`shape` is not an attribute of '<class 'warp.types.float32'>'"):
+        wp.launch(
+            kernel,
+            dim=1,
+            inputs=[],
+            device=device,
+        )
+
+
+class TestGenerics(unittest.TestCase):
+    pass
+
+
+devices = get_test_devices()
+
+add_kernel_test(TestGenerics, name="test_generic_adder", kernel=test_generic_adder, dim=1, devices=devices)
+add_kernel_test(TestGenerics, name="test_specialized_func", kernel=test_specialized_func, dim=1, devices=devices)
+
+add_function_test(TestGenerics, "test_generic_array_kernel", test_generic_array_kernel, devices=devices)
+add_function_test(TestGenerics, "test_generic_accumulator_kernel", test_generic_accumulator_kernel, devices=devices)
+add_function_test(TestGenerics, "test_generic_fill", test_generic_fill, devices=devices)
+add_function_test(TestGenerics, "test_generic_fill_overloads", test_generic_fill_overloads, devices=devices)
+add_function_test(TestGenerics, "test_generic_transform_kernel", test_generic_transform_kernel, devices=devices)
+add_function_test(
+    TestGenerics, "test_generic_transform_array_kernel", test_generic_transform_array_kernel, devices=devices
+)
+add_function_test(TestGenerics, "test_generic_type_cast", test_generic_type_cast, devices=devices)
+add_function_test(TestGenerics, "test_generic_type_construction", test_generic_type_construction, devices=devices)
+add_function_test(TestGenerics, "test_generic_scalar_construction", test_generic_scalar_construction, devices=devices)
+add_function_test(TestGenerics, "test_generic_type_as_argument", test_generic_type_as_argument, devices=devices)
+
+foo = Foo()
+foo.x = 17.0
+foo.y = 25.0
+foo.z = 42.0
+
+bar = Bar()
+bar.x = wp.vec3(1, 2, 3)
+bar.y = wp.vec3(10, 20, 30)
+bar.z = wp.vec3(11, 22, 33)
+
+add_kernel_test(
+    TestGenerics,
+    name="test_generic_struct_kernel",
+    kernel=test_generic_struct_kernel,
+    dim=1,
+    inputs=[foo],
+    devices=devices,
+)
+add_kernel_test(
+    TestGenerics,
+    name="test_generic_struct_kernel",
+    kernel=test_generic_struct_kernel,
+    dim=1,
+    inputs=[bar],
+    devices=devices,
+)
+
+add_kernel_test(
+    TestGenerics,
+    name="test_generic_struct_construction_kernel",
+    kernel=test_generic_struct_construction_kernel,
+    dim=1,
+    inputs=[foo],
+    devices=devices,
+)
+add_kernel_test(
+    TestGenerics,
+    name="test_generic_struct_construction_kernel",
+    kernel=test_generic_struct_construction_kernel,
+    dim=1,
+    inputs=[bar],
+    devices=devices,
+)
+add_function_test(TestGenerics, "test_type_operator_mispell", test_type_operator_mispell, devices=devices)
+add_function_test(TestGenerics, "test_type_attribute_error", test_type_attribute_error, devices=devices)
 
 if __name__ == "__main__":
-    c = register(unittest.TestCase)
+    wp.build.clear_kernel_cache()
     unittest.main(verbosity=2)

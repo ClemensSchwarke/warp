@@ -251,8 +251,6 @@ CUDA_CALLABLE inline void adj_int8(T, T&, int8) {}
 template <typename T>
 CUDA_CALLABLE inline void adj_uint8(T, T&, uint8) {}
 template <typename T>
-CUDA_CALLABLE inline void adj_bool(T, T&, bool) {}
-template <typename T>
 CUDA_CALLABLE inline void adj_int16(T, T&, int16) {}
 template <typename T>
 CUDA_CALLABLE inline void adj_uint16(T, T&, uint16) {}
@@ -297,7 +295,7 @@ inline CUDA_CALLABLE T rshift(T a, T b) { return a>>b; } \
 inline CUDA_CALLABLE T invert(T x) { return ~x; } \
 inline CUDA_CALLABLE bool isfinite(T x) { return true; } \
 inline CUDA_CALLABLE void adj_mul(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
-inline CUDA_CALLABLE void adj_div(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
+inline CUDA_CALLABLE void adj_div(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_add(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_sub(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
 inline CUDA_CALLABLE void adj_mod(T a, T b, T& adj_a, T& adj_b, T adj_ret) { } \
@@ -435,11 +433,6 @@ inline CUDA_CALLABLE void adj_clamp(T x, T a, T b, T& adj_x, T& adj_a, T& adj_b,
     else\
         adj_x += adj_ret;\
 }\
-inline CUDA_CALLABLE void adj_round(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_rint(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_trunc(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_floor(T x, T& adj_x, T adj_ret){ }\
-inline CUDA_CALLABLE void adj_ceil(T x, T& adj_x, T adj_ret){ }\
 inline CUDA_CALLABLE T div(T a, T b)\
 {\
     DO_IF_FPCHECK(\
@@ -450,10 +443,10 @@ inline CUDA_CALLABLE T div(T a, T b)\
     })\
     return a/b;\
 }\
-inline CUDA_CALLABLE void adj_div(T a, T b, T& adj_a, T& adj_b, T adj_ret)\
+inline CUDA_CALLABLE void adj_div(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret)\
 {\
     adj_a += adj_ret/b;\
-    adj_b -= adj_ret*(a/b)/b;\
+    adj_b -= adj_ret*(ret)/b;\
     DO_IF_FPCHECK(\
     if (!isfinite(adj_a) || !isfinite(adj_b))\
     {\
@@ -792,6 +785,10 @@ inline CUDA_CALLABLE half sqrt(half x)
     return ::sqrtf(float(x));
 }
 
+inline CUDA_CALLABLE float cbrt(float x) { return ::cbrtf(x); }
+inline CUDA_CALLABLE double cbrt(double x) { return ::cbrt(x); }
+inline CUDA_CALLABLE half cbrt(half x) { return ::cbrtf(float(x)); }
+
 inline CUDA_CALLABLE float tan(float x) { return ::tanf(x); }
 inline CUDA_CALLABLE float sinh(float x) { return ::sinhf(x);}
 inline CUDA_CALLABLE float cosh(float x) { return ::coshf(x);}
@@ -818,6 +815,21 @@ inline CUDA_CALLABLE float rint(float x) { return ::rintf(x); }
 inline CUDA_CALLABLE float trunc(float x) { return ::truncf(x); }
 inline CUDA_CALLABLE float floor(float x) { return ::floorf(x); }
 inline CUDA_CALLABLE float ceil(float x) { return ::ceilf(x); }
+inline CUDA_CALLABLE float frac(float x) { return x - trunc(x); }
+
+inline CUDA_CALLABLE double round(double x) { return ::round(x); }
+inline CUDA_CALLABLE double rint(double x) { return ::rint(x); }
+inline CUDA_CALLABLE double trunc(double x) { return ::trunc(x); }
+inline CUDA_CALLABLE double floor(double x) { return ::floor(x); }
+inline CUDA_CALLABLE double ceil(double x) { return ::ceil(x); }
+inline CUDA_CALLABLE double frac(double x) { return x - trunc(x); }
+
+inline CUDA_CALLABLE half round(half x) { return ::roundf(float(x)); }
+inline CUDA_CALLABLE half rint(half x) { return ::rintf(float(x)); }
+inline CUDA_CALLABLE half trunc(half x) { return ::truncf(float(x)); }
+inline CUDA_CALLABLE half floor(half x) { return ::floorf(float(x)); }
+inline CUDA_CALLABLE half ceil(half x) { return ::ceilf(float(x)); }
+inline CUDA_CALLABLE half frac(half x) { return float(x) - trunc(float(x)); }
 
 #define DECLARE_ADJOINTS(T)\
 inline CUDA_CALLABLE void adj_log(T a, T& adj_a, T adj_ret)\
@@ -847,11 +859,11 @@ inline CUDA_CALLABLE void adj_log10(T a, T& adj_a, T adj_ret)\
         assert(0);\
     })\
 }\
-inline CUDA_CALLABLE void adj_exp(T a, T& adj_a, T adj_ret) { adj_a += exp(a)*adj_ret; }\
-inline CUDA_CALLABLE void adj_pow(T a, T b, T& adj_a, T& adj_b, T adj_ret)\
+inline CUDA_CALLABLE void adj_exp(T a, T ret, T& adj_a, T adj_ret) { adj_a += ret*adj_ret; }\
+inline CUDA_CALLABLE void adj_pow(T a, T b, T ret, T& adj_a, T& adj_b, T adj_ret)\
 { \
     adj_a += b*pow(a, b-T(1))*adj_ret;\
-    adj_b += log(a)*pow(a, b)*adj_ret;\
+    adj_b += log(a)*ret*adj_ret;\
     DO_IF_FPCHECK(if (!isfinite(adj_a) || !isfinite(adj_b))\
     {\
         printf("%s:%d - adj_pow(%f, %f, %f, %f, %f)\n", __FILE__, __LINE__, float(a), float(b), float(adj_a), float(adj_b), float(adj_ret));\
@@ -950,17 +962,25 @@ inline CUDA_CALLABLE void adj_cosh(T x, T& adj_x, T adj_ret)\
 {\
     adj_x += sinh(x)*adj_ret;\
 }\
-inline CUDA_CALLABLE void adj_tanh(T x, T& adj_x, T adj_ret)\
+inline CUDA_CALLABLE void adj_tanh(T x, T ret, T& adj_x, T adj_ret)\
 {\
-    T tanh_x = tanh(x);\
-    adj_x += (T(1) - tanh_x*tanh_x)*adj_ret;\
+    adj_x += (T(1) - ret*ret)*adj_ret;\
 }\
-inline CUDA_CALLABLE void adj_sqrt(T x, T& adj_x, T adj_ret)\
+inline CUDA_CALLABLE void adj_sqrt(T x, T ret, T& adj_x, T adj_ret)\
 {\
-    adj_x += T(0.5)*(T(1)/sqrt(x))*adj_ret;\
+    adj_x += T(0.5)*(T(1)/ret)*adj_ret;\
     DO_IF_FPCHECK(if (!isfinite(adj_x))\
     {\
         printf("%s:%d - adj_sqrt(%f, %f, %f)\n", __FILE__, __LINE__, float(x), float(adj_x), float(adj_ret));\
+        assert(0);\
+    })\
+}\
+inline CUDA_CALLABLE void adj_cbrt(T x, T ret, T& adj_x, T adj_ret)\
+{\
+    adj_x += (T(1)/T(3))*(T(1)/(ret*ret))*adj_ret;\
+    DO_IF_FPCHECK(if (!isfinite(adj_x))\
+    {\
+        printf("%s:%d - adj_cbrt(%f, %f, %f)\n", __FILE__, __LINE__, float(x), float(adj_x), float(adj_ret));\
         assert(0);\
     })\
 }\
@@ -971,7 +991,13 @@ inline CUDA_CALLABLE void adj_degrees(T x, T& adj_x, T adj_ret)\
 inline CUDA_CALLABLE void adj_radians(T x, T& adj_x, T adj_ret)\
 {\
     adj_x += DEG_TO_RAD * adj_ret;\
-}
+}\
+inline CUDA_CALLABLE void adj_round(T x, T& adj_x, T adj_ret){ }\
+inline CUDA_CALLABLE void adj_rint(T x, T& adj_x, T adj_ret){ }\
+inline CUDA_CALLABLE void adj_trunc(T x, T& adj_x, T adj_ret){ }\
+inline CUDA_CALLABLE void adj_floor(T x, T& adj_x, T adj_ret){ }\
+inline CUDA_CALLABLE void adj_ceil(T x, T& adj_x, T adj_ret){ }\
+inline CUDA_CALLABLE void adj_frac(T x, T& adj_x, T adj_ret){ }
 
 DECLARE_ADJOINTS(float16)
 DECLARE_ADJOINTS(float32)
@@ -995,17 +1021,31 @@ CUDA_CALLABLE inline void adj_select(const C& cond, const T& a, const T& b, C& a
 }
 
 template <typename T>
-CUDA_CALLABLE inline void copy(T& dest, const T& src)
+CUDA_CALLABLE inline T copy(const T& src)
+{
+    return src;
+}
+
+template <typename T>
+CUDA_CALLABLE inline void adj_copy(const T& src, T& adj_src, T& adj_dest)
+{
+    adj_src = adj_dest;
+    adj_dest = T{};
+}
+
+template <typename T>
+CUDA_CALLABLE inline void assign(T& dest, const T& src)
 {
     dest = src;
 }
 
 template <typename T>
-CUDA_CALLABLE inline void adj_copy(T& dest, const T& src, T& adj_dest, T& adj_src)
+CUDA_CALLABLE inline void adj_assign(T& dest, const T& src, T& adj_dest, T& adj_src)
 {
-    // nop, this is non-differentiable operation since it violates SSA
+    // this is generally a non-differentiable operation since it violates SSA,
+    // except in read-modify-write statements which are reversible through backpropagation
     adj_src = adj_dest;
-    adj_dest = T(0);
+    adj_dest = T{};
 }
 
 
@@ -1050,34 +1090,8 @@ struct launch_bounds_t
     size_t size;                // total number of threads
 };
 
-#ifdef __CUDACC__
-
-// store launch bounds in shared memory so
-// we can access them from any user func
-// this is to avoid having to explicitly
-// set another piece of __constant__ memory
-// from the host
-__shared__ launch_bounds_t s_launchBounds;
-
-__device__ inline void set_launch_bounds(const launch_bounds_t& b)
-{
-    if (threadIdx.x == 0)
-        s_launchBounds = b;
-
-    __syncthreads();
-}
-
-#else
-
-// for single-threaded CPU we store launch
-// bounds in static memory to share globally
-static launch_bounds_t s_launchBounds;
+#ifndef __CUDACC__
 static size_t s_threadIdx;
-
-inline void set_launch_bounds(const launch_bounds_t& b)
-{
-    s_launchBounds = b;
-}
 #endif
 
 inline CUDA_CALLABLE size_t grid_index()
@@ -1091,10 +1105,8 @@ inline CUDA_CALLABLE size_t grid_index()
 #endif
 }
 
-inline CUDA_CALLABLE int tid()
+inline CUDA_CALLABLE int tid(size_t index)
 {
-    const size_t index = grid_index();
-
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
     // Only do this in _DEBUG when called from device to avoid excessive register allocation
 #if defined(_DEBUG) || !defined(__CUDA_ARCH__)
@@ -1105,23 +1117,19 @@ inline CUDA_CALLABLE int tid()
     return static_cast<int>(index);
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, size_t index, const launch_bounds_t& launch_bounds)
 {
-    const size_t index = grid_index();
-
-    const size_t n = s_launchBounds.shape[1];
+    const size_t n = launch_bounds.shape[1];
 
     // convert to work item
     i = index/n;
     j = index%n;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, size_t index, const launch_bounds_t& launch_bounds)
 {
-    const size_t index = grid_index();
-
-    const size_t n = s_launchBounds.shape[1];
-    const size_t o = s_launchBounds.shape[2];
+    const size_t n = launch_bounds.shape[1];
+    const size_t o = launch_bounds.shape[2];
 
     // convert to work item
     i = index/(n*o);
@@ -1129,13 +1137,11 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k)
     k = index%o;
 }
 
-inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l)
+inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t index, const launch_bounds_t& launch_bounds)
 {
-    const size_t index = grid_index();
-
-    const size_t n = s_launchBounds.shape[1];
-    const size_t o = s_launchBounds.shape[2];
-    const size_t p = s_launchBounds.shape[3];
+    const size_t n = launch_bounds.shape[1];
+    const size_t o = launch_bounds.shape[2];
+    const size_t p = launch_bounds.shape[3];
 
     // convert to work item
     i = index/(n*o*p);
@@ -1265,8 +1271,35 @@ inline CUDA_CALLABLE int atomic_min(int* address, int val)
 #endif
 }
 
+// default behavior for adjoint of atomic min/max operation that accumulates gradients for all elements matching the min/max value
+template <typename T>
+CUDA_CALLABLE inline void adj_atomic_minmax(T *addr, T *adj_addr, const T &value, T &adj_value)
+{
+    if (value == *addr)
+        adj_value += *adj_addr;
+}
+
+// for integral types we do not accumulate gradients
+CUDA_CALLABLE inline void adj_atomic_minmax(int8* buf, int8* adj_buf, const int8 &value, int8 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(uint8* buf, uint8* adj_buf, const uint8 &value, uint8 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(int16* buf, int16* adj_buf, const int16 &value, int16 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(uint16* buf, uint16* adj_buf, const uint16 &value, uint16 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(int32* buf, int32* adj_buf, const int32 &value, int32 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(uint32* buf, uint32* adj_buf, const uint32 &value, uint32 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(int64* buf, int64* adj_buf, const int64 &value, int64 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(uint64* buf, uint64* adj_buf, const uint64 &value, uint64 &adj_value) { }
+CUDA_CALLABLE inline void adj_atomic_minmax(bool* buf, bool* adj_buf, const bool &value, bool &adj_value) { }
+
 
 } // namespace wp
+
+
+// bool and printf are defined outside of the wp namespace in crt.h, hence
+// their adjoint counterparts are also defined in the global namespace.
+template <typename T>
+CUDA_CALLABLE inline void adj_bool(T, T&, bool) {}
+inline CUDA_CALLABLE void adj_printf(const char* fmt, ...) {}
+
 
 #include "vec.h"
 #include "mat.h"
@@ -1430,10 +1463,6 @@ template<typename Type>
 inline CUDA_CALLABLE void adj_print(transform_t<Type> t, transform_t<Type>& adj_t) {}
 
 inline CUDA_CALLABLE void adj_print(str t, str& adj_t) {}
-
-
-// printf defined globally in crt.h
-inline CUDA_CALLABLE void adj_printf(const char* fmt, ...) {}
 
 
 template <typename T>
