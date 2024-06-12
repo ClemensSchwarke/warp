@@ -11,7 +11,7 @@
 namespace wp
 {
 
-const int kNumThreadsPerBlock = 256;
+
 
 CUDA_CALLABLE inline int dense_index(int stride, int i, int j)
 {
@@ -26,6 +26,10 @@ CUDA_CALLABLE inline int dense_index(int rows, int cols, int i, int j)
     else
         return i*cols + j;
 }
+
+#ifdef __CUDACC__
+
+const int kNumThreadsPerBlock = 256;
 
 template <bool t1, bool t2, bool add>
 CUDA_CALLABLE inline void dense_gemm_impl(int m, int n, int p, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C)
@@ -50,28 +54,33 @@ CUDA_CALLABLE inline void dense_gemm_impl(int m, int n, int p, const float* __re
     }
 }
 
-// template <bool t1, bool t2, bool add>
-// CUDA_CALLABLE inline void dense_gemm_impl(int m, int n, int p, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C)
-// {
-//     for (int i=0; i < m; i++)
-//     {
-//         for (int j=0; j < n; ++j)
-//         {
-//             float sum = 0.0f;
+#else
 
-//             for (int k=0; k < p; ++k)
-//             {
-//                 sum += A[dense_index<t1>(m, p, i, k)]*B[dense_index<t2>(p, n, k, j)];
-//             }
+const int kNumThreadsPerBlock = 1;
+
+template <bool t1, bool t2, bool add>
+CUDA_CALLABLE inline void dense_gemm_impl(int m, int n, int p, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C)
+{
+    for (int i=0; i < m; i++)
+    {
+        for (int j=0; j < n; ++j)
+        {
+            float sum = 0.0f;
+
+            for (int k=0; k < p; ++k)
+            {
+                sum += A[dense_index<t1>(m, p, i, k)]*B[dense_index<t2>(p, n, k, j)];
+            }
             
-//             if (add)
-//                 C[i*n + j] += sum;
-//             else
-//                 C[i*n + j] = sum;
-//         }
-//     }
-// }
+            if (add)
+                C[i*n + j] += sum;
+            else
+                C[i*n + j] = sum;
+        }
+    }
+}
 
+#endif
 
 template <bool add=false>
 CUDA_CALLABLE inline void dense_gemm(int m, int n, int p, int t1, int t2, const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C)
