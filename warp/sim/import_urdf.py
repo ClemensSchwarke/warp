@@ -235,7 +235,10 @@ def parse_urdf(
         # add ourselves to the index
         link_index[name] = link
 
+        # add geometr(ies) of collider(s) to their their specific link -> calls builder.add_shape...
+        # NOTE: not every link has collision defined.
         parse_shapes(link, colliders, density=density)
+
         m = builder.body_mass[link]
         if not ignore_inertial_definitions and urdf_link.find("inertial") is not None:
             # overwrite inertial parameters if defined
@@ -297,10 +300,10 @@ def parse_urdf(
         if joint.find("axis") is not None:
             joint_data["axis"] = joint.find("axis").get("xyz")
             joint_data["axis"] = np.array([float(x) for x in joint_data["axis"].split()])
-        if joint.find("dynamics") is not None:
-            dynamics = joint.find("dynamics")
-            joint_data["damping"] = float(dynamics.get("damping") or str(damping))
-            joint_data["friction"] = float(dynamics.get("friction") or "0")
+        # if joint.find("dynamics") is not None:
+        #     dynamics = joint.find("dynamics")
+        #     joint_data["damping"] = float(dynamics.get("damping") or str(damping))
+        #     joint_data["friction"] = float(dynamics.get("friction") or "0")
         if joint.find("limit") is not None:
             limit = joint.find("limit")
             joint_data["limit_lower"] = float(limit.get("lower") or "-1e6")

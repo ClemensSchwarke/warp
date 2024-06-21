@@ -1620,8 +1620,9 @@ class ModelBuilder:
 
         # articulation, hardcoded to work with legacy simulation
         if joint_type == JOINT_FREE and self.composite_rigid_body_alg:
-            self.joint_axis.append([0.0,0.0,0.0])
-            self.joint_target.extend([0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+            self.joint_axis.append([0.0, 0.0, 0.0])
+            self.joint_axis_mode.append(1.0)
+            self.joint_target.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             self.joint_target_ke.append(0.0)
             self.joint_target_kd.append(0.0)
             self.joint_limit_ke.append(0.0)
@@ -2124,17 +2125,17 @@ class ModelBuilder:
             body_children[parent].append(child)
 
             q_start = self.joint_q_start[i]
-            qd_start = self.joint_qd_start[i]
+            qd_start = self.joint_qd_start[i]  # start index of velocities of movable joints
             if i < self.joint_count - 1:
                 q_dim = self.joint_q_start[i + 1] - q_start
                 qd_dim = self.joint_qd_start[i + 1] - qd_start
             else:
                 q_dim = len(self.joint_q) - q_start
-                qd_dim = len(self.joint_qd) - qd_start
+                qd_dim = len(self.joint_qd) - qd_start  # qd_dim are nr of dof per joint
 
             data = {
                 "type": self.joint_type[i],
-                'armature': self.joint_armature[i],
+                'armature': self.joint_armature[qd_start : qd_start + qd_dim],
                 "q": self.joint_q[q_start : q_start + q_dim],
                 "qd": self.joint_qd[qd_start : qd_start + qd_dim],
                 "act": self.joint_act[qd_start : qd_start + qd_dim],
@@ -2154,10 +2155,13 @@ class ModelBuilder:
             }
             num_lin_axes, num_ang_axes = self.joint_axis_dim[i]
             start_ax = self.joint_axis_start[i]
+
+            # loop over actuated joints
+            # NOTE: For anymal, with 12 actuated joints, start_ax starts at 1
             for j in range(start_ax, start_ax + num_lin_axes + num_ang_axes):
                 data["axes"].append(
                     {
-                        "axis": self.joint_axis[j],
+                        "axis": self.joint_axis[j],  # in e.g. anymal, j=0 would be for base_joint, which we don't need
                         "axis_mode": self.joint_axis_mode[j],
                         "target": self.joint_target[j],
                         "target_ke": self.joint_target_ke[j],
@@ -2212,13 +2216,13 @@ class ModelBuilder:
                         m = body_data[child_body]["mass"]
                         com = body_data[child_body]["com"]
                         inertia = body_data[child_body]["inertia"]
-                        body_data[last_dynamic_body]["inertia"] += wp.sim.transform_inertia(
+                        body_data[last_dynamic_body]["inertia"] += transform_inertia(
                             m, inertia, incoming_xform.p, incoming_xform.q
                         )
                         body_data[last_dynamic_body]["mass"] += m
                         source_m = body_data[last_dynamic_body]["mass"]
                         source_com = body_data[last_dynamic_body]["com"]
-                        body_data[last_dynamic_body]["com"] = (m * com + source_m * source_com) / (m + source_m)
+                        body_data[last_dynamic_body]["com"] = (m * wp.vec3(com) + source_m * wp.vec3(source_com)) * (1.0 / (m + source_m))
                         body_data[last_dynamic_body]["shapes"].append(shape)
                         # indicate to recompute inverse mass, inertia for this body
                         body_data[last_dynamic_body]["inv_mass"] = None
