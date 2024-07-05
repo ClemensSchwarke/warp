@@ -2193,8 +2193,11 @@ class ModelBuilder:
 
             joint = joint_data[(parent_body, child_body)]
             if joint["type"] == JOINT_FIXED:
+                # NOTE: for anymal, joint["child_xform"] is always neutral
+                # joint_xform corresponds to transform of fixed joint
+                # if parent was transformed before, it's contained in incoming_xform
                 joint_xform = joint["parent_xform"] * wp.transform_inverse(joint["child_xform"])
-                incoming_xform = incoming_xform * joint_xform
+                incoming_xform = incoming_xform * joint_xform  # transform from child link to (merged) parent
                 parent_name = self.body_name[parent_body] if parent_body > -1 else "world"
                 child_name = self.body_name[child_body]
                 last_dynamic_body_name = self.body_name[last_dynamic_body] if last_dynamic_body > -1 else "world"
@@ -2204,6 +2207,7 @@ class ModelBuilder:
                         f"merging {child_name} into {last_dynamic_body_name}"
                     )
                 child_id = body_data[child_body]["original_id"]
+
                 for shape in self.body_shapes[child_id]:
                     self.shape_transform[shape] = incoming_xform * self.shape_transform[shape]
                     if verbose:
@@ -2212,22 +2216,41 @@ class ModelBuilder:
                         )
                     if last_dynamic_body > -1:
                         self.shape_body[shape] = body_data[last_dynamic_body]["id"]
-                        # add inertia to last_dynamic_body
-                        m = body_data[child_body]["mass"]
-                        com = body_data[child_body]["com"]
-                        inertia = body_data[child_body]["inertia"]
-                        body_data[last_dynamic_body]["inertia"] += transform_inertia(
-                            m, inertia, incoming_xform.p, incoming_xform.q
-                        )
-                        body_data[last_dynamic_body]["mass"] += m
-                        source_m = body_data[last_dynamic_body]["mass"]
-                        source_com = body_data[last_dynamic_body]["com"]
-                        body_data[last_dynamic_body]["com"] = (m * wp.vec3(com) + source_m * wp.vec3(source_com)) * (1.0 / (m + source_m))
                         body_data[last_dynamic_body]["shapes"].append(shape)
-                        # indicate to recompute inverse mass, inertia for this body
-                        body_data[last_dynamic_body]["inv_mass"] = None
+
                     else:
                         self.shape_body[shape] = -1
+
+                # add mass and inertia to last_dynamic_body
+                if last_dynamic_body > -1:
+
+                    # get values of the two bodies
+                    m = body_data[child_body]["mass"]
+                    com = wp.vec3(body_data[child_body]["com"])
+                    inertia = body_data[child_body]["inertia"]
+                    source_m = body_data[last_dynamic_body]["mass"]
+                    source_com = wp.vec3(body_data[last_dynamic_body]["com"])
+                    source_inertia = body_data[last_dynamic_body]["inertia"]
+
+                    # transform com (rotation + translation) of child to parent frame
+                    transformed_com = wp.transform_point(incoming_xform, com)
+
+                    # compute new com for merged body
+                    merged_com = (m * transformed_com + source_m * source_com) * (1.0 / (m + source_m))
+
+                    # compute distance to new com
+                    d = merged_com - transformed_com
+                    source_d = merged_com - source_com
+
+                    # shift inertia tensors to new com and merge
+                    merged_inertia = (transform_inertia(m, inertia, d, incoming_xform.q)
+                                      + transform_inertia(source_m, source_inertia, source_d, wp.quat_identity()))
+                    # update parent
+                    body_data[last_dynamic_body]["mass"] += m
+                    body_data[last_dynamic_body]["com"] = merged_com
+                    body_data[last_dynamic_body]["inertia"] = merged_inertia
+                    # indicate to recompute inverse mass, inertia for this body
+                    body_data[last_dynamic_body]["inv_mass"] = None
             else:
                 joint["parent_xform"] = incoming_xform * joint["parent_xform"]
                 joint["parent"] = last_dynamic_body
@@ -4024,6 +4047,9 @@ class ModelBuilder:
             m.body_inv_mass = wp.array(self.body_inv_mass, dtype=wp.float32, requires_grad=requires_grad)
             m.body_com = wp.array(self.body_com, dtype=wp.vec3, requires_grad=requires_grad)
             m.body_name = self.body_name
+            # print(f"[model.py]: Rigid body masses: {m.body_mass}")
+            # print(f"[model.py]: Rigid body inertias: {m.body_inertia}")
+            # print(f"[model.py]: Rigid body inertias: {m.body_com}")
 
             # joints
             m.joint_count = self.joint_count
