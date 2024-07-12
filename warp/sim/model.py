@@ -2247,7 +2247,17 @@ class ModelBuilder:
                                       + transform_inertia(source_m, source_inertia, source_d, wp.quat_identity()))
                     # update parent
                     body_data[last_dynamic_body]["mass"] += m
-                    body_data[last_dynamic_body]["com"] = merged_com
+
+                    # ATTENTION: NUMERICAL FIX FOR ANYMAL_C AND HARD CONTACT MODEL
+                    if (
+                        last_dynamic_body_name == "base"
+                        or "SHANK" in last_dynamic_body_name
+                        or "HIP" in last_dynamic_body_name
+                    ):
+                        body_data[last_dynamic_body]["com"] = merged_com + np.random.uniform(-0.0, 0.0, size=3)
+                    else:
+                        # original COM of THIGH: [3.0814720e-02, 4.6503836e-05, -2.4569565e-01]
+                        body_data[last_dynamic_body]["com"] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.21])
                     body_data[last_dynamic_body]["inertia"] = merged_inertia
                     # indicate to recompute inverse mass, inertia for this body
                     body_data[last_dynamic_body]["inv_mass"] = None
@@ -4049,7 +4059,7 @@ class ModelBuilder:
             m.body_name = self.body_name
             # print(f"[model.py]: Rigid body masses: {m.body_mass}")
             # print(f"[model.py]: Rigid body inertias: {m.body_inertia}")
-            # print(f"[model.py]: Rigid body inertias: {m.body_com}")
+            # print(f"[model.py]: Rigid body com: {m.body_com}")
 
             # joints
             m.joint_count = self.joint_count
