@@ -69,6 +69,7 @@ def spatial_transform_inertia(t: wp.transform, I: wp.spatial_matrix):
 
 @wp.kernel
 def eval_rigid_contacts_art(
+    articulation_count: int,
     contact_count: wp.array(dtype=int),
     body_X_s: wp.array(dtype=wp.transform),
     body_v_s: wp.array(dtype=wp.spatial_vector),
@@ -80,16 +81,22 @@ def eval_rigid_contacts_art(
     alpha: float,
     body_f_s: wp.array(dtype=wp.spatial_vector)):
 
-    tid = wp.tid()
+    tid = wp.tid()  # goes from 0 to rigid_contact_max
 
     count = contact_count[0]
     if tid >= count:
         return
 
-    c_body = contact_body[tid]
+    c_body = contact_body[tid]  # body nr of articulation
     c_point = contact_point[tid]
-    c_shape = contact_shape[tid]
+    c_shape = contact_shape[tid]  # collision shape nr of articualtion
     c_dist = geo.thickness[c_shape]
+
+    # hardcoded measure for anymal
+    contacts_per_articulation = count / articulation_count  # 26 for anymal with 13 cylinders
+    contact_id = tid % contacts_per_articulation  # base cylinder: 0,1; LF_THIGH: 2,3; LF_SHANK: 4,5; LF_FOOT: 6,7;... 
+    if c_shape % 3 != 0 or contact_id % 2 != 0:  # only consider bottom of foot cylinder
+        return
 
     # hard coded surface parameter tensor layout (ke, kd, kf, mu)
     ke = shape_materials.ke[c_shape]
@@ -139,6 +146,9 @@ def eval_rigid_contacts_art(
 
     # Coulomb friction (smooth, but gradients are numerically unstable around |vt| = 0)
     ft = compute_friction_force(vt, mu, kf, fn, fd, alpha)
+
+    # wp.printf("[Soft Contact Forces]: tid: %i\t, c_body: %i\t c_shape: %i\t fn: %.3f\t fd: %.3f\t ft: %.3f\t vn: %.3f\t vt: %.3f\t c: %.3f\n",
+    #           tid, c_body, c_shape, fn, fd, ft[0], vn, vt[0], c)
 
     f_total = n * (fn + fd) + ft
     t_total = wp.cross(p, f_total)
@@ -1197,6 +1207,7 @@ class SemiImplicitArticulationIntegrator:
                 kernel=eval_rigid_contacts_art,
                 dim=model.rigid_contact_max,
                 inputs=[
+                    model.articulation_count,
                     model.rigid_contact_count,
                     state_in.body_X_sc,
                     state_in.body_v_s,
