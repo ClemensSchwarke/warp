@@ -407,8 +407,11 @@ def jcalc_integrate(
         # translation of origin
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
-        # linear vel of origin (note q/qd switch order of linear angular elements)
-        # note we are converting the body twist in the space frame (w_s, v_s) to compute center of mass velcity
+        # (old comment) linear vel of origin (note q/qd switch order of linear angular elements)
+        # (old comment) note we are converting the body twist in the space frame (w_s, v_s) 
+        # (old comment) to compute center of mass velocity
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point p_s. p_s is not necessarily the com of the body, but of the joint.
         dpdt_s = v_s_avg + wp.cross(w_s_avg, p_s)
 
         # quat and quat derivative
@@ -864,7 +867,10 @@ def inertial_body_pos_vel(
         v_s = body_v_s[i]
         w = wp.spatial_top(v_s)
         v = wp.spatial_bottom(v_s)
-
+        
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point X_sc (= body_q). X_sc is not necessarily the com of the body, but of the
+        # anchor/coordinate frame (i.e joint's world position in case of anymal).
         v_inertial = v + wp.cross(w, wp.transform_get_translation(X_sc))
 
         body_q[i] = X_sc
