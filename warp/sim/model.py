@@ -2247,17 +2247,7 @@ class ModelBuilder:
                                       + transform_inertia(source_m, source_inertia, source_d, wp.quat_identity()))
                     # update parent
                     body_data[last_dynamic_body]["mass"] += m
-
-                    # ATTENTION: NUMERICAL FIX FOR ANYMAL_C AND HARD CONTACT MODEL
-                    if (
-                        last_dynamic_body_name == "base"
-                        or "SHANK" in last_dynamic_body_name
-                        or "HIP" in last_dynamic_body_name
-                    ):
-                        body_data[last_dynamic_body]["com"] = merged_com + np.random.uniform(-0.0, 0.0, size=3)
-                    else:
-                        # original COM of THIGH: [3.0814720e-02, 4.6503836e-05, -2.4569565e-01]
-                        body_data[last_dynamic_body]["com"] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.21])
+                    body_data[last_dynamic_body]["com"] = merged_com
                     body_data[last_dynamic_body]["inertia"] = merged_inertia
                     # indicate to recompute inverse mass, inertia for this body
                     body_data[last_dynamic_body]["inv_mass"] = None
@@ -2375,6 +2365,16 @@ class ModelBuilder:
                 self.joint_limit_upper.append(axis["limit_upper"])
                 self.joint_limit_ke.append(axis["limit_ke"])
                 self.joint_limit_kd.append(axis["limit_kd"])
+
+        # ATTENTION: NUMERICAL FIX FOR ANYMAL_C AND HARD CONTACT MODEL
+        # original COM of THIGH: [3.0814720e-02, 4.6503836e-05, -2.4569565e-01]
+        self.body_com[2] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
+        self.body_com[5] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
+        self.body_com[8] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
+        self.body_com[11] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
+        # self.body_mass = [0.1 * mass for mass in self.body_mass]
+        # print("[model.py]: body masses:")
+        # print(self.body_mass)
 
     # muscles
     def add_muscle(
