@@ -17,9 +17,9 @@ from .model import ModelShapeGeometry, ModelShapeMaterials
 
 @wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
-    return (
-        1.0 / (1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))) #/ 0.9
-    )  # clamp for stability (exp gradients) unstable from around 85
+    return 1.0 / (
+        1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))
+    )  # / 0.9  # clamp for stability (exp gradients) unstable from around 85
 
 
 # # Frank & Park definition 3.20, pg 100
@@ -421,7 +421,7 @@ def jcalc_integrate(
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
         # (old comment) linear vel of origin (note q/qd switch order of linear angular elements)
-        # (old comment) note we are converting the body twist in the space frame (w_s, v_s) 
+        # (old comment) note we are converting the body twist in the space frame (w_s, v_s)
         # (old comment) to compute center of mass velocity
         # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
         # inertial velocity of the point p_s. p_s is not necessarily the com of the body, but of the joint.
@@ -892,7 +892,7 @@ def inertial_body_pos_vel(
         v_s = body_v_s[i]
         w = wp.spatial_top(v_s)
         v = wp.spatial_bottom(v_s)
-        
+
         # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
         # inertial velocity of the point X_sc (= body_q). X_sc is not necessarily the com of the body, but of the
         # anchor/coordinate frame (i.e joint's world position in case of anymal).

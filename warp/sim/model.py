@@ -700,15 +700,15 @@ class Model:
 
             # rigid contact data
             # contact points of quadruped feet
-            s.point_vec = wp.zeros(self.articulation_count*4, dtype=wp.vec3, requires_grad=True)
+            s.point_vec = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
             s.percussion = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
             # s.percussion_vec = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            
+
             # compute G and c
-            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True) # maybe set to 0?
-            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            s.Jc_qd = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            s.c = wp.zeros(self.articulation_count*4*3, requires_grad=True)
+            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)  # maybe set to 0?
+            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
+            s.Jc_qd = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
+            s.c = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
             s.c_vec = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
             # s.JcT_p = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)
@@ -756,7 +756,7 @@ class Model:
 
             s.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             s.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            s.G_mat = wp.zeros((self.articulation_count,4,4), dtype=wp.mat33, requires_grad=True)
+            s.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
 
             s.toi = wp.zeros(self.articulation_count, dtype=wp.float32, requires_grad=True)
 
@@ -778,10 +778,10 @@ class Model:
             self.J = wp.zeros(self.J_size, dtype=wp.float32, requires_grad=True)
             self.P = wp.empty(self.J_size, dtype=wp.float32, requires_grad=True)
             self.H = wp.empty(self.H_size, dtype=wp.float32, requires_grad=True)
-            self.L = wp.zeros(self.H_size, dtype=wp.float32,requires_grad=True)
+            self.L = wp.zeros(self.H_size, dtype=wp.float32, requires_grad=True)
             self.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             self.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            self.G_mat = wp.zeros((self.articulation_count,4,4), dtype=wp.mat33, requires_grad=True)
+            self.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
 
     def find_shape_contact_pairs(self):
         # find potential contact pairs based on collision groups and collision mask (pairwise filtering)
@@ -925,8 +925,7 @@ class Model:
             len(self.body_q), dtype=wp.float32, device=self.device, requires_grad=requires_grad
         )
         # contact bodies of quadruped feet
-        self.c_body_vec = wp.zeros(self.articulation_count*4, dtype=wp.int32, device=self.device)
-        
+        self.c_body_vec = wp.zeros(self.articulation_count * 4, dtype=wp.int32, device=self.device)
 
     def flatten(self):
         """Returns a list of Tensors stored by the model
@@ -1076,7 +1075,7 @@ class ModelBuilder:
     # Default geo settings
     default_geo_thickness = 1e-5
 
-    def __init__(self, up_vector=(0.0, 1.0, 0.0), gravity=-9.80665, composite_rigid_body_alg = False):
+    def __init__(self, up_vector=(0.0, 1.0, 0.0), gravity=-9.80665, composite_rigid_body_alg=False):
         self.num_envs = 0
 
         # particles
@@ -4054,7 +4053,6 @@ class ModelBuilder:
 
             # --------------------------------------
             # rigid bodies
-
             m.body_q = wp.array(self.body_q, dtype=wp.transform, requires_grad=requires_grad)
             m.body_qd = wp.array(self.body_qd, dtype=wp.spatial_vector, requires_grad=requires_grad)
             m.body_inertia = wp.array(self.body_inertia, dtype=wp.mat33, requires_grad=requires_grad)
