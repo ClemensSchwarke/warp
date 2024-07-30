@@ -2371,16 +2371,6 @@ class ModelBuilder:
                 self.joint_limit_ke.append(axis["limit_ke"])
                 self.joint_limit_kd.append(axis["limit_kd"])
 
-        # ATTENTION: NUMERICAL FIX FOR ANYMAL_C AND HARD CONTACT MODEL
-        # original COM of THIGH: [3.0814720e-02, 4.6503836e-05, -2.4569565e-01]
-        self.body_com[2] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
-        self.body_com[5] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
-        self.body_com[8] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
-        self.body_com[11] = wp.vec3([3.0814720e-02, 4.6503836e-05, -0.24]) + np.random.uniform(-0.0, 0.0, size=3)
-        # self.body_mass = [0.1 * mass for mass in self.body_mass]
-        # print("[model.py]: body masses:")
-        # print(self.body_mass)
-
     # muscles
     def add_muscle(
         self, bodies: List[int], positions: List[Vec3], f0: float, lm: float, lt: float, lmax: float, pen: float
