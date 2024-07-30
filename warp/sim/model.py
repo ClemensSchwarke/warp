@@ -591,6 +591,8 @@ class Model:
         self.joint_qd_start = None
         self.articulation_start = None
         self.joint_name = None
+        self.joint_static_friction = None
+        self.joint_dynamic_friction = None
 
         self.composite_rigid_body_alg = False
 
@@ -1181,6 +1183,8 @@ class ModelBuilder:
         self.joint_limit_ke = []
         self.joint_limit_kd = []
         self.joint_act = []
+        self.joint_static_friction = []
+        self.joint_dynamic_friction = []
 
         self.joint_twist_lower = []
         self.joint_twist_upper = []
@@ -1406,6 +1410,8 @@ class ModelBuilder:
             "joint_target",
             "joint_target_ke",
             "joint_target_kd",
+            "joint_static_friction",
+            "joint_dynamic_friction",
             "joint_linear_compliance",
             "joint_angular_compliance",
             "shape_geo_type",
@@ -4083,6 +4089,8 @@ class ModelBuilder:
             m.joint_target_kd = wp.array(self.joint_target_kd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_axis_mode = wp.array(self.joint_axis_mode, dtype=wp.uint8)
             m.joint_act = wp.array(self.joint_act, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_static_friction = wp.array(self.joint_static_friction, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_dynamic_friction = wp.array(self.joint_dynamic_friction, dtype=wp.float32, requires_grad=requires_grad)
 
             m.joint_limit_lower = wp.array(self.joint_limit_lower, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_limit_upper = wp.array(self.joint_limit_upper, dtype=wp.float32, requires_grad=requires_grad)

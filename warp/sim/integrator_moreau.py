@@ -289,6 +289,8 @@ def jcalc_tau(
     target_k_d: float,
     limit_k_e: float,
     limit_k_d: float,
+    joint_static_friction: float,
+    joint_dynamic_friction: float,
     max_torque: float,
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
@@ -325,11 +327,22 @@ def jcalc_tau(
 
         damping_f = (0.0 - limit_k_d) * qd
 
+        # friction
+        t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
+        if wp.abs(t_2) > joint_static_friction:
+            t_2 += 0.0 - joint_dynamic_friction * qd
+        else:
+            t_2 = 0.0
+
+        # velocity-based torque limit
+        peak_torque = 120.0  # TODO: transfer this into config file
+        velocity_limit = 7.5  # TODO: transfer this into config file
+        max_torque_limit = wp.clamp(peak_torque * (1.0 - qd / velocity_limit), 0.0, max_torque)
+        min_torque_limit = wp.clamp(peak_torque * (-1.0 - qd / velocity_limit), -max_torque, 0.0)
+
         # total torque / force on the joint
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
-        t_2 = wp.clamp(
-            0.0 - target_k_e * (q - target) - target_k_d * qd + act + limit_f + damping_f, 0.0 - max_torque, max_torque
-        )
+        t_2 = wp.clamp(t_2 + act + limit_f + damping_f, min_torque_limit, max_torque_limit)
 
         tau[dof_start] = t_1 + t_2
 
@@ -576,6 +589,8 @@ def compute_link_tau(
     joint_target: wp.array(dtype=float),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
     max_torque: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
@@ -601,6 +616,10 @@ def compute_link_tau(
     limit_k_e = joint_limit_ke[i]
     limit_k_d = joint_limit_kd[i]
 
+    # friction
+    static_friction = joint_static_friction[i]
+    dynamic_friction = joint_dynamic_friction[i]
+
     # total forces on body
     f_b_s = body_fb_s[i]
     f_t_s = body_ft_s[i]
@@ -614,6 +633,8 @@ def compute_link_tau(
         target_k_d,
         limit_k_e,
         limit_k_d,
+        static_friction,
+        dynamic_friction,
         max_torque,
         joint_S_s,
         joint_q,
@@ -737,6 +758,8 @@ def eval_rigid_tau(
     joint_target: wp.array(dtype=float),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -771,6 +794,8 @@ def eval_rigid_tau(
             joint_target,
             joint_target_ke,
             joint_target_kd,
+            joint_static_friction,
+            joint_dynamic_friction,
             max_torque,
             joint_limit_lower,
             joint_limit_upper,
@@ -1215,47 +1240,48 @@ def prox_wo_iteration(
     percussion[tid, 3] = p_3
 
 
-@wp.kernel
-def prox_iteration(
-    G_mat: wp.array3d(dtype=wp.mat33),
-    c_vec: wp.array2d(dtype=wp.vec3),
-    mu: float,
-    prox_iter: int,
-    percussion: wp.array2d(dtype=wp.vec3),
-):
-    tid = wp.tid()
+# depreciated (?)
+# @wp.kernel
+# def prox_iteration(
+#     G_mat: wp.array3d(dtype=wp.mat33),
+#     c_vec: wp.array2d(dtype=wp.vec3),
+#     mu: float,
+#     prox_iter: int,
+#     percussion: wp.array2d(dtype=wp.vec3),
+# ):
+#     tid = wp.tid()
 
-    # initialize percussions with steady state
-    for i in range(4):
-        percussion[tid, i] = -wp.inverse(G_mat[tid, i, i]) * c_vec[tid, i]
-        # overwrite percussions with steady state only in normal direction
-        # percussion[tid, i] = wp.vec3(0.0, percussion[tid, i][1], 0.0)
+#     # initialize percussions with steady state
+#     for i in range(4):
+#         percussion[tid, i] = -wp.inverse(G_mat[tid, i, i]) * c_vec[tid, i]
+#         # overwrite percussions with steady state only in normal direction
+#         # percussion[tid, i] = wp.vec3(0.0, percussion[tid, i][1], 0.0)
 
-    # # solve percussions iteratively
-    for it in range(prox_iter):
-        for i in range(4):
-            # calculate sum(G_ij*p_j) and sum over det(G_ij)
-            sum = wp.vec3(0.0, 0.0, 0.0)
-            r_sum = 0.0
-            for j in range(4):
-                sum += G_mat[tid, i, j] * percussion[tid, j]
-                r_sum += wp.determinant(G_mat[tid, i, j])
-            r = 1.0 / (1.0 + r_sum)  # +1 for stability
+#     # # solve percussions iteratively
+#     for it in range(prox_iter):
+#         for i in range(4):
+#             # calculate sum(G_ij*p_j) and sum over det(G_ij)
+#             sum = wp.vec3(0.0, 0.0, 0.0)
+#             r_sum = 0.0
+#             for j in range(4):
+#                 sum += G_mat[tid, i, j] * percussion[tid, j]
+#                 r_sum += wp.determinant(G_mat[tid, i, j])
+#             r = 1.0 / (1.0 + r_sum)  # +1 for stability
 
-            # update percussion
-            percussion[tid, i] = percussion[tid, i] - r * (sum + c_vec[tid, i])
+#             # update percussion
+#             percussion[tid, i] = percussion[tid, i] - r * (sum + c_vec[tid, i])
 
-            # projection to friction cone
-            if percussion[tid, i][1] <= 0.0:
-                percussion[tid, i] = wp.vec3(0.0, 0.0, 0.0)
-            elif percussion[tid, i][0] != 0.0 or percussion[tid, i][2] != 0.0:
-                fm = wp.sqrt(percussion[tid, i][0] ** 2.0 + percussion[tid, i][2] ** 2.0)  # friction magnitude
-                if mu * percussion[tid, i][1] < fm:
-                    percussion[tid, i] = wp.vec3(
-                        percussion[tid, i][0] * mu * percussion[tid, i][1] / fm,
-                        percussion[tid, i][1],
-                        percussion[tid, i][2] * mu * percussion[tid, i][1] / fm,
-                    )
+#             # projection to friction cone
+#             if percussion[tid, i][1] <= 0.0:
+#                 percussion[tid, i] = wp.vec3(0.0, 0.0, 0.0)
+#             elif percussion[tid, i][0] != 0.0 or percussion[tid, i][2] != 0.0:
+#                 fm = wp.sqrt(percussion[tid, i][0] ** 2.0 + percussion[tid, i][2] ** 2.0)  # friction magnitude
+#                 if mu * percussion[tid, i][1] < fm:
+#                     percussion[tid, i] = wp.vec3(
+#                         percussion[tid, i][0] * mu * percussion[tid, i][1] / fm,
+#                         percussion[tid, i][1],
+#                         percussion[tid, i][2] * mu * percussion[tid, i][1] / fm,
+#                     )
 
 
 @wp.func
@@ -1962,6 +1988,8 @@ class MoreauIntegrator:
                 model.joint_target,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -1998,6 +2026,8 @@ class MoreauIntegrator:
                 model.joint_target,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
