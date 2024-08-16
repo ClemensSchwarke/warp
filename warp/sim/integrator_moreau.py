@@ -329,10 +329,12 @@ def jcalc_tau(
 
         # friction
         t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
-        if wp.abs(t_2) > joint_static_friction:
-            t_2 += 0.0 - joint_dynamic_friction * qd
-        else:
-            t_2 = 0.0
+        # NOTE: we currently ignore if-else, since it's not diff'able and assume static friction is 0
+        # if wp.abs(t_2) > joint_static_friction:
+        #     t_2 += 0.0 - joint_dynamic_friction * qd
+        # else:
+        #     t_2 = 0.0
+        t_2 += 0.0 - joint_dynamic_friction * qd
 
         # velocity-based torque limit
         peak_torque = 120.0  # TODO: transfer this into config file
