@@ -52,6 +52,28 @@ def compute_contact_points(
     contact_pos1[tid] = wp.transform_point(X_wb_b, contact_point1[tid])
 
 
+@wp.kernel
+def compute_coms(
+    body_q: wp.array(dtype=wp.transform),  # current body position and orientation
+    joint_X_cm: wp.array(dtype=wp.transform),  # bodies center of mass relative to body_q
+    # outputs
+    body_X_sm: wp.array(dtype=wp.transform),  # center of mass in world frame
+):
+    tid = wp.tid()  # nr of bodies
+
+    # get body transform
+    # print("tid")
+    # print(tid)
+    X_sc = body_q[tid]
+
+    # compute transform of center of mass
+    X_cm = joint_X_cm[tid]
+    X_sm = wp.transform_multiply(X_sc, X_cm)
+
+    # store transform
+    body_X_sm[tid] = X_sm
+
+
 def CreateSimRenderer(renderer):
     class SimRenderer(renderer):
         use_unique_colors = True
@@ -66,6 +88,7 @@ def CreateSimRenderer(renderer):
             show_rigid_contact_points=False,
             contact_points_radius=1e-3,
             show_joints=False,
+            show_coms=False,
             **render_kwargs,
         ):
             # create USD stage
@@ -74,6 +97,7 @@ def CreateSimRenderer(renderer):
             self.cam_axis = "XYZ".index(up_axis.upper())
             self.show_rigid_contact_points = show_rigid_contact_points
             self.show_joints = show_joints
+            self.show_coms = show_coms
             self.contact_points_radius = contact_points_radius
             self.populate(model)
 
@@ -371,6 +395,38 @@ def CreateSimRenderer(renderer):
                         self.contact_points1.numpy(),
                         radius=self.contact_points_radius * self.scaling,
                         colors=self.contact_points1_colors,
+                    )
+
+            # debug to visualize COMs
+            if self.show_coms:
+                # print("Computing coms for rendering...")
+                wp.launch(
+                    kernel=compute_coms,
+                    dim=self.model.body_count,
+                    inputs=[
+                        state.body_q,
+                        self.model.joint_X_cm,
+                    ],
+                    outputs=[
+                        state.body_X_sm,
+                    ],
+                    device=self.model.device,
+                )
+                # iterate over bodies
+                body_X_sm = state.body_X_sm.numpy()
+                for i in range(body_X_sm.shape[0]):
+
+                    # set radius of sphere
+                    radius = 0.025
+                    if i == 0:
+                        radius = 0.12  # base
+                    self.render_sphere(
+                        pos=body_X_sm[i, :3],
+                        rot=body_X_sm[i, 3:7],
+                        radius=radius,
+                        name=f"body_{i}_com",
+                        color=(1.0, 0.0, 0.0),
+                        is_template=False
                     )
 
     return SimRenderer

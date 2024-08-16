@@ -252,7 +252,14 @@ class UsdRenderer:
         mesh.GetFaceVertexIndicesAttr().Set(indices)
 
     def render_sphere(
-        self, name: str, pos: tuple, rot: tuple, radius: float, parent_body: str = None, is_template: bool = False
+        self,
+        name: str,
+        pos: tuple,
+        rot: tuple,
+        radius: float,
+        parent_body: str = None,
+        is_template: bool = False,
+        color: tuple = None,
     ):
         """Debug helper to add a sphere for visualization
 
@@ -262,7 +269,7 @@ class UsdRenderer:
             name: A name for the USD prim on the stage
         """
 
-        from pxr import UsdGeom, Sdf
+        from pxr import Gf, UsdGeom, Sdf
 
         if is_template:
             prim_path = self._resolve_path(name, parent_body, is_template)
@@ -282,10 +289,13 @@ class UsdRenderer:
 
         sphere.GetRadiusAttr().Set(radius, self.time)
 
+        if color is not None:
+            sphere.GetDisplayColorAttr().Set([Gf.Vec3f(color)], self.time)
+
         self._shape_constructors[name] = UsdGeom.Sphere
 
         if not is_template:
-            _usd_set_xform(sphere, pos, rot, (1.0, 1.0, 1.0), 0.0)
+            _usd_set_xform(sphere, pos, rot, (1.0, 1.0, 1.0), self.time)
 
         return prim_path
 
