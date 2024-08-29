@@ -38,6 +38,7 @@ def parse_urdf(
     parse_visuals_as_colliders=False,
     enable_self_collisions=True,
     ignore_inertial_definitions=True,
+    ignore_undefined_masses=True,
     ensure_nonstatic_links=True,
     static_link_mass=1e-2,
     collapse_fixed_joints=False,
@@ -240,6 +241,8 @@ def parse_urdf(
         parse_shapes(link, colliders, density=density)
 
         m = builder.body_mass[link]
+        if ignore_undefined_masses:
+            m = 0.0  # avoids masses being computed by collision shapes and their density. Problem for anymal_d
         if not ignore_inertial_definitions and urdf_link.find("inertial") is not None:
             # overwrite inertial parameters if defined
             inertial = urdf_link.find("inertial")
@@ -304,10 +307,10 @@ def parse_urdf(
         #     dynamics = joint.find("dynamics")
         #     joint_data["damping"] = float(dynamics.get("damping") or str(damping))
         #     joint_data["friction"] = float(dynamics.get("friction") or "0")
-        if joint.find("limit") is not None:
-            limit = joint.find("limit")
-            joint_data["limit_lower"] = float(limit.get("lower") or "-1e6")
-            joint_data["limit_upper"] = float(limit.get("upper") or "1e6")
+        # if joint.find("limit") is not None:
+        #     limit = joint.find("limit")
+        #     joint_data["limit_lower"] = float(limit.get("lower") or "-1e6")
+        #     joint_data["limit_upper"] = float(limit.get("upper") or "1e6")
         if joint.find("mimic") is not None:
             mimic = joint.find("mimic")
             joint_data["mimic_joint"] = mimic.get("joint")
