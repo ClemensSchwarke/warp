@@ -224,6 +224,8 @@ def parse_urdf(
     start_shape_count = len(builder.shape_geo_type)
 
     # add links
+    count_overwrites = 0
+    count_static = 0
     for i, urdf_link in enumerate(root.findall("link")):
         if parse_visuals_as_colliders:
             colliders = urdf_link.findall("visual")
@@ -241,10 +243,14 @@ def parse_urdf(
         parse_shapes(link, colliders, density=density)
 
         m = builder.body_mass[link]
+        # print("[import_urdf.py] link name: ", name)
+        # print("[import_urdf.py] link mass: ", m)
         if ignore_undefined_masses:
             m = 0.0  # avoids masses being computed by collision shapes and their density. Problem for anymal_d
         if not ignore_inertial_definitions and urdf_link.find("inertial") is not None:
             # overwrite inertial parameters if defined
+            # print("[import_urdf.py] overwriting inertial parameters...")
+            count_overwrites += 1
             inertial = urdf_link.find("inertial")
             inertial_frame = parse_transform(inertial)
             com = inertial_frame.p
@@ -269,6 +275,8 @@ def parse_urdf(
             builder.body_inv_inertia[link] = np.linalg.inv(I_m)
         if m == 0.0 and ensure_nonstatic_links:
             # set the mass to something nonzero to ensure the body is dynamic
+            # print("[import_urdf.py] Adding static link mass to undefined masses...")
+            count_static += 1
             m = static_link_mass
             # cube with side length 0.5
             I_m = np.eye(3) * m / 12.0 * (0.5 * scale) ** 2 * 2.0
@@ -277,6 +285,12 @@ def parse_urdf(
             builder.body_inertia[link] = I_m
             builder.body_inv_inertia[link] = np.linalg.inv(I_m)
 
+        # print("[import_urdf.py] link mass end: ", builder.body_mass[link])
+
+    print("[import_urdf.py] Total number of links: ", i + 1,
+          "   links overwritten with urdf data: ", count_overwrites,
+          "   static links: ", count_static,
+          "   links with mass computed from density: ", i + 1 - count_overwrites - count_static)
     end_shape_count = len(builder.shape_geo_type)
 
     # find joints per body
