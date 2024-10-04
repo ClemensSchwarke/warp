@@ -1705,6 +1705,9 @@ def p_to_f_s(
 
     for i in range(4):
         f = (-percussion[tid, i] / dt) * (1.0 - beta)
+        # print("f:")
+        # print(f)
+        # wp.printf("Contact nr, f[0], f[1], f[2]: %i %.3f %.3f %.3f\n", i, f[0], f[1], f[2])
         t = (wp.cross(point_vec[tid * 4 + i], f)) * (1.0 - beta)
         wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
 
@@ -1779,6 +1782,30 @@ def create_matrix(
         A[A_start[tid] + i + 162] = a_10[a_start[tid] + i]
         A[A_start[tid] + i + 180] = a_11[a_start[tid] + i]
         A[A_start[tid] + i + 198] = a_12[a_start[tid] + i]
+
+
+@wp.kernel
+def copy_relevant_states(
+    # input
+    percussion_in: wp.array2d(dtype=wp.vec3),
+    point_vec_in: wp.array(dtype=wp.vec3),
+    # ouput
+    percussion_out: wp.array2d(dtype=wp.vec3),
+    point_vec_out: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    # NOTE: these states assume hardcoded indices for quadruped feet
+
+    percussion_out[tid, 0] = percussion_in[tid, 0]
+    percussion_out[tid, 1] = percussion_in[tid, 1]
+    percussion_out[tid, 2] = percussion_in[tid, 2]
+    percussion_out[tid, 3] = percussion_in[tid, 3]
+
+    point_vec_out[tid * 4 + 0] = point_vec_in[tid * 4 + 0]  # array has length envs * 4, containing 3-d vecs
+    point_vec_out[tid * 4 + 1] = point_vec_in[tid * 4 + 1]
+    point_vec_out[tid * 4 + 2] = point_vec_in[tid * 4 + 2]
+    point_vec_out[tid * 4 + 3] = point_vec_in[tid * 4 + 3]
 
 
 ##########################
@@ -2045,6 +2072,15 @@ class MoreauIntegrator:
             dim=model.articulation_count,
             inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
             outputs=[state_out.body_q, state_out.body_qd],
+        )
+
+        # copy relevant states to have them in state_out
+        # kernel -1
+        wp.launch(
+            kernel=copy_relevant_states,
+            dim=model.articulation_count,
+            inputs=[state_mid.percussion, state_mid.point_vec],
+            outputs=[state_out.percussion, state_out.point_vec],
         )
 
         return state_out
