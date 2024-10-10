@@ -17,8 +17,8 @@ from .model import ModelShapeGeometry, ModelShapeMaterials
 
 @wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
-    return (
-        1.0 / (1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))) #/ 0.9
+    return 1.0 / (
+        1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))
     )  # clamp for stability (exp gradients) unstable from around 85
 
 
@@ -69,98 +69,6 @@ def spatial_transform_inertia(t: wp.transform, I: wp.spatial_matrix):
     T = wp.spatial_adjoint(R, S)
 
     return wp.mul(wp.mul(wp.transpose(T), I), T)
-
-
-@wp.kernel
-def eval_rigid_contacts_art(
-    beta: float,
-    contact_count: wp.array(dtype=int),
-    body_X_s: wp.array(dtype=wp.transform),
-    body_v_s: wp.array(dtype=wp.spatial_vector),
-    contact_body: wp.array(dtype=int),
-    contact_point: wp.array(dtype=wp.vec3),
-    contact_shape: wp.array(dtype=int),
-    shape_materials: ModelShapeMaterials,
-    geo: ModelShapeGeometry,
-    body_f_s: wp.array(dtype=wp.spatial_vector),
-):
-    tid = wp.tid()
-
-    count = contact_count[0]
-    if tid >= count:
-        return
-
-    c_body = contact_body[tid]
-    c_point = contact_point[tid]
-    c_shape = contact_shape[tid]
-    c_dist = geo.thickness[c_shape]
-
-    # hard coded surface parameter tensor layout (ke, kd, kf, mu)
-    ke = shape_materials.ke[c_shape]
-    kd = shape_materials.kd[c_shape]
-    kf = shape_materials.kf[c_shape]
-    mu = shape_materials.mu[c_shape]
-
-    X_s = body_X_s[c_body]  # position of colliding body
-    v_s = body_v_s[c_body]  # orientation of colliding body
-
-    n = wp.vec3(0.0, 1.0, 0.0)
-
-    # transform point to world space
-    p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
-
-    w = wp.spatial_top(v_s)
-    v = wp.spatial_bottom(v_s)
-
-    # contact point velocity
-    dpdt = v + wp.cross(w, p)
-
-    # check ground contact
-    c = wp.dot(n, p)  # check if we're inside the ground
-
-    if c >= 0.0:
-        return
-
-    vn = wp.dot(n, dpdt)  # velocity component out of the ground
-    vt = dpdt - n * vn  # velocity component not into the ground
-
-    fn = compute_normal_force(c, ke)  # normal force (restitution coefficient * how far inside for ground)
-
-    # contact damping
-    fd = compute_damping_force(vn, kd, c)
-
-    # viscous friction
-    # ft = vt*kf
-
-    # Coulomb friction (box)
-    # lower = mu * (fn + fd)   # negative
-    # upper = 0.0 - lower      # positive, workaround for no unary ops
-
-    # vx = wp.clamp(wp.dot(wp.vec3(kf, 0.0, 0.0), vt), lower, upper)
-    # vz = wp.clamp(wp.dot(wp.vec3(0.0, 0.0, kf), vt), lower, upper)
-
-    # Coulomb friction (smooth, but gradients are numerically unstable around |vt| = 0)
-    ft = compute_friction_force(vt, mu, kf, fn, fd)
-
-    f_total = (n * (fn + fd) + ft) * beta
-    t_total = (wp.cross(p, f_total)) * beta
-
-    wp.atomic_add(body_f_s, c_body, wp.spatial_vector(t_total, f_total))
-
-
-@wp.func
-def compute_normal_force(c: float, ke: float):
-    return c * ke
-
-
-@wp.func
-def compute_damping_force(vn: float, kd: float, c: float):
-    return wp.min(vn, 0.0) * kd * wp.step(c)  # * (0.0 - c)
-
-
-@wp.func
-def compute_friction_force(vt: wp.vec3, mu: float, kf: float, fn: float, fd: float):
-    return wp.normalize(vt) * wp.min(kf * wp.length(vt), 0.0 - mu * (fn + fd))  # * wp.step(c)
 
 
 # compute transform across a joint
@@ -1538,116 +1446,6 @@ def prox_iteration_unrolled(
     # p_2 = wp.vec3(0.0, p_2[1], 0.0)
     # p_3 = wp.vec3(0.0, p_3[1], 0.0)
 
-    # # solve percussions iteratively
-    # for it in range(prox_iter):
-    #     # CONTACT 0
-    #     # calculate sum(G_ij*p_j) and sum over det(G_ij)
-    #     sum = wp.vec3(0.0, 0.0, 0.0)
-    #     r_sum = 0.0
-
-    #     sum += G_mat[tid, 0, 0] * p_0
-    #     r_sum += wp.determinant(G_mat[tid, 0, 0])
-    #     sum += G_mat[tid, 0, 1] * p_1
-    #     r_sum += wp.determinant(G_mat[tid, 0, 1])
-    #     sum += G_mat[tid, 0, 2] * p_2
-    #     r_sum += wp.determinant(G_mat[tid, 0, 2])
-    #     sum += G_mat[tid, 0, 3] * p_3
-    #     r_sum += wp.determinant(G_mat[tid, 0, 3])
-
-    #     r = 1.0 / (1.0 + r_sum)  # +1 for stability
-
-    #     # update percussion
-    #     p_0 = p_0 - r * (sum + c_vec_0)
-
-    #     # projection to friction cone
-    #     if p_0[1] <= 0.0:
-    #         p_0 = wp.vec3(0.0, 0.0, 0.0)
-    #     elif p_0[0] != 0.0 or p_0[2] != 0.0:
-    #         fm = wp.sqrt(p_0[0] ** 2.0 + p_0[2] ** 2.0)  # friction magnitude
-    #         if mu * p_0[1] < fm:
-    #             p_0 = wp.vec3(p_0[0] * mu * p_0[1] / fm, p_0[1], p_0[2] * mu * p_0[1] / fm)
-
-    #     # CONTACT 1
-    #     # calculate sum(G_ij*p_j) and sum over det(G_ij)
-    #     sum = wp.vec3(0.0, 0.0, 0.0)
-    #     r_sum = 0.0
-
-    #     sum += G_mat[tid, 1, 0] * p_0
-    #     r_sum += wp.determinant(G_mat[tid, 1, 0])
-    #     sum += G_mat[tid, 1, 1] * p_1
-    #     r_sum += wp.determinant(G_mat[tid, 1, 1])
-    #     sum += G_mat[tid, 1, 2] * p_2
-    #     r_sum += wp.determinant(G_mat[tid, 1, 2])
-    #     sum += G_mat[tid, 1, 3] * p_3
-    #     r_sum += wp.determinant(G_mat[tid, 1, 3])
-
-    #     r = 1.0 / (1.0 + r_sum)  # +1 for stability
-
-    #     # update percussion
-    #     p_1 = p_1 - r * (sum + c_vec_1)
-
-    #     # projection to friction cone
-    #     if p_1[1] <= 0.0:
-    #         p_1 = wp.vec3(0.0, 0.0, 0.0)
-    #     elif p_1[0] != 0.0 or p_1[2] != 0.0:
-    #         fm = wp.sqrt(p_1[0] ** 2.0 + p_1[2] ** 2.0)  # friction magnitude
-    #         if mu * p_1[1] < fm:
-    #             p_1 = wp.vec3(p_1[0] * mu * p_1[1] / fm, p_1[1], p_1[2] * mu * p_1[1] / fm)
-
-    #     # CONTACT 2
-    #     # calculate sum(G_ij*p_j) and sum over det(G_ij)
-    #     sum = wp.vec3(0.0, 0.0, 0.0)
-    #     r_sum = 0.0
-
-    #     sum += G_mat[tid, 2, 0] * p_0
-    #     r_sum += wp.determinant(G_mat[tid, 2, 0])
-    #     sum += G_mat[tid, 2, 1] * p_1
-    #     r_sum += wp.determinant(G_mat[tid, 2, 1])
-    #     sum += G_mat[tid, 2, 2] * p_2
-    #     r_sum += wp.determinant(G_mat[tid, 2, 2])
-    #     sum += G_mat[tid, 2, 3] * p_3
-    #     r_sum += wp.determinant(G_mat[tid, 2, 3])
-
-    #     r = 1.0 / (1.0 + r_sum)  # +1 for stability
-
-    #     # update percussion
-    #     p_2 = p_2 - r * (sum + c_vec_2)
-
-    #     # projection to friction cone
-    #     if p_2[1] <= 0.0:
-    #         p_2 = wp.vec3(0.0, 0.0, 0.0)
-    #     elif p_2[0] != 0.0 or p_2[2] != 0.0:
-    #         fm = wp.sqrt(p_2[0] ** 2.0 + p_2[2] ** 2.0)  # friction magnitude
-    #         if mu * p_2[1] < fm:
-    #             p_2 = wp.vec3(p_2[0] * mu * p_2[1] / fm, p_2[1], p_2[2] * mu * p_2[1] / fm)
-
-    #     # CONTACT 3
-    #     # calculate sum(G_ij*p_j) and sum over det(G_ij)
-    #     sum = wp.vec3(0.0, 0.0, 0.0)
-    #     r_sum = 0.0
-
-    #     sum += G_mat[tid, 3, 0] * p_0
-    #     r_sum += wp.determinant(G_mat[tid, 3, 0])
-    #     sum += G_mat[tid, 3, 1] * p_1
-    #     r_sum += wp.determinant(G_mat[tid, 3, 1])
-    #     sum += G_mat[tid, 3, 2] * p_2
-    #     r_sum += wp.determinant(G_mat[tid, 3, 2])
-    #     sum += G_mat[tid, 3, 3] * p_3
-    #     r_sum += wp.determinant(G_mat[tid, 3, 3])
-
-    #     r = 1.0 / (1.0 + r_sum)  # +1 for stability
-
-    #     # update percussion
-    #     p_3 = p_3 - r * (sum + c_vec_3)
-
-    #     # projection to friction cone
-    #     if p_3[1] <= 0.0:
-    #         p_3 = wp.vec3(0.0, 0.0, 0.0)
-    #     elif p_3[0] != 0.0 or p_3[2] != 0.0:
-    #         fm = wp.sqrt(p_3[0] ** 2.0 + p_3[2] ** 2.0)  # friction magnitude
-    #         if mu * p_3[1] < fm:
-    #             p_3 = wp.vec3(p_3[0] * mu * p_3[1] / fm, p_3[1], p_3[2] * mu * p_3[1] / fm)
-
     p_0, p_1, p_2, p_3 = prox_loop(tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, mu, prox_iter, p_0, p_1, p_2, p_3)
 
     percussion[tid, 0] = p_0
@@ -1752,7 +1550,6 @@ def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: 
 
 @wp.kernel
 def p_to_f_s(
-    beta: float,
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
     percussion: wp.array2d(dtype=wp.vec3),
@@ -1762,8 +1559,8 @@ def p_to_f_s(
     tid = wp.tid()
 
     for i in range(4):
-        f = (-percussion[tid, i] / dt) * (1.0 - beta)
-        t = (wp.cross(point_vec[tid * 4 + i], f)) * (1.0 - beta)
+        f = -percussion[tid, i] / dt
+        t = wp.cross(point_vec[tid * 4 + i], f)
         wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
 
 
@@ -1862,7 +1659,6 @@ class MoreauIntegrator:
         requires_grad,
         update_mass_matrix,
         prox_iter,
-        beta,
         max_torque,
         mode,
     ):
@@ -1973,7 +1769,7 @@ class MoreauIntegrator:
         self.eval_contact_quantities(model, state_in, state_mid, dt)
 
         # prox iteration
-        self.eval_contact_forces(model, state_mid, dt, mu, prox_iter, beta, mode)
+        self.eval_contact_forces(model, state_mid, dt, mu, prox_iter, mode)
 
         # recompute tau with contact forces
         # kernel 5
@@ -2208,45 +2004,6 @@ class MoreauIntegrator:
         )
 
         # solve for X^T (X = H^-1*Jc^T)
-
-        # original
-        # wp.launch(
-        #     kernel=eval_dense_solve_batched_matrix,
-        #     dim=model.articulation_count,
-        #     inputs=[
-        #         int(model.joint_dof_count / model.articulation_count),
-        #         model.articulation_Jc_start,
-        #         model.articulation_H_start,
-        #         model.articulation_H_rows,
-        #         model.H,
-        #         model.L,
-        #         model.Jc,
-        #         model.TMP,
-        #     ],
-        #     outputs=[state_mid.Inv_M_times_Jc_t],
-        #     device=model.device,
-        # )
-
-        # parallel / wrong grads for H
-        # kernel 15
-        # wp.launch(
-        #     kernel=eval_dense_solve_batched,
-        #     dim=model.articulation_count * 4 * 3,
-        #     inputs=[
-        #         # int(model.joint_dof_count / model.articulation_count),
-        #         model.articulation_Jc_row_start,
-        #         model.articulation_H_start_matrix,
-        #         model.articulation_H_rows_matrix,
-        #         model.H,
-        #         model.L,
-        #         model.Jc,
-        #         model.TMP,
-        #     ],
-        #     outputs=[state_mid.Inv_M_times_Jc_t],
-        #     device=model.device,
-        # )
-
-        # split
         wp.launch(
             kernel=split_matrix,
             dim=model.articulation_count,
@@ -2596,7 +2353,7 @@ class MoreauIntegrator:
             device=model.device,
         )
 
-    def eval_contact_forces(self, model, state_mid, dt, mu, prox_iter, beta, mode):
+    def eval_contact_forces(self, model, state_mid, dt, mu, prox_iter, mode):
         # prox iteration
         # kernel 7
         if mode == "hard":
@@ -2615,85 +2372,14 @@ class MoreauIntegrator:
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
-        elif mode == "mixed":
-            wp.launch(
-                kernel=prox_iteration_unrolled,
-                dim=model.articulation_count,
-                inputs=[model.G_mat, state_mid.c_vec, mu, prox_iter],
-                outputs=[state_mid.percussion],
-                device=model.device,
-            )
-            wp.launch(
-                kernel=eval_rigid_contacts_art,
-                dim=model.rigid_contact_max,
-                inputs=[
-                    beta,
-                    model.rigid_contact_count,
-                    state_mid.body_X_sc,
-                    state_mid.body_v_s,
-                    model.rigid_contact_body0,
-                    model.rigid_contact_point0,
-                    model.rigid_contact_shape0,
-                    model.shape_materials,
-                    model.shape_geo,
-                ],
-                outputs=[state_mid.body_f_s],
-                device=model.device,
-            )
         else:
             raise ValueError("Invalid mode")
 
-        # # vectorize percussion
-        # wp.launch(
-        #     kernel=vectorize_percussion,
-        #     dim=model.articulation_count,
-        #     inputs=[
-        #         state_mid.percussion,
-        #     ],
-        #     outputs=[state_mid.percussion_vec],
-        #     device=model.device,
-        # )
-
-        # # compute Jc^T * p
-        # matmul_batched(
-        #     model.articulation_count,
-        #     model.articulation_Jc_cols,  # m
-        #     model.articulation_vec_size,  # n
-        #     model.articulation_Jc_rows,  # intermediate dim
-        #     1,
-        #     0,
-        #     model.articulation_Jc_start,
-        #     model.articulation_contact_dim_start,
-        #     model.articulation_dof_start,
-        #     model.Jc,
-        #     state_mid.percussion_vec,
-        #     state_mid.JcT_p,
-        #     device=model.device,
-        # )
-
-        # # compute tau as state_mid.joint_tau + Jc^T * p/dt
-        # wp.launch(
-        #     kernel=eval_dense_add_batched_2,
-        #     dim=model.articulation_count,
-        #     inputs=[
-        #         model.articulation_Jc_cols,
-        #         model.articulation_dof_start,
-        #         state_mid.joint_tau,
-        #         state_mid.JcT_p,
-        #         1 / dt,
-        #     ],
-        #     outputs=[state_out.joint_tau],
-        #     device=model.device,
-        # )
-
-        # map p to body forces
         # kernel 6
-        if mode != "mixed":
-            beta = 0.0
         wp.launch(
             kernel=p_to_f_s,
             dim=model.articulation_count,
-            inputs=[beta, model.c_body_vec, state_mid.point_vec, state_mid.percussion, dt],
+            inputs=[model.c_body_vec, state_mid.point_vec, state_mid.percussion, dt],
             outputs=[state_mid.body_f_s],
             device=model.device,
         )

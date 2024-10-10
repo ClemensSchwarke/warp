@@ -69,98 +69,6 @@ def spatial_transform_inertia(t: wp.transform, I: wp.spatial_matrix):
     return wp.mul(wp.mul(wp.transpose(T), I), T)
 
 
-@wp.kernel
-def eval_rigid_contacts_art(
-    beta: float,
-    contact_count: wp.array(dtype=int),
-    body_X_s: wp.array(dtype=wp.transform),
-    body_v_s: wp.array(dtype=wp.spatial_vector),
-    contact_body: wp.array(dtype=int),
-    contact_point: wp.array(dtype=wp.vec3),
-    contact_shape: wp.array(dtype=int),
-    shape_materials: ModelShapeMaterials,
-    geo: ModelShapeGeometry,
-    body_f_s: wp.array(dtype=wp.spatial_vector),
-):
-    tid = wp.tid()
-
-    count = contact_count[0]
-    if tid >= count:
-        return
-
-    c_body = contact_body[tid]
-    c_point = contact_point[tid]
-    c_shape = contact_shape[tid]
-    c_dist = geo.thickness[c_shape]
-
-    # hard coded surface parameter tensor layout (ke, kd, kf, mu)
-    ke = shape_materials.ke[c_shape]
-    kd = shape_materials.kd[c_shape]
-    kf = shape_materials.kf[c_shape]
-    mu = shape_materials.mu[c_shape]
-
-    X_s = body_X_s[c_body]  # position of colliding body
-    v_s = body_v_s[c_body]  # orientation of colliding body
-
-    n = wp.vec3(0.0, 1.0, 0.0)
-
-    # transform point to world space
-    p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
-
-    w = wp.spatial_top(v_s)
-    v = wp.spatial_bottom(v_s)
-
-    # contact point velocity
-    dpdt = v + wp.cross(w, p)
-
-    # check ground contact
-    c = wp.dot(n, p)  # check if we're inside the ground
-
-    if c >= 0.0:
-        return
-
-    vn = wp.dot(n, dpdt)  # velocity component out of the ground
-    vt = dpdt - n * vn  # velocity component not into the ground
-
-    fn = compute_normal_force(c, ke)  # normal force (restitution coefficient * how far inside for ground)
-
-    # contact damping
-    fd = compute_damping_force(vn, kd, c)
-
-    # viscous friction
-    # ft = vt*kf
-
-    # Coulomb friction (box)
-    # lower = mu * (fn + fd)   # negative
-    # upper = 0.0 - lower      # positive, workaround for no unary ops
-
-    # vx = wp.clamp(wp.dot(wp.vec3(kf, 0.0, 0.0), vt), lower, upper)
-    # vz = wp.clamp(wp.dot(wp.vec3(0.0, 0.0, kf), vt), lower, upper)
-
-    # Coulomb friction (smooth, but gradients are numerically unstable around |vt| = 0)
-    ft = compute_friction_force(vt, mu, kf, fn, fd)
-
-    f_total = (n * (fn + fd) + ft) * beta
-    t_total = (wp.cross(p, f_total)) * beta
-
-    wp.atomic_add(body_f_s, c_body, wp.spatial_vector(t_total, f_total))
-
-
-@wp.func
-def compute_normal_force(c: float, ke: float):
-    return c * ke
-
-
-@wp.func
-def compute_damping_force(vn: float, kd: float, c: float):
-    return wp.min(vn, 0.0) * kd * wp.step(c)  # * (0.0 - c)
-
-
-@wp.func
-def compute_friction_force(vt: wp.vec3, mu: float, kf: float, fn: float, fd: float):
-    return wp.normalize(vt) * wp.min(kf * wp.length(vt), 0.0 - mu * (fn + fd))  # * wp.step(c)
-
-
 # compute transform across a joint
 @wp.func
 def jcalc_transform(type: int, axis: wp.vec3, joint_q: wp.array(dtype=float), start: int):
@@ -1451,7 +1359,6 @@ def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: 
 
 @wp.kernel
 def p_to_f_s(
-    beta: float,
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
     percussion: wp.array2d(dtype=wp.vec3),
@@ -1463,8 +1370,8 @@ def p_to_f_s(
 
     for i in range(4):
         if wp.abs(dt - toi[tid]) > 1e-4:
-            f = (-percussion[tid, i] / (dt - toi[tid])) * (1.0 - beta)
-            t = (wp.cross(point_vec[tid * 4 + i], f)) * (1.0 - beta)
+            f = -percussion[tid, i] / (dt - toi[tid])
+            t = wp.cross(point_vec[tid * 4 + i], f)
             wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
 
 
@@ -1615,7 +1522,6 @@ class TOIIntegrator:
         requires_grad,
         update_mass_matrix,
         prox_iter,
-        beta,
         max_torque,
         mode,
     ):
@@ -1649,7 +1555,7 @@ class TOIIntegrator:
         self.eval_contact_quantities(model, state_in, dt)
 
         # prox iteration for state_in
-        self.eval_contact_forces(model, state_in, dt, mu, prox_iter, beta, mode)
+        self.eval_contact_forces(model, state_in, dt, mu, prox_iter, mode)
 
         # recompute tau with contact forces
         self.eval_tau(model, state_in, state_out_pred, max_torque)
@@ -1730,21 +1636,6 @@ class TOIIntegrator:
             outputs=[state_mid.Jc, model.c_body_vec, state_out_pred.point_vec],
             device=model.device,
         )
-        # wp.launch(
-        #     kernel=eval_point_vec,
-        #     dim=model.articulation_count,
-        #     inputs=[
-        #         state_out_pred.body_X_sc,
-        #         model.rigid_contact_max,
-        #         model.articulation_count,
-        #         model.rigid_contact_body0,
-        #         model.rigid_contact_point0,
-        #         model.rigid_contact_shape0,
-        #         model.shape_geo,
-        #     ],
-        #     outputs=[state_out_pred.point_vec],
-        #     device=model.device,
-        # )
         self.eval_toi(model, state_in, state_out_pred, state_mid, dt)
 
         # integrate until toi
@@ -1820,26 +1711,6 @@ class TOIIntegrator:
         # recompute tau with contact forces
         self.eval_tau(model, state_mid, state_mid, max_torque)
 
-        # reevaluate contact quantities
-        # wp.launch(
-        #     kernel=construct_contact_jacobian,
-        #     dim=model.articulation_count,
-        #     inputs=[
-        #         model.J,
-        #         model.articulation_J_start,
-        #         model.articulation_Jc_start,
-        #         state_mid.body_X_sc,
-        #         model.rigid_contact_max,
-        #         model.articulation_count,
-        #         int(model.joint_dof_count / model.articulation_count),
-        #         model.rigid_contact_body0,
-        #         model.rigid_contact_point0,
-        #         model.rigid_contact_shape0,
-        #         model.shape_geo,
-        #     ],
-        #     outputs=[state_mid.Jc, model.c_body_vec, state_mid.point_vec],
-        #     device=model.device,
-        # )
         self.eval_contact_quantities(model, state_mid, dt)
 
         # prox iteration for state_mid
@@ -1858,7 +1729,7 @@ class TOIIntegrator:
             outputs=[state_mid.point_vec],
             device=model.device,
         )
-        self.eval_contact_forces(model, state_mid, dt, mu, prox_iter, beta, mode)
+        self.eval_contact_forces(model, state_mid, dt, mu, prox_iter, mode)
 
         # recompute tau with contact forces
         self.eval_tau(model, state_mid, state_out, max_torque)
@@ -1957,12 +1828,6 @@ class TOIIntegrator:
             inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
             outputs=[state_out.body_q, state_out.body_qd],
         )
-        # q1= wp.to_torch(state_out_pred.joint_q)
-        # q2= wp.to_torch(state_out.joint_q)
-        # are_equal = torch.equal(q1, q2)
-        # if not are_equal:
-        #     print(state_mid.toi)
-
         return state_out
 
     def eval_mass_matrix(self, model, state_in):
@@ -2384,7 +2249,7 @@ class TOIIntegrator:
             device=model.device,
         )
 
-    def eval_contact_forces(self, model, state, dt, mu, prox_iter, beta, mode):
+    def eval_contact_forces(self, model, state, dt, mu, prox_iter, mode):
         # prox iteration
         if mode == "hard":
             wp.launch(
@@ -2396,42 +2261,14 @@ class TOIIntegrator:
             )
         elif mode == "soft":
             raise ValueError("Soft contact does not make sense with TOI")
-
-        elif mode == "mixed":
-            wp.launch(
-                kernel=prox_iteration_unrolled,
-                dim=model.articulation_count,
-                inputs=[state.G_mat, state.c_vec, mu, prox_iter],
-                outputs=[state.percussion],
-                device=model.device,
-            )
-            wp.launch(
-                kernel=eval_rigid_contacts_art,
-                dim=model.rigid_contact_max,
-                inputs=[
-                    beta,
-                    model.rigid_contact_count,
-                    state.body_X_sc,
-                    state.body_v_s,
-                    model.rigid_contact_body0,
-                    model.rigid_contact_point0,
-                    model.rigid_contact_shape0,
-                    model.shape_materials,
-                    model.shape_geo,
-                ],
-                outputs=[state.body_f_s],
-                device=model.device,
-            )
         else:
             raise ValueError("Invalid mode")
 
         # map p to body forces
-        if mode != "mixed":
-            beta = 0.0
         wp.launch(
             kernel=p_to_f_s,
             dim=model.articulation_count,
-            inputs=[beta, model.c_body_vec, state.point_vec, state.percussion, dt, state.toi],
+            inputs=[model.c_body_vec, state.point_vec, state.percussion, dt, state.toi],
             outputs=[state.body_f_s],
             device=model.device,
         )
