@@ -1705,9 +1705,6 @@ def p_to_f_s(
 
     for i in range(4):
         f = (-percussion[tid, i] / dt) * (1.0 - beta)
-        # print("f:")
-        # print(f)
-        # wp.printf("Contact nr, f[0], f[1], f[2]: %i %.3f %.3f %.3f\n", i, f[0], f[1], f[2])
         t = (wp.cross(point_vec[tid * 4 + i], f)) * (1.0 - beta)
         wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
 
@@ -1806,6 +1803,75 @@ def copy_relevant_states(
     point_vec_out[tid * 4 + 1] = point_vec_in[tid * 4 + 1]
     point_vec_out[tid * 4 + 2] = point_vec_in[tid * 4 + 2]
     point_vec_out[tid * 4 + 3] = point_vec_in[tid * 4 + 3]
+
+
+@wp.kernel
+def get_foot_states(
+    # inputs
+    rigid_contact_max: int,
+    articulation_count: int,
+    # contact_count: wp.array(dtype=int),
+    body_X_s: wp.array(dtype=wp.transform),
+    body_v_s: wp.array(dtype=wp.spatial_vector),
+    contact_body: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    # shape_materials: ModelShapeMaterials,
+    geo: ModelShapeGeometry,
+    # outputs
+    point_vec: wp.array(dtype=wp.vec3),
+    foot_vel: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()  # articulation_count
+
+    # count = contact_count[0]
+    # if tid >= count:
+    #     return
+    # print("tid")
+    # print(tid)
+
+    contacts_per_articulation = rigid_contact_max / articulation_count
+    # print("contacts_per_articulation")
+    # print(contacts_per_articulation)
+
+    for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
+        contact_id = tid * contacts_per_articulation + i
+        # print("contact_id")
+        # print(contact_id)
+        c_body = contact_body[contact_id]
+        c_point = contact_point[contact_id]
+        c_shape = contact_shape[contact_id]
+        c_dist = geo.thickness[c_shape]
+
+        if (c_body - tid) % 3 == 0 and i % 2 == 0:  # only consider foot contacts
+            foot_id = (c_body - tid - tid * 12) / 3 - 1
+            # print("c_body")
+            # print(c_body)
+            # print("c_point")
+            # print(c_point)
+            # print("c_shape")
+            # print(c_shape)
+            # print("c_dist")
+            # print(c_dist)
+
+            X_s = body_X_s[c_body]  # position of colliding body
+            v_s = body_v_s[c_body]  # orientation of colliding body
+
+            n = wp.vec3(0.0, 1.0, 0.0)
+
+            # transform point to world space
+            p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+
+            # compute contact point velocity
+            w = wp.spatial_top(v_s)
+            v = wp.spatial_bottom(v_s)
+            # print("v")
+            # print(v)
+            dpdt = v + wp.cross(w, p)
+
+            # get data
+            point_vec[tid * 4 + foot_id] = p
+            foot_vel[tid * 4 + foot_id] = dpdt
 
 
 ##########################
@@ -2081,6 +2147,24 @@ class MoreauIntegrator:
             dim=model.articulation_count,
             inputs=[state_mid.percussion, state_mid.point_vec],
             outputs=[state_out.percussion, state_out.point_vec],
+        )
+        # get_foot_states NOTE: we're overwriting the previously copied point_vec with the most current estimate
+        # kernel -2
+        wp.launch(
+            kernel=get_foot_states,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_max,
+                model.articulation_count,
+                state_out.body_X_sc,
+                state_out.body_v_s,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+            ],
+            outputs=[state_out.point_vec, 
+                     state_out.foot_vel],
         )
 
         return state_out

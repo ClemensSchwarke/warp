@@ -703,6 +703,7 @@ class Model:
             s.point_vec = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
             s.percussion = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
             # s.percussion_vec = wp.zeros(self.articulation_count*4*3, requires_grad=True)
+            s.foot_vel = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
 
             # compute G and c
             s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)  # maybe set to 0?
