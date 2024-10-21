@@ -416,9 +416,24 @@ def jcalc_tau(
 
         damping_f = (0.0 - limit_k_d) * qd
 
+        # friction
+        t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
+        # NOTE: we currently ignore if-else, since it's not diff'able and assume static friction is 0
+        # if wp.abs(t_2) > joint_static_friction:
+        #     t_2 += 0.0 - joint_dynamic_friction * qd
+        # else:
+        #     t_2 = 0.0
+        t_2 += 0.0 - joint_dynamic_friction * qd
+
+        # velocity-based torque limit
+        peak_torque = 120.0  # TODO: transfer this into config file
+        velocity_limit = 7.5  # TODO: transfer this into config file
+        max_torque_limit = wp.clamp(peak_torque * (1.0 - qd / velocity_limit), 0.0, max_torque)
+        min_torque_limit = wp.clamp(peak_torque * (-1.0 - qd / velocity_limit), -max_torque, 0.0)
+
         # total torque / force on the joint
-        t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s) 
-        t_2 = wp.clamp(0.0 - target_k_e*(q - target) - target_k_d*qd + act + limit_f + damping_f, 0.0-max_torque, max_torque)
+        t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
+        t_2 = wp.clamp(t_2 + act + limit_f + damping_f, min_torque_limit, max_torque_limit)
 
         tau[dof_start] = t_1 + t_2
 
@@ -551,8 +566,11 @@ def jcalc_integrate(
                      joint_q[coord_start + 1], 
                      joint_q[coord_start + 2])
 
-        # linear vel of origin (note q/qd switch order of linear angular elements) 
-        # note we are converting the body twist in the space frame (w_s, v_s) to compute center of mass velcity
+        # (old comment) linear vel of origin (note q/qd switch order of linear angular elements)
+        # (old comment) note we are converting the body twist in the space frame (w_s, v_s)
+        # (old comment) to compute center of mass velocity
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point p_s. p_s is not necessarily the com of the body, but of the joint.
         dpdt_s = v_s + wp.cross(w_s, p_s)
         
         # quat and quat derivative
@@ -702,28 +720,32 @@ def compute_link_velocity(i: int,
 
 
 @wp.func
-def compute_link_tau(offset: int,
-                     joint_end: int,
-                     joint_type: wp.array(dtype=int),
-                     joint_parent: wp.array(dtype=int),
-                     joint_q_start: wp.array(dtype=int),
-                     joint_qd_start: wp.array(dtype=int),
-                     joint_q: wp.array(dtype=float),
-                     joint_qd: wp.array(dtype=float),
-                     joint_act: wp.array(dtype=float),
-                     joint_target: wp.array(dtype=float),
-                     joint_target_ke: wp.array(dtype=float),
-                     joint_target_kd: wp.array(dtype=float),
-                     joint_limit_lower: wp.array(dtype=float),
-                     joint_limit_upper: wp.array(dtype=float),
-                     joint_limit_ke: wp.array(dtype=float),
-                     joint_limit_kd: wp.array(dtype=float),
-                     max_torque: float,
-                     joint_S_s: wp.array(dtype=wp.spatial_vector),
-                     body_fb_s: wp.array(dtype=wp.spatial_vector),
-                     # outputs
-                     body_ft_s: wp.array(dtype=wp.spatial_vector),
-                     tau: wp.array(dtype=float)):
+def compute_link_tau(
+    offset: int,
+    joint_end: int,
+    joint_type: wp.array(dtype=int),
+    joint_parent: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_q: wp.array(dtype=float),
+    joint_qd: wp.array(dtype=float),
+    joint_act: wp.array(dtype=float),
+    joint_target: wp.array(dtype=float),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_limit_ke: wp.array(dtype=float),
+    joint_limit_kd: wp.array(dtype=float),
+    max_torque: float,
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    body_fb_s: wp.array(dtype=wp.spatial_vector),
+    # outputs
+    body_ft_s: wp.array(dtype=wp.spatial_vector),
+    tau: wp.array(dtype=float),
+):
 
     # for backwards traversal
     i = joint_end-offset-1
@@ -739,6 +761,10 @@ def compute_link_tau(offset: int,
     limit_k_e = joint_limit_ke[i]
     limit_k_d = joint_limit_kd[i]
 
+    # friction
+    static_friction = joint_static_friction[i]
+    dynamic_friction = joint_dynamic_friction[i]
+
     # total forces on body
     f_b_s = body_fb_s[i]
     f_t_s = body_ft_s[i]
@@ -746,7 +772,27 @@ def compute_link_tau(offset: int,
     f_s = f_b_s + f_t_s
 
     # compute joint-space forces, writes out tau
-    jcalc_tau(type, target_k_e, target_k_d, limit_k_e, limit_k_d, max_torque, joint_S_s, joint_q, joint_qd, joint_act, joint_target, joint_limit_lower, joint_limit_upper, coord_start, dof_start, f_s, tau)
+    jcalc_tau(
+        type,
+        target_k_e,
+        target_k_d,
+        limit_k_e,
+        limit_k_d,
+        static_friction,
+        dynamic_friction,
+        max_torque,
+        joint_S_s,
+        joint_q,
+        joint_qd,
+        joint_act,
+        joint_target,
+        joint_limit_lower,
+        joint_limit_upper,
+        coord_start,
+        dof_start,
+        f_s,
+        tau,
+    )
 
     # update parent forces, todo: check that this is valid for the backwards pass
     if (parent >= 0):
@@ -840,28 +886,32 @@ def eval_rigid_id(articulation_start: wp.array(dtype=int),
 
 
 @wp.kernel
-def eval_rigid_tau(articulation_start: wp.array(dtype=int),
-                  joint_type: wp.array(dtype=int),
-                  joint_parent: wp.array(dtype=int),
-                  joint_q_start: wp.array(dtype=int),
-                  joint_qd_start: wp.array(dtype=int),
-                  joint_q: wp.array(dtype=float),
-                  joint_qd: wp.array(dtype=float),
-                  joint_act: wp.array(dtype=float),
-                  joint_target: wp.array(dtype=float),
-                  joint_target_ke: wp.array(dtype=float),
-                  joint_target_kd: wp.array(dtype=float),
-                  joint_limit_lower: wp.array(dtype=float),
-                  joint_limit_upper: wp.array(dtype=float),
-                  joint_limit_ke: wp.array(dtype=float),
-                  joint_limit_kd: wp.array(dtype=float),
-                  max_torque: float,
-                  joint_axis: wp.array(dtype=wp.vec3),
-                  joint_S_s: wp.array(dtype=wp.spatial_vector),
-                  body_fb_s: wp.array(dtype=wp.spatial_vector),                  
-                  # outputs
-                  body_ft_s: wp.array(dtype=wp.spatial_vector),
-                  tau: wp.array(dtype=float)):
+def eval_rigid_tau(
+    articulation_start: wp.array(dtype=int),
+    joint_type: wp.array(dtype=int),
+    joint_parent: wp.array(dtype=int),
+    joint_q_start: wp.array(dtype=int),
+    joint_qd_start: wp.array(dtype=int),
+    joint_q: wp.array(dtype=float),
+    joint_qd: wp.array(dtype=float),
+    joint_act: wp.array(dtype=float),
+    joint_target: wp.array(dtype=float),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
+    joint_limit_lower: wp.array(dtype=float),
+    joint_limit_upper: wp.array(dtype=float),
+    joint_limit_ke: wp.array(dtype=float),
+    joint_limit_kd: wp.array(dtype=float),
+    max_torque: float,
+    joint_axis: wp.array(dtype=wp.vec3),
+    joint_S_s: wp.array(dtype=wp.spatial_vector),
+    body_fb_s: wp.array(dtype=wp.spatial_vector),
+    # outputs
+    body_ft_s: wp.array(dtype=wp.spatial_vector),
+    tau: wp.array(dtype=float),
+):
 
     # one thread per-articulation
     tid = wp.tid()
@@ -885,6 +935,8 @@ def eval_rigid_tau(articulation_start: wp.array(dtype=int),
             joint_target,
             joint_target_ke,
             joint_target_kd,
+            joint_static_friction,
+            joint_dynamic_friction,
             joint_limit_lower,
             joint_limit_upper,
             joint_limit_ke,
@@ -893,7 +945,8 @@ def eval_rigid_tau(articulation_start: wp.array(dtype=int),
             joint_S_s,
             body_fb_s,
             body_ft_s,
-            tau)
+            tau,
+        )
 
 
 @wp.kernel
@@ -988,7 +1041,10 @@ def inertial_body_pos_vel(
         v_s = body_v_s[i]
         w = wp.spatial_top(v_s)
         v = wp.spatial_bottom(v_s)
-        
+
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point X_sc (= body_q). X_sc is not necessarily the com of the body, but of the
+        # anchor/coordinate frame (i.e joint's world position in case of anymal).
         v_inertial = v + wp.cross(w, wp.transform_get_translation(X_sc))
         
         body_q[i] = X_sc
@@ -1055,6 +1111,57 @@ def matmul_batched(batch_count, m, n, k, t1, t2, A_start, B_start, C_start, A, B
         ],
         device=device,
 )
+
+
+@wp.kernel
+def get_foot_states(
+    # inputs
+    rigid_contact_max: int,
+    articulation_count: int,
+    # contact_count: wp.array(dtype=int),
+    body_X_s: wp.array(dtype=wp.transform),
+    body_v_s: wp.array(dtype=wp.spatial_vector),
+    contact_body: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    # shape_materials: ModelShapeMaterials,
+    geo: ModelShapeGeometry,
+    # outputs
+    point_vec: wp.array(dtype=wp.vec3),
+    foot_vel: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()  # articulation_count
+
+    contacts_per_articulation = rigid_contact_max / articulation_count
+
+    for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
+        contact_id = tid * contacts_per_articulation + i
+
+        c_body = contact_body[contact_id]
+        c_point = contact_point[contact_id]
+        c_shape = contact_shape[contact_id]
+        c_dist = geo.thickness[c_shape]
+
+        if (c_body - tid) % 3 == 0 and i % 2 == 0:  # only consider foot contacts
+            foot_id = (c_body - tid - tid * 12) / 3 - 1
+
+            X_s = body_X_s[c_body]  # position of colliding body
+            v_s = body_v_s[c_body]  # orientation of colliding body
+
+            n = wp.vec3(0.0, 1.0, 0.0)
+
+            # transform point to world space
+            p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+
+            # compute contact point velocity
+            w = wp.spatial_top(v_s)
+            v = wp.spatial_bottom(v_s)
+            dpdt = v + wp.cross(w, p)
+
+            # get data
+            point_vec[tid * 4 + foot_id] = p
+            foot_vel[tid * 4 + foot_id] = dpdt
+
 
 class SemiImplicitArticulationIntegrator:
 
@@ -1240,6 +1347,8 @@ class SemiImplicitArticulationIntegrator:
                 model.joint_target,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -1364,6 +1473,24 @@ class SemiImplicitArticulationIntegrator:
                 state_out.body_q,
                 state_out.body_qd,
             ],
+        )
+
+        # get_foot_states NOTE: we're overwriting the previously copied point_vec with the most current estimate
+        wp.launch(
+            kernel=get_foot_states,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_max,
+                model.articulation_count,
+                state_out.body_X_sc,
+                state_out.body_v_s,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+            ],
+            outputs=[state_out.point_vec,
+                     state_out.foot_vel],
         )
 
         return state_out
