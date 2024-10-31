@@ -4102,7 +4102,7 @@ class ModelBuilder:
             m.edge_count = len(self.edge_rest_angle)
             m.spring_count = len(self.spring_rest_length)
             m.muscle_count = len(self.muscle_start)
-            m.articulation_count = len(self.articulation_start)
+            m.articulation_count = len(self.articulation_start)  # NOTE: self.articulation_count was different for some reason
 
             # 'close' the start index arrays with a sentinel value
             self.joint_q_start.append(self.joint_coord_count)
@@ -4132,6 +4132,13 @@ class ModelBuilder:
             m.joint_coord_count = self.joint_coord_count
             m.sigmoid_scale = wp.zeros(1, dtype=wp.float32, requires_grad=requires_grad)
             m.col_height = 0.0
+
+            # some variables used for learning, NOTE: they may be time-varying, so not really sticking to purpose of Model class
+            m.random_foot_forces = wp.zeros((m.articulation_count, 4), dtype=wp.vec3, requires_grad=False)
+            m.forces_height_range = wp.array([-1.0, 1.0], dtype=wp.float32, requires_grad=False)  # [m]
+            m.randomize_height_map = False  # create a flag in model for this randomization
+            m.rand_foot_height_map = wp.zeros((2, 2), dtype=wp.float32, requires_grad=False)  # define dummy variable
+            m.grid_step_size = 1.0  # define dummy variable
 
             # store refs to geometry
             m.geo_meshes = self.geo_meshes

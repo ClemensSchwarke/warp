@@ -16,6 +16,17 @@ from .model import ModelShapeGeometry, ModelShapeMaterials
 
 
 @wp.func
+def get_random_height(map: wp.array2d(dtype=float), grid_step_size: float, x: float, z: float):
+    x_idx = wp.floor(x / grid_step_size)
+    z_idx = wp.floor(z / grid_step_size)
+
+    if x_idx >= map.shape[0] or z_idx >= map.shape[1]:
+        return 0.0
+    else:
+        return map[int(x_idx), int(z_idx)]
+
+
+@wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
     return 1.0 / (
         1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))
@@ -1121,6 +1132,7 @@ def integrate_q_halfstep(
 
 @wp.kernel
 def construct_contact_jacobian(
+    # inputs
     J: wp.array(dtype=float),
     J_start: wp.array(dtype=int),
     Jc_start: wp.array(dtype=int),
@@ -1133,14 +1145,20 @@ def construct_contact_jacobian(
     contact_shape: wp.array(dtype=int),
     geo: ModelShapeGeometry,
     col_height: float,
+    randomize_height_map: bool,
+    height_map: wp.array2d(dtype=wp.float32),
+    grid_step_size: float,
+    # outputs
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
 
-    contacts_per_articulation = rigid_contact_max / articulation_count
+    # print(height_map[0, 0])
 
+    contacts_per_articulation = rigid_contact_max / articulation_count
+    # print("[integrator_moreau.py]: construct_contact_jacobian")
     for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
         contact_id = tid * contacts_per_articulation + i
         c_body = contact_body[contact_id]
@@ -1156,6 +1174,26 @@ def construct_contact_jacobian(
             p = (
                 wp.transform_point(X_s, c_point) - n * c_dist
             )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+
+            # print("p before randomization")
+            # print(p)
+
+            # randomize contact point
+            # print(randomize_height_map)
+            if randomize_height_map:
+                # print(grid_step_size)
+                # print(height_map[0, 0])
+                # height = 
+                # p[1] = p[1] - get_random_height(height_map, grid_step_size, p[0], p[2])
+                x_idx = wp.floor(p[0] / grid_step_size)
+                z_idx = wp.floor(p[2] / grid_step_size)
+
+                if x_idx < height_map.shape[0] and z_idx < height_map.shape[1]:
+                    p[1] = p[1] - height_map[int(x_idx), int(z_idx)]
+
+            # print("p after randomization")
+            # print(p)
+
             p_skew = wp.skew(wp.vec3(p[0], p[1], p[2]))
             # check ground contact
             c = wp.dot(n, p)
@@ -1694,18 +1732,39 @@ def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: 
 
 @wp.kernel
 def p_to_f_s(
+    # inputs
     beta: float,
     c_body_vec: wp.array(dtype=int),
+    random_foot_forces: wp.array2d(dtype=wp.vec3),
+    forces_height_range: wp.array(dtype=wp.float32),
     point_vec: wp.array(dtype=wp.vec3),
     percussion: wp.array2d(dtype=wp.vec3),
     dt: float,
+    # output
     body_f_s: wp.array(dtype=wp.spatial_vector),
 ):
-    tid = wp.tid()
+    tid = wp.tid()  # number of articulations, i.e. robots
 
+    # print("random_foot_forces")
+    # print(random_foot_forces[0, 0])
+
+    # iterate over four feet of quadruped (hardcoded!)
     for i in range(4):
+        # foot forces and torques
         f = (-percussion[tid, i] / dt) * (1.0 - beta)
         t = (wp.cross(point_vec[tid * 4 + i], f)) * (1.0 - beta)
+
+        # add randomization, if foot height in given range
+        foot_point = point_vec[tid * 4 + i]
+        if forces_height_range[0] < foot_point[1] and foot_point[1] < forces_height_range[1]:
+            # print("True")
+            # print(tid)
+            # print("i")
+            # print(i)
+            # print("random_foot_forces")
+            # print(random_foot_forces[tid, i])
+            f += random_foot_forces[tid, i]  # rand forces for domain rand.
+
         wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
 
 
@@ -2009,7 +2068,7 @@ class MoreauIntegrator:
         self.eval_contact_quantities(model, state_in, state_mid, dt)
 
         # prox iteration
-        self.eval_contact_forces(model, state_mid, dt, prox_iter, beta, mode)
+        self.eval_contact_forces(model, state_in, state_mid, dt, prox_iter, beta, mode)  # NOTE: prob can remove state_in
 
         # recompute tau with contact forces
         # kernel 5
@@ -2267,6 +2326,9 @@ class MoreauIntegrator:
                 model.rigid_contact_shape0,
                 model.shape_geo,
                 model.col_height,
+                model.randomize_height_map,
+                model.rand_foot_height_map,
+                model.grid_step_size,
             ],
             outputs=[model.Jc, model.c_body_vec, state_mid.point_vec],
             device=model.device,
@@ -2661,7 +2723,7 @@ class MoreauIntegrator:
             device=model.device,
         )
 
-    def eval_contact_forces(self, model, state_mid, dt, prox_iter, beta, mode):
+    def eval_contact_forces(self, model, state_in, state_mid, dt, prox_iter, beta, mode):
         # prox iteration
         # kernel 7
         if mode == "hard":
@@ -2766,7 +2828,7 @@ class MoreauIntegrator:
         wp.launch(
             kernel=p_to_f_s,
             dim=model.articulation_count,
-            inputs=[beta, model.c_body_vec, state_mid.point_vec, state_mid.percussion, dt],
+            inputs=[beta, model.c_body_vec, model.random_foot_forces, model.forces_height_range, state_mid.point_vec, state_mid.percussion, dt],
             outputs=[state_mid.body_f_s],
             device=model.device,
         )
