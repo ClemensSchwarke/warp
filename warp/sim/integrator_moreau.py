@@ -16,17 +16,6 @@ from .model import ModelShapeGeometry, ModelShapeMaterials
 
 
 @wp.func
-def get_random_height(map: wp.array2d(dtype=float), grid_step_size: float, x: float, z: float):
-    x_idx = wp.floor(x / grid_step_size)
-    z_idx = wp.floor(z / grid_step_size)
-
-    if x_idx >= map.shape[0] or z_idx >= map.shape[1]:
-        return 0.0
-    else:
-        return map[int(x_idx), int(z_idx)]
-
-
-@wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
     return 1.0 / (
         1.0 + wp.exp(wp.clamp(x * scale - offset, -100.0, 50.0))
@@ -1175,24 +1164,15 @@ def construct_contact_jacobian(
                 wp.transform_point(X_s, c_point) - n * c_dist
             )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
 
-            # print("p before randomization")
-            # print(p)
-
-            # randomize contact point
-            # print(randomize_height_map)
+            # randomization
             if randomize_height_map:
-                # print(grid_step_size)
-                # print(height_map[0, 0])
-                # height = 
-                # p[1] = p[1] - get_random_height(height_map, grid_step_size, p[0], p[2])
+                map_offset = height_map.shape[0] / 2
                 x_idx = wp.floor(p[0] / grid_step_size)
                 z_idx = wp.floor(p[2] / grid_step_size)
 
-                if x_idx < height_map.shape[0] and z_idx < height_map.shape[1]:
-                    p[1] = p[1] - height_map[int(x_idx), int(z_idx)]
-
-            # print("p after randomization")
-            # print(p)
+                # check if point is in square of height map centered at (x, z) = (0, 0)
+                if wp.abs(x_idx) < map_offset and wp.abs(z_idx) < map_offset:
+                    p[1] = p[1] - height_map[int(x_idx) + map_offset, int(z_idx) + map_offset]
 
             p_skew = wp.skew(wp.vec3(p[0], p[1], p[2]))
             # check ground contact
@@ -1877,6 +1857,9 @@ def get_foot_states(
     contact_shape: wp.array(dtype=int),
     # shape_materials: ModelShapeMaterials,
     geo: ModelShapeGeometry,
+    randomize_height_map: bool,
+    height_map: wp.array2d(dtype=wp.float32),
+    grid_step_size: float,
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
@@ -1920,6 +1903,14 @@ def get_foot_states(
 
             # transform point to world space
             p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+
+            if randomize_height_map:
+                map_offset = height_map.shape[0] / 2
+                x_idx = wp.floor(p[0] / grid_step_size)
+                z_idx = wp.floor(p[2] / grid_step_size)
+
+                if wp.abs(x_idx) < map_offset and wp.abs(z_idx) < map_offset:
+                    p[1] = p[1] - height_map[int(x_idx) + map_offset, int(z_idx) + map_offset]
 
             # compute contact point velocity
             w = wp.spatial_top(v_s)
@@ -2221,8 +2212,11 @@ class MoreauIntegrator:
                 model.rigid_contact_point0,
                 model.rigid_contact_shape0,
                 model.shape_geo,
+                model.randomize_height_map,
+                model.rand_foot_height_map,
+                model.grid_step_size,
             ],
-            outputs=[state_out.point_vec, 
+            outputs=[state_out.point_vec,
                      state_out.foot_vel],
         )
 
