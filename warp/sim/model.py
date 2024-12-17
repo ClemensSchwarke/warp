@@ -591,6 +591,8 @@ class Model:
         self.joint_qd_start = None
         self.articulation_start = None
         self.joint_name = None
+        self.joint_static_friction = None
+        self.joint_dynamic_friction = None
 
         self.composite_rigid_body_alg = False
 
@@ -698,15 +700,16 @@ class Model:
 
             # rigid contact data
             # contact points of quadruped feet
-            s.point_vec = wp.zeros(self.articulation_count*4, dtype=wp.vec3, requires_grad=True)
+            s.point_vec = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
             s.percussion = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
             # s.percussion_vec = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            
+            s.foot_vel = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
+
             # compute G and c
-            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True) # maybe set to 0?
-            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            s.Jc_qd = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            s.c = wp.zeros(self.articulation_count*4*3, requires_grad=True)
+            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)  # maybe set to 0?
+            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
+            s.Jc_qd = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
+            s.c = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
             s.c_vec = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
             # s.JcT_p = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)
@@ -754,7 +757,7 @@ class Model:
 
             s.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             s.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            s.G_mat = wp.zeros((self.articulation_count,4,4), dtype=wp.mat33, requires_grad=True)
+            s.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
 
             s.toi = wp.zeros(self.articulation_count, dtype=wp.float32, requires_grad=True)
 
@@ -776,10 +779,10 @@ class Model:
             self.J = wp.zeros(self.J_size, dtype=wp.float32, requires_grad=True)
             self.P = wp.empty(self.J_size, dtype=wp.float32, requires_grad=True)
             self.H = wp.empty(self.H_size, dtype=wp.float32, requires_grad=True)
-            self.L = wp.zeros(self.H_size, dtype=wp.float32,requires_grad=True)
+            self.L = wp.zeros(self.H_size, dtype=wp.float32, requires_grad=True)
             self.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             self.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            self.G_mat = wp.zeros((self.articulation_count,4,4), dtype=wp.mat33, requires_grad=True)
+            self.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
 
     def find_shape_contact_pairs(self):
         # find potential contact pairs based on collision groups and collision mask (pairwise filtering)
@@ -923,8 +926,7 @@ class Model:
             len(self.body_q), dtype=wp.float32, device=self.device, requires_grad=requires_grad
         )
         # contact bodies of quadruped feet
-        self.c_body_vec = wp.zeros(self.articulation_count*4, dtype=wp.int32, device=self.device)
-        
+        self.c_body_vec = wp.zeros(self.articulation_count * 4, dtype=wp.int32, device=self.device)
 
     def flatten(self):
         """Returns a list of Tensors stored by the model
@@ -1074,7 +1076,7 @@ class ModelBuilder:
     # Default geo settings
     default_geo_thickness = 1e-5
 
-    def __init__(self, up_vector=(0.0, 1.0, 0.0), gravity=-9.80665, composite_rigid_body_alg = False):
+    def __init__(self, up_vector=(0.0, 1.0, 0.0), gravity=-9.80665, composite_rigid_body_alg=False):
         self.num_envs = 0
 
         # particles
@@ -1181,6 +1183,8 @@ class ModelBuilder:
         self.joint_limit_ke = []
         self.joint_limit_kd = []
         self.joint_act = []
+        self.joint_static_friction = []
+        self.joint_dynamic_friction = []
 
         self.joint_twist_lower = []
         self.joint_twist_upper = []
@@ -1406,6 +1410,8 @@ class ModelBuilder:
             "joint_target",
             "joint_target_ke",
             "joint_target_kd",
+            "joint_static_friction",
+            "joint_dynamic_friction",
             "joint_linear_compliance",
             "joint_angular_compliance",
             "shape_geo_type",
@@ -1620,8 +1626,9 @@ class ModelBuilder:
 
         # articulation, hardcoded to work with legacy simulation
         if joint_type == JOINT_FREE and self.composite_rigid_body_alg:
-            self.joint_axis.append([0.0,0.0,0.0])
-            self.joint_target.extend([0.0,0.0,0.0,0.0,0.0,0.0,0.0])
+            self.joint_axis.append([0.0, 0.0, 0.0])
+            self.joint_axis_mode.append(1.0)
+            self.joint_target.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             self.joint_target_ke.append(0.0)
             self.joint_target_kd.append(0.0)
             self.joint_limit_ke.append(0.0)
@@ -2124,17 +2131,17 @@ class ModelBuilder:
             body_children[parent].append(child)
 
             q_start = self.joint_q_start[i]
-            qd_start = self.joint_qd_start[i]
+            qd_start = self.joint_qd_start[i]  # start index of velocities of movable joints
             if i < self.joint_count - 1:
                 q_dim = self.joint_q_start[i + 1] - q_start
                 qd_dim = self.joint_qd_start[i + 1] - qd_start
             else:
                 q_dim = len(self.joint_q) - q_start
-                qd_dim = len(self.joint_qd) - qd_start
+                qd_dim = len(self.joint_qd) - qd_start  # qd_dim are nr of dof per joint
 
             data = {
                 "type": self.joint_type[i],
-                'armature': self.joint_armature[i],
+                'armature': self.joint_armature[qd_start : qd_start + qd_dim],
                 "q": self.joint_q[q_start : q_start + q_dim],
                 "qd": self.joint_qd[qd_start : qd_start + qd_dim],
                 "act": self.joint_act[qd_start : qd_start + qd_dim],
@@ -2154,10 +2161,13 @@ class ModelBuilder:
             }
             num_lin_axes, num_ang_axes = self.joint_axis_dim[i]
             start_ax = self.joint_axis_start[i]
+
+            # loop over actuated joints
+            # NOTE: For anymal, with 12 actuated joints, start_ax starts at 1
             for j in range(start_ax, start_ax + num_lin_axes + num_ang_axes):
                 data["axes"].append(
                     {
-                        "axis": self.joint_axis[j],
+                        "axis": self.joint_axis[j],  # in e.g. anymal, j=0 would be for base_joint, which we don't need
                         "axis_mode": self.joint_axis_mode[j],
                         "target": self.joint_target[j],
                         "target_ke": self.joint_target_ke[j],
@@ -2189,8 +2199,11 @@ class ModelBuilder:
 
             joint = joint_data[(parent_body, child_body)]
             if joint["type"] == JOINT_FIXED:
+                # NOTE: for anymal, joint["child_xform"] is always neutral
+                # joint_xform corresponds to transform of fixed joint
+                # if parent was transformed before, it's contained in incoming_xform
                 joint_xform = joint["parent_xform"] * wp.transform_inverse(joint["child_xform"])
-                incoming_xform = incoming_xform * joint_xform
+                incoming_xform = incoming_xform * joint_xform  # transform from child link to (merged) parent
                 parent_name = self.body_name[parent_body] if parent_body > -1 else "world"
                 child_name = self.body_name[child_body]
                 last_dynamic_body_name = self.body_name[last_dynamic_body] if last_dynamic_body > -1 else "world"
@@ -2200,6 +2213,7 @@ class ModelBuilder:
                         f"merging {child_name} into {last_dynamic_body_name}"
                     )
                 child_id = body_data[child_body]["original_id"]
+
                 for shape in self.body_shapes[child_id]:
                     self.shape_transform[shape] = incoming_xform * self.shape_transform[shape]
                     if verbose:
@@ -2208,22 +2222,41 @@ class ModelBuilder:
                         )
                     if last_dynamic_body > -1:
                         self.shape_body[shape] = body_data[last_dynamic_body]["id"]
-                        # add inertia to last_dynamic_body
-                        m = body_data[child_body]["mass"]
-                        com = body_data[child_body]["com"]
-                        inertia = body_data[child_body]["inertia"]
-                        body_data[last_dynamic_body]["inertia"] += wp.sim.transform_inertia(
-                            m, inertia, incoming_xform.p, incoming_xform.q
-                        )
-                        body_data[last_dynamic_body]["mass"] += m
-                        source_m = body_data[last_dynamic_body]["mass"]
-                        source_com = body_data[last_dynamic_body]["com"]
-                        body_data[last_dynamic_body]["com"] = (m * com + source_m * source_com) / (m + source_m)
                         body_data[last_dynamic_body]["shapes"].append(shape)
-                        # indicate to recompute inverse mass, inertia for this body
-                        body_data[last_dynamic_body]["inv_mass"] = None
+
                     else:
                         self.shape_body[shape] = -1
+
+                # add mass and inertia to last_dynamic_body
+                if last_dynamic_body > -1:
+
+                    # get values of the two bodies
+                    m = body_data[child_body]["mass"]
+                    com = wp.vec3(body_data[child_body]["com"])
+                    inertia = body_data[child_body]["inertia"]
+                    source_m = body_data[last_dynamic_body]["mass"]
+                    source_com = wp.vec3(body_data[last_dynamic_body]["com"])
+                    source_inertia = body_data[last_dynamic_body]["inertia"]
+
+                    # transform com (rotation + translation) of child to parent frame
+                    transformed_com = wp.transform_point(incoming_xform, com)
+
+                    # compute new com for merged body
+                    merged_com = (m * transformed_com + source_m * source_com) * (1.0 / (m + source_m))
+
+                    # compute distance to new com
+                    d = merged_com - transformed_com
+                    source_d = merged_com - source_com
+
+                    # shift inertia tensors to new com and merge
+                    merged_inertia = (transform_inertia(m, inertia, d, incoming_xform.q)
+                                      + transform_inertia(source_m, source_inertia, source_d, wp.quat_identity()))
+                    # update parent
+                    body_data[last_dynamic_body]["mass"] += m
+                    body_data[last_dynamic_body]["com"] = merged_com
+                    body_data[last_dynamic_body]["inertia"] = merged_inertia
+                    # indicate to recompute inverse mass, inertia for this body
+                    body_data[last_dynamic_body]["inv_mass"] = None
             else:
                 joint["parent_xform"] = incoming_xform * joint["parent_xform"]
                 joint["parent"] = last_dynamic_body
@@ -4011,7 +4044,6 @@ class ModelBuilder:
 
             # --------------------------------------
             # rigid bodies
-
             m.body_q = wp.array(self.body_q, dtype=wp.transform, requires_grad=requires_grad)
             m.body_qd = wp.array(self.body_qd, dtype=wp.spatial_vector, requires_grad=requires_grad)
             m.body_inertia = wp.array(self.body_inertia, dtype=wp.mat33, requires_grad=requires_grad)
@@ -4043,6 +4075,8 @@ class ModelBuilder:
             m.joint_target_kd = wp.array(self.joint_target_kd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_axis_mode = wp.array(self.joint_axis_mode, dtype=wp.uint8)
             m.joint_act = wp.array(self.joint_act, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_static_friction = wp.array(self.joint_static_friction, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_dynamic_friction = wp.array(self.joint_dynamic_friction, dtype=wp.float32, requires_grad=requires_grad)
 
             m.joint_limit_lower = wp.array(self.joint_limit_lower, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_limit_upper = wp.array(self.joint_limit_upper, dtype=wp.float32, requires_grad=requires_grad)
@@ -4065,7 +4099,7 @@ class ModelBuilder:
             m.edge_count = len(self.edge_rest_angle)
             m.spring_count = len(self.spring_rest_length)
             m.muscle_count = len(self.muscle_start)
-            m.articulation_count = len(self.articulation_start)
+            m.articulation_count = len(self.articulation_start)  # NOTE: self.articulation_count was different for some reason
 
             # 'close' the start index arrays with a sentinel value
             self.joint_q_start.append(self.joint_coord_count)
