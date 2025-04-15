@@ -1516,16 +1516,37 @@ def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), 
             )
 
 
+# @wp.func
+# def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
+#     """
+#     tid: articulation
+#     i: contact 1
+#     j: contact 2
+#     k: row in 3x3 matrix
+#     l: column in 3x3 matrix
+#     """
+#     return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+
+
 @wp.func
 def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
     """
-    tid: articulation
-    i: contact 1
-    j: contact 2
-    k: row in 3x3 matrix
-    l: column in 3x3 matrix
+    Calculates flat index for G stored in row-major order.
+    tid: articulation index
+    i: block row index (contact 1, 0..3)
+    j: block col index (contact 2, 0..3)
+    k: row index within 3x3 block (0..2)
+    l: col index within 3x3 block (0..2)
     """
-    return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+    # Assuming N=4 contacts per articulation (hardcoded in loops using G_mat)
+    num_contacts = 4
+    num_block_cols = num_contacts  # G is (N*3) x (N*3)
+    num_total_cols = num_block_cols * 3  # Total number of columns in the flat matrix per articulation
+
+    global_row = i * 3 + k
+    global_col = j * 3 + l
+
+    return G_start[tid] + global_row * num_total_cols + global_col
 
 
 @wp.kernel
