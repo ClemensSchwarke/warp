@@ -1570,10 +1570,9 @@ def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int
     k: row index within 3x3 block (0..2)
     l: col index within 3x3 block (0..2)
     """
-    # Assuming N=4 contacts per articulation (hardcoded in loops using G_mat)
     num_contacts = 4
     num_block_cols = num_contacts  # G is (N*3) x (N*3)
-    num_total_cols = num_block_cols * 3  # Total number of columns in the flat matrix per articulation
+    num_total_cols = num_block_cols * 3
 
     global_row = i * 3 + k
     global_col = j * 3 + l
