@@ -221,27 +221,8 @@ def jcalc_tau(
         act = joint_act[dof_start]
 
         target = joint_target[coord_start]
-        lower = joint_limit_lower[coord_start]
-        upper = joint_limit_upper[coord_start]
-
-        limit_f = 0.0
-
-        # compute limit forces, damping only active when limit is violated
-        if q < lower:
-            limit_f = limit_k_e * (lower - q)
-
-        if q > upper:
-            limit_f = limit_k_e * (upper - q)
-
-        damping_f = (0.0 - limit_k_d) * qd
-
         # friction
         t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
-        # NOTE: we currently ignore if-else, since it's not diff'able and assume static friction is 0
-        # if wp.abs(t_2) > joint_static_friction:
-        #     t_2 += 0.0 - joint_dynamic_friction * qd
-        # else:
-        #     t_2 = 0.0
         t_2 += 0.0 - joint_dynamic_friction * qd
 
         # velocity-based torque limit
@@ -252,7 +233,7 @@ def jcalc_tau(
 
         # total torque / force on the joint
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
-        t_2 = wp.clamp(t_2 + act + limit_f + damping_f, min_torque_limit, max_torque_limit)
+        t_2 = wp.clamp(t_2 + act, min_torque_limit, max_torque_limit)
 
         tau[dof_start] = t_1 + t_2
 
@@ -1567,16 +1548,37 @@ def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), 
             )
 
 
+# @wp.func
+# def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
+#     """
+#     tid: articulation
+#     i: contact 1
+#     j: contact 2
+#     k: row in 3x3 matrix
+#     l: column in 3x3 matrix
+#     """
+#     return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+
+
 @wp.func
 def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
     """
-    tid: articulation
-    i: contact 1
-    j: contact 2
-    k: row in 3x3 matrix
-    l: column in 3x3 matrix
+    Calculates flat index for G stored in row-major order.
+    tid: articulation index
+    i: block row index (contact 1, 0..3)
+    j: block col index (contact 2, 0..3)
+    k: row index within 3x3 block (0..2)
+    l: col index within 3x3 block (0..2)
     """
-    return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+    # Assuming N=4 contacts per articulation (hardcoded in loops using G_mat)
+    num_contacts = 4
+    num_block_cols = num_contacts  # G is (N*3) x (N*3)
+    num_total_cols = num_block_cols * 3  # Total number of columns in the flat matrix per articulation
+
+    global_row = i * 3 + k
+    global_col = j * 3 + l
+
+    return G_start[tid] + global_row * num_total_cols + global_col
 
 
 @wp.kernel
@@ -1744,7 +1746,9 @@ def get_foot_states(
             n = wp.vec3(0.0, 1.0, 0.0)
 
             # transform point to world space
-            p = wp.transform_point(X_s, c_point) - n * c_dist  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+            p = (
+                wp.transform_point(X_s, c_point) - n * c_dist
+            )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
 
             # compute contact point velocity
             w = wp.spatial_top(v_s)
@@ -2045,8 +2049,7 @@ class MoreauIntegrator:
                 model.rigid_contact_shape0,
                 model.shape_geo,
             ],
-            outputs=[state_out.point_vec,
-                     state_out.foot_vel],
+            outputs=[state_out.point_vec, state_out.foot_vel],
         )
 
         return state_out
