@@ -197,6 +197,8 @@ def jcalc_tau(
     target_k_d: float,
     limit_k_e: float,
     limit_k_d: float,
+    joint_static_friction: float,
+    joint_dynamic_friction: float,
     max_torque: float,
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
@@ -219,25 +221,19 @@ def jcalc_tau(
         act = joint_act[dof_start]
 
         target = joint_target[coord_start]
-        lower = joint_limit_lower[coord_start]
-        upper = joint_limit_upper[coord_start]
+        # friction
+        t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
+        t_2 += 0.0 - joint_dynamic_friction * qd
 
-        limit_f = 0.0
-
-        # compute limit forces, damping only active when limit is violated
-        if q < lower:
-            limit_f = limit_k_e * (lower - q)
-
-        if q > upper:
-            limit_f = limit_k_e * (upper - q)
-
-        damping_f = (0.0 - limit_k_d) * qd
+        # velocity-based torque limit
+        peak_torque = 120.0  # TODO: transfer this into config file
+        velocity_limit = 7.5  # TODO: transfer this into config file
+        max_torque_limit = wp.clamp(peak_torque * (1.0 - qd / velocity_limit), 0.0, max_torque)
+        min_torque_limit = wp.clamp(peak_torque * (-1.0 - qd / velocity_limit), -max_torque, 0.0)
 
         # total torque / force on the joint
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
-        t_2 = wp.clamp(
-            0.0 - target_k_e * (q - target) - target_k_d * qd + act + limit_f + damping_f, 0.0 - max_torque, max_torque
-        )
+        t_2 = wp.clamp(t_2 + act, min_torque_limit, max_torque_limit)
 
         tau[dof_start] = t_1 + t_2
 
@@ -315,8 +311,11 @@ def jcalc_integrate(
         # translation of origin
         p_s = wp.vec3(joint_q[coord_start + 0], joint_q[coord_start + 1], joint_q[coord_start + 2])
 
-        # linear vel of origin (note q/qd switch order of linear angular elements)
-        # note we are converting the body twist in the space frame (w_s, v_s) to compute center of mass velcity
+        # (old comment) linear vel of origin (note q/qd switch order of linear angular elements)
+        # (old comment) note we are converting the body twist in the space frame (w_s, v_s)
+        # (old comment) to compute center of mass velocity
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point p_s. p_s is not necessarily the com of the body, but of the joint.
         dpdt_s = v_s_avg + wp.cross(w_s_avg, p_s)
 
         # quat and quat derivative
@@ -481,6 +480,8 @@ def compute_link_tau(
     joint_target: wp.array(dtype=float),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
     max_torque: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
@@ -506,6 +507,10 @@ def compute_link_tau(
     limit_k_e = joint_limit_ke[i]
     limit_k_d = joint_limit_kd[i]
 
+    # friction
+    static_friction = joint_static_friction[i]
+    dynamic_friction = joint_dynamic_friction[i]
+
     # total forces on body
     f_b_s = body_fb_s[i]
     f_t_s = body_ft_s[i]
@@ -519,6 +524,8 @@ def compute_link_tau(
         target_k_d,
         limit_k_e,
         limit_k_d,
+        static_friction,
+        dynamic_friction,
         max_torque,
         joint_S_s,
         joint_q,
@@ -642,6 +649,8 @@ def eval_rigid_tau(
     joint_target: wp.array(dtype=float),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
+    joint_static_friction: wp.array(dtype=float),
+    joint_dynamic_friction: wp.array(dtype=float),
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -676,6 +685,8 @@ def eval_rigid_tau(
             joint_target,
             joint_target_ke,
             joint_target_kd,
+            joint_static_friction,
+            joint_dynamic_friction,
             max_torque,
             joint_limit_lower,
             joint_limit_upper,
@@ -773,6 +784,9 @@ def inertial_body_pos_vel(
         w = wp.spatial_top(v_s)
         v = wp.spatial_bottom(v_s)
 
+        # NOTE to elaborate: v_s is a spatial velocity in a body-fixed frame. With this formula we can compute the
+        # inertial velocity of the point X_sc (= body_q). X_sc is not necessarily the com of the body, but of the
+        # anchor/coordinate frame (i.e joint's world position in case of anymal).
         v_inertial = v + wp.cross(w, wp.transform_get_translation(X_sc))
 
         body_q[i] = X_sc
@@ -1422,18 +1436,27 @@ def prox_loop_soft(
 
 @wp.kernel
 def prox_iteration_unrolled(
+    # inputs
+    articulation_count: int,
     G_mat: wp.array3d(dtype=wp.mat33),
     c_vec: wp.array2d(dtype=wp.vec3),
-    mu: float,
+    # mu: float,
     prox_iter: int,
+    shape_materials: ModelShapeMaterials,
+    # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
-    tid = wp.tid()
+    tid = wp.tid()  # number of envs/articulations
 
     c_vec_0 = c_vec[tid, 0]
     c_vec_1 = c_vec[tid, 1]
     c_vec_2 = c_vec[tid, 2]
     c_vec_3 = c_vec[tid, 3]
+
+    # get friction coefficient
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count  # excluding ground shape
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]  # we only access 1 body for each env assuming mu is the same for all bodies
 
     # initialize percussions with steady state
     p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
@@ -1456,12 +1479,16 @@ def prox_iteration_unrolled(
 
 @wp.kernel
 def prox_iteration_unrolled_soft(
+    # inputs
+    articulation_count: int,
     point_vec: wp.array(dtype=wp.vec3),
     G_mat: wp.array3d(dtype=wp.mat33),
     c_vec: wp.array2d(dtype=wp.vec3),
-    mu: float,
+    # mu: float,
     prox_iter: int,
     scale_array: wp.array(dtype=float),
+    shape_materials: ModelShapeMaterials,
+    # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
@@ -1480,6 +1507,11 @@ def prox_iteration_unrolled_soft(
     c_vec_1 = c_vec[tid, 1]  # * offset_sigmoid(c_1, scale, 0.0)
     c_vec_2 = c_vec[tid, 2]  # * offset_sigmoid(c_2, scale, 0.0)
     c_vec_3 = c_vec[tid, 3]  # * offset_sigmoid(c_3, scale, 0.0)
+
+    # get friction coefficient
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count  # excluding ground shape
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]  # we only access 1 body for each env assuming mu is the same for all bodies
 
     # initialize percussions with steady state
     p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
@@ -1516,16 +1548,36 @@ def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), 
             )
 
 
+# @wp.func
+# def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
+#     """
+#     tid: articulation
+#     i: contact 1
+#     j: contact 2
+#     k: row in 3x3 matrix
+#     l: column in 3x3 matrix
+#     """
+#     return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+
+
 @wp.func
 def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int, l: int):
     """
-    tid: articulation
-    i: contact 1
-    j: contact 2
-    k: row in 3x3 matrix
-    l: column in 3x3 matrix
+    Calculates flat index for G stored in row-major order.
+    tid: articulation index
+    i: block row index (contact 1, 0..3)
+    j: block col index (contact 2, 0..3)
+    k: row index within 3x3 block (0..2)
+    l: col index within 3x3 block (0..2)
     """
-    return G_start[tid] + i * 4 * 3 * 3 + j * 3 + k + l * 4 * 3
+    num_contacts = 4
+    num_block_cols = num_contacts  # G is (N*3) x (N*3)
+    num_total_cols = num_block_cols * 3
+
+    global_row = i * 3 + k
+    global_col = j * 3 + l
+
+    return G_start[tid] + global_row * num_total_cols + global_col
 
 
 @wp.kernel
@@ -1550,15 +1602,18 @@ def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: 
 
 @wp.kernel
 def p_to_f_s(
+    # inputs
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
     percussion: wp.array2d(dtype=wp.vec3),
     dt: float,
+    # output
     body_f_s: wp.array(dtype=wp.spatial_vector),
 ):
     tid = wp.tid()
 
     for i in range(4):
+        # foot forces and torques
         f = -percussion[tid, i] / dt
         t = wp.cross(point_vec[tid * 4 + i], f)
         wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
@@ -1636,6 +1691,75 @@ def create_matrix(
         A[A_start[tid] + i + 198] = a_12[a_start[tid] + i]
 
 
+@wp.kernel
+def copy_relevant_states(
+    # input
+    percussion_in: wp.array2d(dtype=wp.vec3),
+    # ouput
+    percussion_out: wp.array2d(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    # NOTE: these states assume hardcoded indices for quadruped feet
+
+    percussion_out[tid, 0] = percussion_in[tid, 0]
+    percussion_out[tid, 1] = percussion_in[tid, 1]
+    percussion_out[tid, 2] = percussion_in[tid, 2]
+    percussion_out[tid, 3] = percussion_in[tid, 3]
+
+
+@wp.kernel
+def get_foot_states(
+    # inputs
+    rigid_contact_max: int,
+    articulation_count: int,
+    # contact_count: wp.array(dtype=int),
+    body_X_s: wp.array(dtype=wp.transform),
+    body_v_s: wp.array(dtype=wp.spatial_vector),
+    contact_body: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    # shape_materials: ModelShapeMaterials,
+    geo: ModelShapeGeometry,
+    # outputs
+    point_vec: wp.array(dtype=wp.vec3),
+    foot_vel: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()  # articulation_count
+
+    contacts_per_articulation = rigid_contact_max / articulation_count
+
+    for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
+        contact_id = tid * contacts_per_articulation + i
+        c_body = contact_body[contact_id]
+        c_point = contact_point[contact_id]
+        c_shape = contact_shape[contact_id]
+        c_dist = geo.thickness[c_shape]
+
+        if (c_body - tid) % 3 == 0 and i % 2 == 0:  # only consider foot contacts
+            foot_id = (c_body - tid - tid * 12) / 3 - 1
+
+            X_s = body_X_s[c_body]  # position of colliding body
+            v_s = body_v_s[c_body]  # orientation of colliding body
+
+            n = wp.vec3(0.0, 1.0, 0.0)
+
+            # transform point to world space
+            p = (
+                wp.transform_point(X_s, c_point) - n * c_dist
+            )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
+
+            # compute contact point velocity
+            w = wp.spatial_top(v_s)
+            v = wp.spatial_bottom(v_s)
+
+            dpdt = v + wp.cross(w, p)
+
+            # get data
+            point_vec[tid * 4 + foot_id] = p
+            foot_vel[tid * 4 + foot_id] = dpdt
+
+
 ##########################
 
 ###  INTEGRATOR CLASS  ###
@@ -1655,7 +1779,6 @@ class MoreauIntegrator:
         state_mid,
         state_out,
         dt,
-        mu,
         requires_grad,
         update_mass_matrix,
         prox_iter,
@@ -1752,6 +1875,8 @@ class MoreauIntegrator:
                 model.joint_target,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -1769,7 +1894,7 @@ class MoreauIntegrator:
         self.eval_contact_quantities(model, state_in, state_mid, dt)
 
         # prox iteration
-        self.eval_contact_forces(model, state_mid, dt, mu, prox_iter, mode)
+        self.eval_contact_forces(model, state_mid, dt, prox_iter, mode)
 
         # recompute tau with contact forces
         # kernel 5
@@ -1788,6 +1913,8 @@ class MoreauIntegrator:
                 model.joint_target,
                 model.joint_target_ke,
                 model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -1896,6 +2023,32 @@ class MoreauIntegrator:
             dim=model.articulation_count,
             inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
             outputs=[state_out.body_q, state_out.body_qd],
+        )
+
+        # copy relevant states to have them in state_out
+        # kernel -1
+        wp.launch(
+            kernel=copy_relevant_states,
+            dim=model.articulation_count,
+            inputs=[state_mid.percussion],
+            outputs=[state_out.percussion],
+        )
+        # get_foot_states
+        # kernel -2
+        wp.launch(
+            kernel=get_foot_states,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_max,
+                model.articulation_count,
+                state_out.body_X_sc,
+                state_out.body_v_s,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+            ],
+            outputs=[state_out.point_vec, state_out.foot_vel],
         )
 
         return state_out
@@ -2353,14 +2506,14 @@ class MoreauIntegrator:
             device=model.device,
         )
 
-    def eval_contact_forces(self, model, state_mid, dt, mu, prox_iter, mode):
+    def eval_contact_forces(self, model, state_mid, dt, prox_iter, mode):
         # prox iteration
         # kernel 7
         if mode == "hard":
             wp.launch(
                 kernel=prox_iteration_unrolled,
                 dim=model.articulation_count,
-                inputs=[model.G_mat, state_mid.c_vec, mu, prox_iter],
+                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
@@ -2368,7 +2521,15 @@ class MoreauIntegrator:
             wp.launch(
                 kernel=prox_iteration_unrolled_soft,
                 dim=model.articulation_count,
-                inputs=[state_mid.point_vec, model.G_mat, state_mid.c_vec, mu, prox_iter, model.sigmoid_scale],
+                inputs=[
+                    model.articulation_count,
+                    state_mid.point_vec,
+                    model.G_mat,
+                    state_mid.c_vec,
+                    prox_iter,
+                    model.sigmoid_scale,
+                    model.shape_materials,
+                ],
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
