@@ -93,11 +93,14 @@ def eval_rigid_contacts_art(
     c_shape = contact_shape[tid]  # collision shape nr of articualtion
     c_dist = geo.thickness[c_shape]
 
-    # hardcoded measure for anymal (if feet sink in ground then "ankle" might make contact leading to weird behavior)
-    contacts_per_articulation = count / articulation_count  # 26 for anymal with 13 cylinders
-    contact_id = tid % contacts_per_articulation  # base cylinder: 0,1; LF_THIGH: 2,3; LF_SHANK: 4,5; LF_FOOT: 6,7;...
-    # if c_shape % 3 != 0 or contact_id % 2 != 0:  # only consider bottom of foot cylinder
-    #     return
+    # hardcoded measure for anymal: only keep contacts on foot bodies.
+    # Using tid/contact ordering is brittle (depends on broadphase/contact compaction ordering),
+    # while c_body is stable and maps directly to articulation-local body ids.
+    bodies_per_articulation = 13
+    local_body_id = c_body % bodies_per_articulation
+    is_foot_body = local_body_id > 0 and local_body_id % 3 == 0
+    if not is_foot_body:
+        return
 
     # hard coded surface parameter tensor layout (ke, kd, kf, mu)
     ke = shape_materials.ke[c_shape]
