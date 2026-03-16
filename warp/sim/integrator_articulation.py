@@ -96,8 +96,8 @@ def eval_rigid_contacts_art(
     # hardcoded measure for anymal (if feet sink in ground then "ankle" might make contact leading to weird behavior)
     contacts_per_articulation = count / articulation_count  # 26 for anymal with 13 cylinders
     contact_id = tid % contacts_per_articulation  # base cylinder: 0,1; LF_THIGH: 2,3; LF_SHANK: 4,5; LF_FOOT: 6,7;...
-    if c_shape % 3 != 0 or contact_id % 2 != 0:  # only consider bottom of foot cylinder
-        return
+    # if c_shape % 3 != 0 or contact_id % 2 != 0:  # only consider bottom of foot cylinder
+    #     return
 
     # hard coded surface parameter tensor layout (ke, kd, kf, mu)
     ke = shape_materials.ke[c_shape]
