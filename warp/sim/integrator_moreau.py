@@ -2533,8 +2533,34 @@ class MoreauIntegrator:
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
+        elif mode == "mixed":
+            # Soft kernel on tape (recorded for backward pass gradients)
+            wp.launch(
+                kernel=prox_iteration_unrolled_soft,
+                dim=model.articulation_count,
+                inputs=[
+                    model.articulation_count,
+                    state_mid.point_vec,
+                    model.G_mat,
+                    state_mid.c_vec,
+                    prox_iter,
+                    model.sigmoid_scale,
+                    model.shape_materials,
+                ],
+                outputs=[state_mid.percussion],
+                device=model.device,
+            )
+            # Hard kernel off tape (overwrites with hard forward values, not recorded for backward)
+            wp.launch(
+                kernel=prox_iteration_unrolled,
+                dim=model.articulation_count,
+                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
+                outputs=[state_mid.percussion],
+                device=model.device,
+                record_tape=False,
+            )
         else:
-            raise ValueError("Invalid mode")
+            raise ValueError(f"Invalid mode '{mode}', expected 'hard', 'soft', or 'mixed'")
 
         # kernel 6
         wp.launch(
