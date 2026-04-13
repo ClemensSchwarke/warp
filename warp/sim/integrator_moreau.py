@@ -1760,6 +1760,574 @@ def get_foot_states(
             foot_vel[tid * 4 + foot_id] = dpdt
 
 
+##############################
+
+###  BUNDLE MODE KERNELS  ###
+
+##############################
+
+
+@wp.kernel
+def detect_bundle_contacts(
+    # inputs
+    point_vec: wp.array(dtype=wp.vec3),
+    col_height: float,
+    bundle_active: wp.array(dtype=int),
+    # outputs
+    bundle_trigger: wp.array(dtype=int),
+    contact_feet_mask: wp.array(dtype=int),
+):
+    """Detect which envs have foot-ground contact and should trigger bundling.
+
+    For each articulation, checks 4 feet. contact_feet_mask is ALWAYS filled
+    from the current point_vec (needed by continuing bundle envs to refresh
+    their perturbation Jacobian leg set each substep).
+
+    bundle_trigger is only set for envs with bundle_active==0 — i.e. envs
+    already inside a bundle window continue via bookkeeping, not re-triggering.
+    """
+    tid = wp.tid()
+
+    mask = int(0)
+    any_contact = int(0)
+
+    for f in range(4):
+        p = point_vec[tid * 4 + f]
+        if p[1] <= col_height:
+            mask = mask | (1 << f)
+            any_contact = 1
+
+    contact_feet_mask[tid] = mask
+
+    if bundle_active[tid] > 0:
+        bundle_trigger[tid] = 0
+    else:
+        bundle_trigger[tid] = any_contact
+
+
+@wp.kernel
+def copy_int_array(src: wp.array(dtype=int), dst: wp.array(dtype=int)):
+    tid = wp.tid()
+    dst[tid] = src[tid]
+
+
+@wp.kernel
+def copy_float_array_1d(src: wp.array(dtype=float), dst: wp.array(dtype=float)):
+    tid = wp.tid()
+    dst[tid] = src[tid]
+
+
+@wp.kernel
+def detect_bundle_branch_contacts(
+    # inputs
+    point_vec: wp.array(dtype=wp.vec3),
+    col_height: float,
+    # outputs
+    branch_contact_mask: wp.array(dtype=int),
+):
+    """Detect foot-ground contacts for bundle branch environments.
+
+    Runs on bundle_model.articulation_count (= main_articulation_count * num_bundle_samples).
+    Writes a 4-bit contact mask per bundle env.
+    """
+    tid = wp.tid()
+
+    mask = int(0)
+    for f in range(4):
+        p = point_vec[tid * 4 + f]
+        if p[1] <= col_height:
+            mask = mask | (1 << f)
+
+    branch_contact_mask[tid] = mask
+
+
+@wp.kernel
+def copy_joint_actions_to_bundle(
+    # inputs
+    bundle_trigger: wp.array(dtype=int),
+    num_envs: int,
+    articulation_coord_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    joint_act_main: wp.array(dtype=float),
+    joint_target_main: wp.array(dtype=float),
+    dof_count: int,
+    coord_count: int,
+    # outputs
+    joint_act_bundle: wp.array(dtype=float),
+    joint_target_bundle: wp.array(dtype=float),
+):
+    """Copy joint_act and joint_target from main model to bundle model slots.
+
+    Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id.
+    Thread tid is the flat bundle slot index.
+    Only copies for triggered envs.
+    joint_act and joint_target are indexed by coordinates (joint_coord_count),
+    not by DOFs (joint_dof_count).
+    """
+    tid = wp.tid()
+    env_id = tid % num_envs
+
+    if bundle_trigger[env_id] == 0:
+        return
+
+    main_coord_start = articulation_coord_start[env_id]
+    main_dof_start = articulation_dof_start[env_id]
+    bundle_coord_start = tid * coord_count
+    bundle_dof_start = tid * dof_count
+
+    for d in range(dof_count):
+        joint_act_bundle[bundle_dof_start + d] = joint_act_main[main_dof_start + d]
+
+    for c in range(coord_count):
+        joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
+
+
+@wp.kernel
+def average_bundle_into_buffer(
+    # inputs
+    bundle_trigger: wp.array(dtype=int),
+    num_bundle_samples: int,
+    num_envs: int,
+    bundle_joint_q: wp.array(dtype=float),
+    bundle_joint_qd: wp.array(dtype=float),
+    articulation_coord_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    coord_count: int,
+    dof_count: int,
+    root_q_dim: int,
+    # outputs
+    bundle_avg_q: wp.array(dtype=float),
+    bundle_avg_qd: wp.array(dtype=float),
+):
+    """Average bundle branch end states into the bundle_avg buffers (NOT state_out).
+
+    For each triggered env, averages joint_q and joint_qd across all samples and
+    writes to bundle_avg_q / bundle_avg_qd, which have the same per-env layout as
+    the main joint_q / joint_qd.
+
+    When root_q_dim == 7 (floating-base free joint), the quaternion at indices
+    [main_q_start+3 .. main_q_start+6] is averaged with double-cover sign
+    correction: each sample's quaternion is flipped if its dot product with
+    sample-0's quaternion is negative, so all samples lie in the same hemisphere
+    before averaging.  The normalization step is intentionally kept OFF the warp
+    tape (see the separate normalize_bundle_avg_quat kernel launched with
+    record_tape=False directly after this launch).  This ensures the backward pass
+    through the averaging is a plain 1/N scaling with no projection Jacobian,
+    which makes the bundle gradient match the soft-mode gradient exactly when
+    num_bundle_samples==1 and sigma==0.
+
+    Non-triggered envs leave the buffer slot untouched.
+    """
+    tid = wp.tid()
+
+    if bundle_trigger[tid] == 0:
+        return
+
+    main_q_start = articulation_coord_start[tid]
+    main_qd_start = articulation_dof_start[tid]
+    inv_n = 1.0 / float(num_bundle_samples)
+
+    # Read reference quaternion from sample 0 for sign-consistency check.
+    # Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id
+    # (tid here is env_id, running 0..num_envs-1).
+    ref_qx = float(0.0)
+    ref_qy = float(0.0)
+    ref_qz = float(0.0)
+    ref_qw = float(1.0)
+    if root_q_dim == 7:
+        s0_q_start = (0 * num_envs + tid) * coord_count
+        ref_qx = bundle_joint_q[s0_q_start + 3]
+        ref_qy = bundle_joint_q[s0_q_start + 4]
+        ref_qz = bundle_joint_q[s0_q_start + 5]
+        ref_qw = bundle_joint_q[s0_q_start + 6]
+
+    # Average joint_q, with quaternion sign flip for the free joint.
+    for qi in range(coord_count):
+        avg = float(0.0)
+        for s in range(num_bundle_samples):
+            bundle_slot = s * num_envs + tid
+            bundle_q_start = bundle_slot * coord_count
+            val = bundle_joint_q[bundle_q_start + qi]
+            # For quaternion indices [3..6] of the free joint, flip sign if
+            # this sample is in the opposite hemisphere to sample 0.
+            if root_q_dim == 7 and qi >= 3 and qi < 7:
+                sq_start = bundle_slot * coord_count
+                dot = (
+                    bundle_joint_q[sq_start + 3] * ref_qx
+                    + bundle_joint_q[sq_start + 4] * ref_qy
+                    + bundle_joint_q[sq_start + 5] * ref_qz
+                    + bundle_joint_q[sq_start + 6] * ref_qw
+                )
+                if dot < 0.0:
+                    val = -val
+            avg = avg + val
+        bundle_avg_q[main_q_start + qi] = avg * inv_n
+
+    # NOTE: quaternion renormalization is NOT done here so that the warp tape
+    # backward sees a plain linear average (Jacobian = I/n).  A separate
+    # normalize_bundle_avg_quat kernel launched with record_tape=False
+    # restores unit-length after this kernel.
+
+    # Average joint_qd (spatial velocity — pure tangent vector, no sign issues).
+    for qdi in range(dof_count):
+        avg = float(0.0)
+        for s in range(num_bundle_samples):
+            bundle_slot = s * num_envs + tid
+            bundle_qd_start = bundle_slot * dof_count
+            avg = avg + bundle_joint_qd[bundle_qd_start + qdi]
+        bundle_avg_qd[main_qd_start + qdi] = avg * inv_n
+
+
+@wp.kernel
+def normalize_bundle_avg_quat(
+    # inputs
+    bundle_trigger: wp.array(dtype=int),
+    root_q_dim: int,
+    articulation_coord_start: wp.array(dtype=int),
+    # in-out
+    bundle_avg_q: wp.array(dtype=float),
+):
+    """Renormalize the free-joint quaternion in bundle_avg_q (off-tape).
+
+    Launched with record_tape=False immediately after average_bundle_into_buffer
+    so that the normalization does NOT appear in the warp autodiff graph.
+    This keeps the backward-pass Jacobian of the averaging step equal to I/n,
+    matching the soft-mode gradient exactly when num_bundle_samples==1 and
+    sigma==0, while still guaranteeing a unit-length quaternion in the forward
+    pass for all configurations.
+    """
+    tid = wp.tid()
+    if bundle_trigger[tid] == 0:
+        return
+    if root_q_dim != 7:
+        return
+    main_q_start = articulation_coord_start[tid]
+    qx = bundle_avg_q[main_q_start + 3]
+    qy = bundle_avg_q[main_q_start + 4]
+    qz = bundle_avg_q[main_q_start + 5]
+    qw = bundle_avg_q[main_q_start + 6]
+    quat_len = wp.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if quat_len > 0.0:
+        inv_len = 1.0 / quat_len
+        bundle_avg_q[main_q_start + 3] = qx * inv_len
+        bundle_avg_q[main_q_start + 4] = qy * inv_len
+        bundle_avg_q[main_q_start + 5] = qz * inv_len
+        bundle_avg_q[main_q_start + 6] = qw * inv_len
+
+
+@wp.kernel
+def init_bundle_state_with_perturbation(
+    # inputs
+    env_mask: wp.array(dtype=int),
+    num_envs: int,
+    articulation_coord_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    coord_count: int,
+    dof_count: int,
+    root_q_dim: int,
+    root_qd_dim: int,
+    joint_q_main: wp.array(dtype=float),
+    joint_qd_main: wp.array(dtype=float),
+    delta_q_buf: wp.array2d(dtype=float),
+    delta_qd_buf: wp.array2d(dtype=float),
+    # outputs
+    bundle_joint_q: wp.array(dtype=float),
+    bundle_joint_qd: wp.array(dtype=float),
+):
+    """Copy main joint state into bundle slots and add precomputed leg-DOF deltas.
+
+    Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id.
+    Thread tid is the flat bundle slot index. Skips envs whose env_mask entry is 0.
+    The delta buffers store deltas in DOF space, restricted to leg DOFs (i.e. their
+    width is dof_count - root_qd_dim). The first root_q_dim coords / root_qd_dim dofs
+    of each slot are copied verbatim from the main state (root joint is unperturbed).
+    """
+    tid = wp.tid()
+    env_id = tid % num_envs
+    sample_id = tid / num_envs
+
+    if env_mask[env_id] == 0:
+        return
+
+    main_q_start = articulation_coord_start[env_id]
+    main_qd_start = articulation_dof_start[env_id]
+    bundle_q_start = tid * coord_count
+    bundle_qd_start = tid * dof_count
+
+    # Root joint coords copied verbatim
+    for qi in range(root_q_dim):
+        bundle_joint_q[bundle_q_start + qi] = joint_q_main[main_q_start + qi]
+    # Leg coords get the delta added
+    leg_coord_count = coord_count - root_q_dim
+    for li in range(leg_coord_count):
+        bundle_joint_q[bundle_q_start + root_q_dim + li] = (
+            joint_q_main[main_q_start + root_q_dim + li] + delta_q_buf[tid, li]
+        )
+
+    # Root joint dofs copied verbatim
+    for qdi in range(root_qd_dim):
+        bundle_joint_qd[bundle_qd_start + qdi] = joint_qd_main[main_qd_start + qdi]
+    # Leg dofs get the delta added
+    leg_dof_count = dof_count - root_qd_dim
+    for li in range(leg_dof_count):
+        bundle_joint_qd[bundle_qd_start + root_qd_dim + li] = (
+            joint_qd_main[main_qd_start + root_qd_dim + li] + delta_qd_buf[tid, li]
+        )
+
+    # Suppress unused warning
+    _ = sample_id
+
+
+@wp.kernel
+def apply_perturbation_to_bundle_slots(
+    # inputs
+    apply_mask: wp.array(dtype=int),
+    num_envs: int,
+    coord_count: int,
+    dof_count: int,
+    root_q_dim: int,
+    root_qd_dim: int,
+    delta_q_buf: wp.array2d(dtype=float),
+    delta_qd_buf: wp.array2d(dtype=float),
+    # outputs
+    bundle_joint_q: wp.array(dtype=float),
+    bundle_joint_qd: wp.array(dtype=float),
+):
+    """In-place add the staged deltas to the current bundle joint state.
+
+    Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id.
+    Thread tid is the flat bundle slot index. Skips envs whose apply_mask entry is 0.
+    Used for mid-rollout re-perturbation when newly contacting feet appear during
+    the bundle horizon.
+    """
+    tid = wp.tid()
+    env_id = tid % num_envs
+
+    if apply_mask[env_id] == 0:
+        return
+
+    bundle_q_start = tid * coord_count
+    bundle_qd_start = tid * dof_count
+
+    leg_coord_count = coord_count - root_q_dim
+    for li in range(leg_coord_count):
+        bundle_joint_q[bundle_q_start + root_q_dim + li] = (
+            bundle_joint_q[bundle_q_start + root_q_dim + li] + delta_q_buf[tid, li]
+        )
+
+    leg_dof_count = dof_count - root_qd_dim
+    for li in range(leg_dof_count):
+        bundle_joint_qd[bundle_qd_start + root_qd_dim + li] = (
+            bundle_joint_qd[bundle_qd_start + root_qd_dim + li] + delta_qd_buf[tid, li]
+        )
+
+
+@wp.kernel
+def merge_state_transitions(
+    # inputs
+    current_substep: int,
+    bundle_active: wp.array(dtype=int),
+    pending_has_result: wp.array(dtype=int),
+    pending_target_substep: wp.array(dtype=int),
+    pending_bundle_q: wp.array(dtype=float),
+    pending_bundle_qd: wp.array(dtype=float),
+    articulation_coord_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    coord_count: int,
+    dof_count: int,
+    joint_q_in: wp.array(dtype=float),
+    joint_qd_in: wp.array(dtype=float),
+    joint_q_pred: wp.array(dtype=float),
+    joint_qd_pred: wp.array(dtype=float),
+    # outputs
+    joint_q_out: wp.array(dtype=float),
+    joint_qd_out: wp.array(dtype=float),
+):
+    """Per-env merge: sole writer of state_out.joint_q / joint_qd.
+
+    For each env the chosen transition is EXACTLY ONE of:
+
+      (W) WRITE PENDING BUNDLE RESULT — pending_has_result[e] == 1 and the
+          pending result's target substep matches current_substep. The target
+          substep is the outer substep whose state_out receives the averaged
+          bundle state. This is a single, temporally-correct future-state
+          write: state_out[e] ← averaged bundle end state at time
+          (trigger_substep + H) * dt.
+
+      (H) HOLD — bundle_active[e] > 0 but this is not the target substep yet.
+          The env is paused in its trigger-time state; we copy state_in to
+          state_out verbatim. This is NOT a fake time-progression: the stored
+          joint state remains the state at the trigger substep, and the clock
+          catches up with a single jump when the target substep arrives.
+          We cannot per-env-mask the upstream Phase A kernels cheaply, so the
+          Phase A outputs for held envs are computed but discarded here.
+
+      (N) NORMAL — env is not in a bundle window. Writes the normal pipeline
+          result (state_out_pred.joint_q / joint_qd).
+
+    Recorded on the tape; the gradient path reaches state_out via either
+    pending_bundle_q/qd (bundle branch) or joint_q_pred (normal branch).
+    """
+    tid = wp.tid()
+    q_start = articulation_coord_start[tid]
+    qd_start = articulation_dof_start[tid]
+
+    write_pending = (
+        pending_has_result[tid] == 1
+        and pending_target_substep[tid] == current_substep
+    )
+
+    if write_pending:
+        for qi in range(coord_count):
+            joint_q_out[q_start + qi] = pending_bundle_q[q_start + qi]
+        for qdi in range(dof_count):
+            joint_qd_out[qd_start + qdi] = pending_bundle_qd[qd_start + qdi]
+    elif bundle_active[tid] > 0:
+        for qi in range(coord_count):
+            joint_q_out[q_start + qi] = joint_q_in[q_start + qi]
+        for qdi in range(dof_count):
+            joint_qd_out[qd_start + qdi] = joint_qd_in[qd_start + qdi]
+    else:
+        for qi in range(coord_count):
+            joint_q_out[q_start + qi] = joint_q_pred[q_start + qi]
+        for qdi in range(dof_count):
+            joint_qd_out[qd_start + qdi] = joint_qd_pred[qd_start + qdi]
+
+
+@wp.kernel
+def update_bundle_bookkeeping(
+    # inputs
+    current_substep: int,
+    # outputs
+    bundle_active: wp.array(dtype=int),
+    pending_has_result: wp.array(dtype=int),
+    pending_target_substep: wp.array(dtype=int),
+):
+    """Post-merge bookkeeping update.
+
+    Must run AFTER the merge kernel and sees the same current_substep:
+
+      - If the pending result was just written this substep
+        (pending_has_result==1 and pending_target_substep==current_substep),
+        clear it and force bundle_active to 0 (the hold window has ended).
+
+      - Otherwise, if the env is inside a hold window (bundle_active > 0),
+        decrement — one outer substep of the hold window has elapsed.
+    """
+    tid = wp.tid()
+    if (
+        pending_has_result[tid] == 1
+        and pending_target_substep[tid] == current_substep
+    ):
+        pending_has_result[tid] = 0
+        pending_target_substep[tid] = 0
+        bundle_active[tid] = 0
+    elif bundle_active[tid] > 0:
+        bundle_active[tid] = bundle_active[tid] - 1
+
+
+@wp.kernel
+def stage_pending_bundle_trigger(
+    # inputs
+    bundle_trigger: wp.array(dtype=int),
+    current_substep: int,
+    effective_window: int,
+    # outputs
+    bundle_active: wp.array(dtype=int),
+    pending_has_result: wp.array(dtype=int),
+    pending_target_substep: wp.array(dtype=int),
+):
+    """Mark freshly triggered envs for the upcoming hold window.
+
+    Called once at trigger time (substep s), after the bundle rollout has
+    been run to completion and its averaged end state is in
+    pending_bundle_q/qd. For each env with bundle_trigger==1:
+
+        bundle_active[e]        = effective_window
+        pending_has_result[e]   = 1
+        pending_target_substep[e] = current_substep + effective_window - 1
+
+    Interpretation: the averaged bundle state corresponds to time
+    (s + effective_window) * dt, which is the state_out of outer substep
+    (s + effective_window - 1). That is the single target substep at which
+    the merge kernel will commit it.
+
+    ``bundle_active`` is counted including the trigger substep itself and
+    decrements once per outer substep in ``update_bundle_bookkeeping`` for
+    every non-target substep. On the target substep the bookkeeping kernel
+    zeroes it directly (rather than decrementing), so the hold window is
+    always positive throughout [s .. s + H - 1] and drops to 0 at the end.
+    This keeps ``detect_bundle_contacts`` (gated on ``bundle_active == 0``)
+    from re-triggering while a pending result is still in flight.
+
+    The effective_window == 1 case works naturally:
+        bundle_active          = 1
+        pending_target_substep = s   (merge commits this same substep; the
+                                      bookkeeping then zeroes bundle_active)
+    """
+    tid = wp.tid()
+    if bundle_trigger[tid] == 1:
+        bundle_active[tid] = effective_window
+        pending_has_result[tid] = 1
+        pending_target_substep[tid] = current_substep + effective_window - 1
+
+
+def _debug_absmax(tensor: torch.Tensor) -> float:
+    flat = tensor.detach().reshape(-1).float()
+    return float(flat.abs().max().item()) if flat.numel() else float("nan")
+
+
+def _debug_min(tensor: torch.Tensor) -> float:
+    flat = tensor.detach().reshape(-1).float()
+    return float(flat.min().item()) if flat.numel() else float("nan")
+
+
+def _debug_bad_count(*tensors: torch.Tensor) -> int:
+    bad = 0
+    for tensor in tensors:
+        flat = tensor.detach().reshape(-1).float()
+        bad += int((~torch.isfinite(flat)).sum().item())
+    return bad
+
+
+def _debug_head(tensor: torch.Tensor, count: int) -> str:
+    flat = tensor.detach().reshape(-1).float().cpu()
+    n = min(max(count, 0), flat.numel())
+    values = ", ".join(f"{flat[i].item():+.4e}" for i in range(n))
+    return f"[{values}]"
+
+
+def _print_bundle_inner_debug(
+    outer_call: int,
+    outer_substep: int,
+    total_substeps: int,
+    inner_step: int,
+    inner_total: int,
+    head_count: int,
+    joint_q_in: torch.Tensor,
+    joint_qd_in: torch.Tensor,
+    joint_q_out: torch.Tensor,
+    joint_qd_out: torch.Tensor,
+    foot_pos: torch.Tensor,
+    foot_vel: torch.Tensor,
+):
+    foot_height_min = _debug_min(foot_pos[..., 1]) if foot_pos.numel() else float("nan")
+    print(
+        f"[DBG][FWD][bundle][bundle_inner] call={outer_call} "
+        f"outer_ss={outer_substep + 1}/{total_substeps} inner={inner_step + 1}/{inner_total} "
+        f"q_in_absmax={_debug_absmax(joint_q_in):.4e} q_out_absmax={_debug_absmax(joint_q_out):.4e} "
+        f"qd_in_absmax={_debug_absmax(joint_qd_in):.4e} qd_out_absmax={_debug_absmax(joint_qd_out):.4e} "
+        f"foot_y_min={foot_height_min:.4e} foot_vel_absmax={_debug_absmax(foot_vel):.4e} "
+        f"bad_out={_debug_bad_count(joint_q_out, joint_qd_out, foot_pos, foot_vel)}"
+    )
+    print(
+        f"[DBG][FWDHEAD][bundle][bundle_inner] call={outer_call} "
+        f"outer_ss={outer_substep + 1}/{total_substeps} inner={inner_step + 1}/{inner_total} "
+        f"q_out[:{head_count}]={_debug_head(joint_q_out, head_count)} "
+        f"qd_out[:{head_count}]={_debug_head(joint_qd_out, head_count)}"
+    )
+
+
 ##########################
 
 ###  INTEGRATOR CLASS  ###
@@ -1769,7 +2337,396 @@ def get_foot_states(
 
 class MoreauIntegrator:
     def __init__(self):
-        pass
+        self._bundle_initialized = False
+        self.debug_print_bundle_inner = False
+        self.debug_current_outer_call = 0
+        self.debug_head_values = 6
+        # Dedicated CPU generator for bundle perturbation sampling.
+        # Using a separate generator (never the global RNG) ensures that bundle
+        # operations — which fire on every trigger even when sigma==0 — do NOT
+        # advance the global torch RNG, keeping soft-mode and bundle-mode
+        # training trajectories identical when sigma==0 / n_samples==1.
+        self._bundle_rng = torch.Generator(device="cpu")
+
+    def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps):
+        """Allocate persistent bundle state buffers owned by the integrator.
+
+        Called lazily on the first bundle-mode ``simulate()`` call. Allocates:
+
+          - ``self._bundle_states``: dict of State objects for the bundle rollout
+            (``in`` / ``mid`` / ``out_pred`` / ``out``). These correspond to
+            ``bundle_model`` which already holds ``num_envs * num_bundle_samples``
+            articulations — one slot per (main_env, sample).
+          - ``self._delta_q_buf`` / ``self._delta_qd_buf``: per-sample leg-DOF
+            delta staging buffers consumed by the perturbation kernels.
+          - ``self._pending_bundle_q`` / ``self._pending_bundle_qd``: per-main-env
+            pending averaged bundle end state. When an env triggers bundling at
+            outer substep ``s`` with effective horizon ``H``, the inner rollout
+            writes the averaged end state here; ``merge_state_transitions``
+            later commits it into ``state_out`` at outer substep ``s + H - 1``.
+          - ``self._pending_has_result``: 1 if a pending result is waiting.
+          - ``self._pending_target_substep``: outer substep at which the pending
+            result should be committed (= trigger_substep + H - 1).
+          - ``self._bundle_active``: per-env hold-window countdown. Set to
+            ``H - 1`` on trigger (remaining hold substeps AFTER the trigger
+            substep itself); decrements each subsequent outer substep.
+
+        Integrator-owned state: never passed through the ``simulate()`` API.
+        Callers that need to clear it at episode boundaries should call
+        :meth:`reset_bundle`.
+        """
+        device = model.device
+        num_envs = model.articulation_count
+        dof_per_env = int(model.joint_dof_count / num_envs)
+
+        # Cache root-joint dims so we can size the delta staging buffer.
+        if not hasattr(self, "_root_q_dim"):
+            jqs = wp.to_torch(model.joint_q_start)
+            jqds = wp.to_torch(model.joint_qd_start)
+            self._root_q_dim = int(jqs[1].item() - jqs[0].item())
+            self._root_qd_dim = int(jqds[1].item() - jqds[0].item())
+        leg_dof_count = max(dof_per_env - self._root_qd_dim, 1)
+
+        if (
+            self._bundle_initialized
+            and getattr(self, "_bundle_num_envs", -1) == num_envs
+            and getattr(self, "_bundle_num_samples", -1) == num_bundle_samples
+            and getattr(self, "_bundle_horizon_substeps", -1) == bundle_horizon_substeps
+        ):
+            return
+
+        # Mirror the stable non-bundle path: each inner substep gets its own
+        # state buffers instead of reusing a single mid/out scratch state.
+        self._bundle_state_traj = [
+            bundle_model.state(requires_grad=False)
+            for _ in range(bundle_horizon_substeps + 1)
+        ]
+        self._bundle_state_mid = [
+            bundle_model.state(requires_grad=False)
+            for _ in range(bundle_horizon_substeps)
+        ]
+        self._bundle_state_out_pred = [
+            bundle_model.state(requires_grad=False)
+            for _ in range(bundle_horizon_substeps)
+        ]
+
+        # The normal wrapper swaps in a fresh matrix set per substep. Do the
+        # same for bundle rollout steps so contact/Jacobian scratch does not
+        # alias across the inner horizon.
+        self._bundle_matrices = []
+        for _ in range(bundle_horizon_substeps):
+            bundle_model.alloc_mass_matrix()
+            self._bundle_matrices.append(
+                [
+                    bundle_model.M,
+                    bundle_model.J,
+                    bundle_model.P,
+                    bundle_model.H,
+                    bundle_model.L,
+                    bundle_model.Jc,
+                    bundle_model.G,
+                    bundle_model.G_mat,
+                ]
+            )
+
+        total_slots = num_envs * num_bundle_samples
+        self._delta_q_buf = wp.zeros(
+            (total_slots, leg_dof_count), dtype=float, device=device
+        )
+        self._delta_qd_buf = wp.zeros(
+            (total_slots, leg_dof_count), dtype=float, device=device
+        )
+
+        # Pending averaged bundle end state — per main-env layout.
+        self._pending_bundle_q = wp.zeros(
+            model.joint_coord_count, dtype=float, device=device, requires_grad=True
+        )
+        self._pending_bundle_qd = wp.zeros(
+            model.joint_dof_count, dtype=float, device=device, requires_grad=True
+        )
+
+        self._pending_has_result = wp.zeros(num_envs, dtype=int, device=device)
+        self._pending_target_substep = wp.zeros(num_envs, dtype=int, device=device)
+        self._bundle_active = wp.zeros(num_envs, dtype=int, device=device)
+
+        self._bundle_num_envs = num_envs
+        self._bundle_num_samples = num_bundle_samples
+        self._bundle_horizon_substeps = bundle_horizon_substeps
+        self._bundle_initialized = True
+
+    def reset_bundle(self):
+        """Clear all pending bundle bookkeeping (call at episode boundaries)."""
+        if not self._bundle_initialized:
+            return
+        self._pending_has_result.zero_()
+        self._pending_target_substep.zero_()
+        self._bundle_active.zero_()
+        self._pending_bundle_q.zero_()
+        self._pending_bundle_qd.zero_()
+
+    def _init_bundle_branches(
+        self,
+        model,
+        state_in,
+        bundle_model,
+        bundle_state_in,
+        should_bundle,
+        contact_feet_mask,
+        num_bundle_samples,
+        bundle_sigma_q,
+        bundle_sigma_qd,
+        delta_q_buf,
+        delta_qd_buf,
+        root_q_dim,
+        root_qd_dim,
+        requires_grad,
+        damping=1e-4,
+    ):
+        """Initialize bundle branch states with Jacobian-based perturbations.
+
+        Called every substep for every env with ``should_bundle[e] == 1`` (both
+        newly-triggered envs and envs continuing inside an active bundle window).
+        Computes per-sample, per-env joint-space deltas (in DOF space, restricted
+        to leg DOFs) from a damped pseudoinverse of the main model's contact
+        Jacobian — whose leg set was freshly re-detected this substep, so any
+        newly-contacting leg is automatically included — stages them into
+        ``delta_q_buf`` / ``delta_qd_buf`` (warp arrays the caller owns and never
+        tape-records), and launches a warp kernel that copies the main joint
+        state into the bundle slots and adds the leg-DOF deltas. No torch-side
+        mutation of the bundle state aliases occurs.
+
+        Sample 0 is perturbed identically to all other samples.
+        """
+        del bundle_model  # unused — main model's Jc is the source for init perturbations
+        device = model.device
+        torch_device = wp.device_to_torch(device)
+        num_envs = model.articulation_count
+        coord_per_env = int(model.joint_coord_count / num_envs)
+        dof_per_env = int(model.joint_dof_count / num_envs)
+        leg_dof_count = dof_per_env - root_qd_dim
+
+        with torch.no_grad():
+            should_t = wp.to_torch(should_bundle)
+            triggered_envs = torch.where(should_t > 0)[0]
+
+            # Always zero the staging buffers — old contents must not leak through.
+            delta_q_torch = wp.to_torch(delta_q_buf)
+            delta_qd_torch = wp.to_torch(delta_qd_buf)
+            delta_q_torch.zero_()
+            delta_qd_torch.zero_()
+
+            if len(triggered_envs) > 0:
+                feet_mask_t = wp.to_torch(contact_feet_mask)
+                Jc_flat = wp.to_torch(model.Jc)
+                Jc_start = wp.to_torch(model.articulation_Jc_start)
+
+                for env_idx in triggered_envs:
+                    e = int(env_idx.item())
+
+                    mask = int(feet_mask_t[e].item())
+                    active_feet = [f for f in range(4) if mask & (1 << f)]
+                    if len(active_feet) == 0:
+                        continue
+
+                    jc_offset = int(Jc_start[e].item())
+                    Jc_blocks = []
+                    for f in active_feet:
+                        start_idx = jc_offset + f * 3 * dof_per_env
+                        block = Jc_flat[start_idx:start_idx + 3 * dof_per_env].reshape(3, dof_per_env)
+                        Jc_blocks.append(block)
+                    Jc_active = torch.cat(Jc_blocks, dim=0)  # (3*Nf, dof_per_env)
+
+                    JJt_damped = (
+                        Jc_active @ Jc_active.T
+                        + damping * torch.eye(Jc_active.shape[0], device=torch_device, dtype=Jc_active.dtype)
+                    )
+                    task_dim = 3 * len(active_feet)
+
+                    for s in range(num_bundle_samples):
+                        # Bundle model uses samples-major layout: slot = s * num_envs + e
+                        bundle_idx = s * num_envs + e
+                        # Use the dedicated bundle RNG so the global torch RNG is
+                        # never advanced by bundle operations (keeps soft/bundle
+                        # mode identical when sigma==0).
+                        delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
+                            device=torch_device, dtype=Jc_active.dtype
+                        ) * bundle_sigma_q
+                        delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
+                            device=torch_device, dtype=Jc_active.dtype
+                        ) * bundle_sigma_qd
+
+                        alpha_q = torch.linalg.solve(JJt_damped, delta_x)
+                        delta_q = (Jc_active.T @ alpha_q).clamp(-0.1, 0.1)
+
+                        alpha_qd = torch.linalg.solve(JJt_damped, delta_v)
+                        delta_qd = (Jc_active.T @ alpha_qd).clamp(-0.5, 0.5)
+
+                        # Stage only the leg-DOF portion (root joint dofs are unperturbed)
+                        delta_q_torch[bundle_idx, :leg_dof_count] = delta_q[root_qd_dim:]
+                        delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd[root_qd_dim:]
+
+        # Launch warp kernel to copy main state into bundle slots and add the deltas.
+            wp.launch(
+                kernel=init_bundle_state_with_perturbation,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                should_bundle,
+                num_envs,
+                model.articulation_coord_start,
+                model.articulation_dof_start,
+                coord_per_env,
+                dof_per_env,
+                root_q_dim,
+                root_qd_dim,
+                state_in.joint_q,
+                state_in.joint_qd,
+                delta_q_buf,
+                delta_qd_buf,
+                ],
+                outputs=[bundle_state_in.joint_q, bundle_state_in.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+
+    def _detect_and_perturb_new_contacts(
+        self,
+        bundle_model,
+        bundle_state_out,
+        contact_feet_mask,
+        bundle_trigger,
+        num_bundle_samples,
+        main_model,
+        bundle_sigma_q,
+        bundle_sigma_qd,
+        delta_q_buf,
+        delta_qd_buf,
+        root_q_dim,
+        root_qd_dim,
+        requires_grad,
+        damping=1e-4,
+    ):
+        """Detect newly contacting feet mid-rollout and stage per-sample perturbations.
+
+        For each main env that has any newly contacting foot (foot in contact in
+        at least one sample but not previously in ``contact_feet_mask``), this
+        builds a per-sample damped-pseudoinverse mapping using THAT sample's own
+        Jacobian out of ``bundle_model.Jc`` (each sample has drifted to a different
+        state and so has a different Jc), stages the deltas into the warp delta
+        buffers, and launches a warp kernel that adds them in place to the bundle
+        joint state. Envs with no new contact are masked out via ``apply_mask``.
+        """
+        device = bundle_model.device
+        torch_device = wp.device_to_torch(device)
+        num_envs = main_model.articulation_count
+        coord_per_env = int(bundle_model.joint_coord_count / bundle_model.articulation_count)
+        dof_per_env = int(bundle_model.joint_dof_count / bundle_model.articulation_count)
+        leg_dof_count = dof_per_env - root_qd_dim
+
+        # 1) detect contacts in every bundle branch
+        branch_contact_mask = wp.zeros(bundle_model.articulation_count, dtype=int, device=device)
+        wp.launch(
+            kernel=detect_bundle_branch_contacts,
+            dim=bundle_model.articulation_count,
+            inputs=[bundle_state_out.point_vec, main_model.col_height],
+            outputs=[branch_contact_mask],
+            device=device,
+            record_tape=False,
+        )
+
+        # 2) decide per-env which need re-perturbation, and stage deltas per sample
+        apply_mask_host = torch.zeros(num_envs, dtype=torch.int32)
+        any_new = False
+
+        with torch.no_grad():
+            delta_q_torch = wp.to_torch(delta_q_buf)
+            delta_qd_torch = wp.to_torch(delta_qd_buf)
+            delta_q_torch.zero_()
+            delta_qd_torch.zero_()
+
+            trigger_t = wp.to_torch(bundle_trigger)
+            branch_mask_t = wp.to_torch(branch_contact_mask)
+            feet_mask_t = wp.to_torch(contact_feet_mask)
+            Jc_flat = wp.to_torch(bundle_model.Jc)
+            Jc_start = wp.to_torch(bundle_model.articulation_Jc_start)
+
+            for e in range(num_envs):
+                if int(trigger_t[e].item()) == 0:
+                    continue
+
+                # Union contact mask across this env's samples
+                # Bundle model uses samples-major layout: slot = s * num_envs + e
+                union_mask = 0
+                for s in range(num_bundle_samples):
+                    bundle_idx = s * num_envs + e
+                    union_mask |= int(branch_mask_t[bundle_idx].item())
+
+                prev_mask = int(feet_mask_t[e].item())
+                newly_contacting = union_mask & ~prev_mask
+                if newly_contacting == 0:
+                    continue
+
+                feet_mask_t[e] = prev_mask | newly_contacting
+                apply_mask_host[e] = 1
+                any_new = True
+
+                new_feet = [f for f in range(4) if newly_contacting & (1 << f)]
+                task_dim = 3 * len(new_feet)
+
+                # Per-sample Jacobian: each sample has its own Jc in bundle_model.Jc
+                # Bundle model uses samples-major layout: slot = s * num_envs + e
+                for s in range(num_bundle_samples):
+                    bundle_idx = s * num_envs + e
+                    jc_offset = int(Jc_start[bundle_idx].item())
+                    Jc_blocks = []
+                    for f in new_feet:
+                        start_idx = jc_offset + f * 3 * dof_per_env
+                        block = Jc_flat[start_idx:start_idx + 3 * dof_per_env].reshape(3, dof_per_env)
+                        Jc_blocks.append(block)
+                    Jc_active = torch.cat(Jc_blocks, dim=0)
+                    JJt_damped = (
+                        Jc_active @ Jc_active.T
+                        + damping * torch.eye(Jc_active.shape[0], device=torch_device, dtype=Jc_active.dtype)
+                    )
+
+                    # Use the dedicated bundle RNG (never the global torch RNG).
+                    delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
+                        device=torch_device, dtype=Jc_active.dtype
+                    ) * bundle_sigma_q
+                    delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
+                        device=torch_device, dtype=Jc_active.dtype
+                    ) * bundle_sigma_qd
+
+                    alpha_q = torch.linalg.solve(JJt_damped, delta_x)
+                    delta_q = (Jc_active.T @ alpha_q).clamp(-0.1, 0.1)
+
+                    alpha_qd = torch.linalg.solve(JJt_damped, delta_v)
+                    delta_qd = (Jc_active.T @ alpha_qd).clamp(-0.5, 0.5)
+
+                    delta_q_torch[bundle_idx, :leg_dof_count] = delta_q[root_qd_dim:]
+                    delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd[root_qd_dim:]
+
+        if not any_new:
+            return
+
+        # 3) upload apply_mask and launch the in-place perturbation kernel
+        apply_mask = wp.from_torch(apply_mask_host.to(torch_device))
+        wp.launch(
+            kernel=apply_perturbation_to_bundle_slots,
+            dim=bundle_model.articulation_count,
+            inputs=[
+                apply_mask,
+                num_envs,
+                coord_per_env,
+                dof_per_env,
+                root_q_dim,
+                root_qd_dim,
+                delta_q_buf,
+                delta_qd_buf,
+            ],
+            outputs=[bundle_state_out.joint_q, bundle_state_out.joint_qd],
+            device=device,
+            record_tape=requires_grad,
+        )
 
     def simulate(
         self,
@@ -1784,7 +2741,26 @@ class MoreauIntegrator:
         prox_iter,
         max_torque,
         mode,
+        # Bundle mode parameters
+        substep,
+        num_substeps=4,
+        bundle_model=None,
+        num_bundle_samples=8,
+        bundle_horizon_substeps=4,
+        bundle_sigma_q=0.01,
+        bundle_sigma_qd=0.01,
+        bundle_inner_mode=None,
     ):
+        if mode == "bundle":
+            return self._simulate_bundle(
+                model, state_in, state_out_pred, state_mid, state_out, dt,
+                requires_grad, update_mass_matrix, prox_iter, max_torque,
+                substep, num_substeps, bundle_model,
+                num_bundle_samples, bundle_horizon_substeps,
+                bundle_sigma_q, bundle_sigma_qd,
+                bundle_inner_mode,
+            )
+
         # integrate position with euler half a step
         # kernel 25 / 20
         wp.launch(
@@ -2041,6 +3017,678 @@ class MoreauIntegrator:
             inputs=[
                 model.rigid_contact_max,
                 model.articulation_count,
+                state_out.body_X_sc,
+                state_out.body_v_s,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+            ],
+            outputs=[state_out.point_vec, state_out.foot_vel],
+        )
+
+        return state_out
+
+    def _simulate_bundle(
+        self,
+        model,
+        state_in,
+        state_out_pred,
+        state_mid,
+        state_out,
+        dt,
+        requires_grad,
+        update_mass_matrix,
+        prox_iter,
+        max_torque,
+        substep,
+        num_substeps,
+        bundle_model,
+        num_bundle_samples,
+        bundle_horizon_substeps,
+        bundle_sigma_q,
+        bundle_sigma_qd,
+        bundle_inner_mode,
+    ):
+        """Bundle-mode simulate with horizon-end averaging and deferred commit.
+
+        Semantics (per the refactor spec):
+
+          * Each outer substep advances every env by exactly one dt.
+          * When an env triggers bundling at outer substep ``s`` with
+            effective horizon ``H = min(bundle_horizon_substeps,
+            num_substeps - s)``, this call spawns ``num_bundle_samples`` perturbed
+            branches around the env's CURRENT main joint state, rolls those
+            branches forward for ``H`` inner substeps using ``bundle_model``,
+            averages the branch end states ONCE at the end of the horizon, and
+            stores the averaged state into ``self._pending_bundle_q/qd``.
+          * The pending result is committed into ``state_out`` exactly once,
+            at outer substep ``s + H - 1``, by ``merge_state_transitions``.
+            That is the outer substep at which simulated time reaches
+            ``(s + H) * dt`` — the time the averaged bundle state corresponds
+            to. No earlier outer substep is written with the averaged state.
+          * During the intervening outer substeps ``s .. s + H - 2``, the env
+            is in HOLD: its ``joint_q/qd`` in ``state_out`` are copied verbatim
+            from ``state_in`` (paused at the trigger-time state). This is NOT
+            a fake time progression — the env is simply paused and catches up
+            in a single jump at the target substep.
+          * Non-bundled envs receive the normal pipeline's result (state_out_pred)
+            through the same merge kernel.
+          * New leg contacts that appear during the inner H-step rollout are
+            folded into the perturbation via per-sample Jacobian-space deltas
+            applied after each inner substep (see ``_detect_and_perturb_new_contacts``).
+
+        All bundle bookkeeping is integrator-owned (see ``_lazy_init_bundle``)
+        and is not threaded through the ``simulate()`` API. Call
+        ``reset_bundle()`` at episode boundaries.
+
+        The normal pipeline is still launched on the full batch (per-env
+        dispatch is not worth it for batched warp kernels); its final joint
+        state lands in ``state_out_pred`` and is discarded by the merge for
+        HOLD and WRITE-PENDING envs.
+        """
+        device = model.device
+        inner_mode = bundle_inner_mode or "soft"
+        num_envs = model.articulation_count
+        coord_per_env = int(model.joint_coord_count / num_envs)
+        dof_per_env = int(model.joint_dof_count / num_envs)
+
+        if getattr(self, "_merge_snapshot_num_substeps", -1) != num_substeps:
+            self._merge_snapshot_bundle_active = [
+                wp.zeros(num_envs, dtype=int, device=device)
+                for _ in range(num_substeps)
+            ]
+            self._merge_snapshot_pending_has_result = [
+                wp.zeros(num_envs, dtype=int, device=device)
+                for _ in range(num_substeps)
+            ]
+            self._merge_snapshot_pending_target_substep = [
+                wp.zeros(num_envs, dtype=int, device=device)
+                for _ in range(num_substeps)
+            ]
+            self._merge_snapshot_pending_bundle_q = [
+                wp.zeros(
+                    model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad
+                )
+                for _ in range(num_substeps)
+            ]
+            self._merge_snapshot_pending_bundle_qd = [
+                wp.zeros(
+                    model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad
+                )
+                for _ in range(num_substeps)
+            ]
+            self._merge_snapshot_num_substeps = num_substeps
+
+        # Lazily allocate integrator-owned bundle buffers. Also derives and
+        # caches root_q_dim / root_qd_dim from model metadata.
+        self._lazy_init_bundle(
+            model, bundle_model, num_bundle_samples, bundle_horizon_substeps
+        )
+        root_q_dim = self._root_q_dim
+        root_qd_dim = self._root_qd_dim
+
+        bundle_active = self._bundle_active
+        pending_has_result = self._pending_has_result
+        pending_target_substep = self._pending_target_substep
+        # ============================================================
+        # Phase A: NORMAL CANDIDATE
+        # Run the full Moreau pipeline. The final eval_rigid_integrate writes
+        # the resulting joint state into state_out_pred, NOT state_out.
+        # All other intermediate fields (joint_qdd, body_ft_s, joint_tau,
+        # tmp, etc.) live on state_out as scratch — that's fine, they're not
+        # gradient-relevant for the merge decision.
+        # ============================================================
+
+        # integrate position with euler half a step (kernel 25)
+        wp.launch(
+            kernel=integrate_q_halfstep,
+            dim=model.body_count,
+            inputs=[
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                state_in.joint_qd,
+                dt,
+            ],
+            outputs=[state_mid.joint_q],
+            device=device,
+        )
+
+        # evaluate mid body transforms (kernel 24)
+        wp.launch(
+            kernel=eval_rigid_fk,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_mid.joint_q,
+                model.joint_X_p,
+                model.joint_X_cm,
+                model.joint_axis,
+            ],
+            outputs=[state_mid.body_X_sc, state_mid.body_X_sm],
+            device=device,
+        )
+
+        # evaluate mid joint inertias, motion vectors, and forces (kernel 23)
+        wp.launch(
+            kernel=eval_rigid_id,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_mid.joint_q,
+                state_in.joint_qd,
+                model.joint_axis,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                model.body_I_m,
+                state_mid.body_X_sc,
+                state_mid.body_X_sm,
+                model.joint_X_p,
+                model.gravity,
+            ],
+            outputs=[
+                state_mid.joint_S_s,
+                state_mid.body_I_s,
+                state_mid.body_v_s,
+                state_mid.body_f_s,
+                state_mid.body_a_s,
+            ],
+            device=device,
+        )
+
+        # eval mass matrix
+        if update_mass_matrix:
+            self.eval_mass_matrix(model, state_mid)
+
+        # eval_tau (kernel 17)
+        wp.launch(
+            kernel=eval_rigid_tau,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_mid.joint_q,
+                state_in.joint_qd,
+                model.joint_act,
+                model.joint_target,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
+                model.joint_limit_lower,
+                model.joint_limit_upper,
+                model.joint_limit_ke,
+                model.joint_limit_kd,
+                max_torque,
+                model.joint_axis,
+                state_mid.joint_S_s,
+                state_mid.body_f_s,
+            ],
+            outputs=[state_mid.body_ft_s, state_mid.joint_tau],
+            device=device,
+        )
+
+        # eval Jc, G, and c
+        self.eval_contact_quantities(model, state_in, state_mid, dt)
+
+        # prox iteration — use inner_mode for the normal path too
+        self.eval_contact_forces(model, state_mid, dt, prox_iter, inner_mode)
+
+        # recompute tau with contact forces (kernel 5)
+        wp.launch(
+            kernel=eval_rigid_tau,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_mid.joint_q,
+                state_in.joint_qd,
+                model.joint_act,
+                model.joint_target,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                model.joint_static_friction,
+                model.joint_dynamic_friction,
+                model.joint_limit_lower,
+                model.joint_limit_upper,
+                model.joint_limit_ke,
+                model.joint_limit_kd,
+                max_torque,
+                model.joint_axis,
+                state_mid.joint_S_s,
+                state_mid.body_f_s,
+            ],
+            outputs=[state_out.body_ft_s, state_out.joint_tau],
+            device=device,
+        )
+
+        # solve for qdd (kernel 4)
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=num_envs,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_out.joint_tau,
+                state_out.tmp,
+            ],
+            outputs=[state_out.joint_qdd],
+            device=device,
+        )
+
+        # integrate (kernel 3) → state_out_pred.joint_q, joint_qd
+        # NOTE: result lands in state_out_pred (the NORMAL CANDIDATE buffer),
+        # not state_out — the per-env merge below decides which envs actually
+        # get this candidate as their final transition.
+        wp.launch(
+            kernel=eval_rigid_integrate,
+            dim=model.body_count,
+            inputs=[
+                model.joint_type,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_in.joint_q,
+                state_in.joint_qd,
+                state_out.joint_qdd,
+                dt,
+            ],
+            outputs=[state_out_pred.joint_q, state_out_pred.joint_qd],
+            device=device,
+        )
+
+        # ============================================================
+        # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
+        # detect_bundle_contacts unconditionally fills contact_feet_mask from
+        # the current point_vec (every env), but only sets bundle_trigger=1
+        # for envs with bundle_active==0 (envs inside an active hold window
+        # or with a pending result in flight are suppressed — their state
+        # will be committed when pending_target_substep is reached).
+        # ============================================================
+        bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
+        contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
+
+        wp.launch(
+            kernel=detect_bundle_contacts,
+            dim=num_envs,
+            inputs=[state_mid.point_vec, model.col_height, bundle_active],
+            outputs=[bundle_trigger, contact_feet_mask],
+            device=device,
+            record_tape=False,
+        )
+
+        # ============================================================
+        # Phase C: H-STEP INNER ROLLOUT FOR NEWLY TRIGGERED ENVS
+        # For each env with bundle_trigger==1:
+        #   1) Copy current actions into all bundle slots of that env
+        #      (actions are frozen for the entire inner horizon — user spec).
+        #   2) Initialise num_bundle_samples perturbed branches around the
+        #      current main joint state using the main model's Jc.
+        #   3) Step the bundle_model forward for ``effective_window`` inner
+        #      substeps, re-perturbing any newly-contacting feet mid-rollout.
+        #   4) Average the branch end states ONCE and store into
+        #      self._pending_bundle_q/qd.
+        #   5) Stage pending metadata: bundle_active = H-1,
+        #      pending_target_substep = current_substep + H - 1.
+        # Non-triggered envs leave all bundle buffers untouched.
+        # ============================================================
+        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
+        effective_window = max(min(bundle_horizon_substeps, num_substeps - substep), 1)
+        
+        if any_triggered:
+            # Fresh bundle states are required here. simulate() does not fully
+            # overwrite every scratch field on State, so reusing bundle mid/out
+            # buffers across triggers leaks stale contact scratch into later
+            # bundle solves.
+            bundle_traj = [
+                bundle_model.state(requires_grad=requires_grad)
+                for _ in range(effective_window + 1)
+            ]
+            bundle_mid = [
+                bundle_model.state(requires_grad=requires_grad)
+                for _ in range(effective_window)
+            ]
+            bundle_out_pred = [
+                bundle_model.state(requires_grad=requires_grad)
+                for _ in range(effective_window)
+            ]
+            bundle_joint_act = wp.zeros(
+                bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad
+            )
+            bundle_joint_target = wp.zeros(
+                bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad
+            )
+            bundle_matrices = []
+            for _ in range(effective_window):
+                bundle_model.alloc_mass_matrix()
+                bundle_matrices.append(
+                    [
+                        bundle_model.M,
+                        bundle_model.J,
+                        bundle_model.P,
+                        bundle_model.H,
+                        bundle_model.L,
+                        bundle_model.Jc,
+                        bundle_model.G,
+                        bundle_model.G_mat,
+                    ]
+                )
+
+            # 1) Freeze current-substep actions into all bundle slots of
+            #    newly-triggered envs. These remain fixed for the full
+            #    inner horizon.
+            bundle_model.joint_act = bundle_joint_act
+            bundle_model.joint_target = bundle_joint_target
+            wp.launch(
+                kernel=copy_joint_actions_to_bundle,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    bundle_trigger,
+                    num_envs,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
+                    model.joint_act,
+                    model.joint_target,
+                    dof_per_env,
+                    coord_per_env,
+                ],
+                outputs=[bundle_joint_act, bundle_joint_target],
+                device=device,
+                record_tape=requires_grad,
+            )
+
+            # 2) Initialise branches around the current main joint state.
+            #    Uses the main model's contact Jacobian — whose leg set
+            #    was freshly refreshed this substep — so newly contacting
+            #    legs at trigger time are included.
+            self._init_bundle_branches(
+                model, state_in, bundle_model, bundle_traj[0],
+                bundle_trigger, contact_feet_mask,
+                num_bundle_samples, bundle_sigma_q, bundle_sigma_qd,
+                self._delta_q_buf, self._delta_qd_buf,
+                root_q_dim, root_qd_dim, requires_grad,
+            )
+
+            # 3) H-step inner rollout. Each inner substep uses the non-bundle
+            #    branch of simulate(), then we re-detect newly contacting feet
+            #    in each sample and re-perturb the joint state in place using
+            #    that sample's own Jacobian (per-sample Jc).
+            for h in range(effective_window):
+                b_in = bundle_traj[h]
+                b_out = bundle_traj[h + 1]
+                b_mid = bundle_mid[h]
+                b_out_pred = bundle_out_pred[h]
+
+                (
+                    bundle_model.M,
+                    bundle_model.J,
+                    bundle_model.P,
+                    bundle_model.H,
+                    bundle_model.L,
+                    bundle_model.Jc,
+                    bundle_model.G,
+                    bundle_model.G_mat,
+                ) = bundle_matrices[h]
+
+                self.simulate(
+                    bundle_model, b_in, b_out_pred, b_mid, b_out,
+                    dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
+                    mode=inner_mode,
+                    substep=0, num_substeps=1,
+                )
+                if self.debug_print_bundle_inner:
+                    _print_bundle_inner_debug(
+                        self.debug_current_outer_call,
+                        substep,
+                        num_substeps,
+                        h,
+                        effective_window,
+                        self.debug_head_values,
+                        wp.to_torch(b_in.joint_q).clone(),
+                        wp.to_torch(b_in.joint_qd).clone(),
+                        wp.to_torch(b_out.joint_q).clone(),
+                        wp.to_torch(b_out.joint_qd).clone(),
+                        wp.to_torch(b_out.point_vec).view(num_envs, 4, 3).clone(),
+                        wp.to_torch(b_out.foot_vel).view(num_envs, 4, 3).clone(),
+                    )
+
+                if h < effective_window - 1:
+                    # Re-perturb any newly-contacting feet in place, then swap
+                    # (b_out becomes b_in for the next inner substep).
+                    self._detect_and_perturb_new_contacts(
+                        bundle_model, b_out, contact_feet_mask, bundle_trigger,
+                        num_bundle_samples, model,
+                        bundle_sigma_q, bundle_sigma_qd,
+                        self._delta_q_buf, self._delta_qd_buf,
+                        root_q_dim, root_qd_dim, requires_grad,
+                    )
+
+            bundle_end_state = bundle_traj[effective_window]
+
+            # 4) Average branch end states into the pending per-env buffers.
+            #    This is the single, horizon-end write: the averaged state
+            #    represents the env at simulated time (substep + H) * dt,
+            #    which is the state_out of outer substep (substep + H - 1).
+            target_substep = substep + effective_window - 1
+            pending_bundle_q_slot = self._merge_snapshot_pending_bundle_q[target_substep]
+            pending_bundle_qd_slot = self._merge_snapshot_pending_bundle_qd[target_substep]
+
+            wp.launch(
+                kernel=average_bundle_into_buffer,
+                dim=num_envs,
+                inputs=[
+                    bundle_trigger,
+                    num_bundle_samples,
+                    num_envs,
+                    bundle_end_state.joint_q,
+                    bundle_end_state.joint_qd,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
+                    coord_per_env,
+                    dof_per_env,
+                    root_q_dim,
+                ],
+                outputs=[pending_bundle_q_slot, pending_bundle_qd_slot],
+                device=device,
+            )
+            # Renormalize the averaged quaternion off-tape so the backward
+            # through averaging remains a plain I/n Jacobian (matching soft mode).
+            wp.launch(
+                kernel=normalize_bundle_avg_quat,
+                dim=num_envs,
+                inputs=[
+                    bundle_trigger,
+                    root_q_dim,
+                    model.articulation_coord_start,
+                ],
+                outputs=[pending_bundle_q_slot],
+                device=device,
+                record_tape=False,
+            )
+
+            # 5) Stage pending metadata for these envs.
+            wp.launch(
+                kernel=stage_pending_bundle_trigger,
+                dim=num_envs,
+                inputs=[bundle_trigger, substep, effective_window],
+                outputs=[bundle_active, pending_has_result, pending_target_substep],
+                device=device,
+                record_tape=False,
+            )
+
+        # ============================================================
+        # Phase D: PER-ENV MERGE INTO state_out.joint_q / joint_qd
+        # Three-way transition per env:
+        #   (W) WRITE PENDING — pending_has_result && pending_target==substep
+        #   (H) HOLD          — bundle_active > 0 (not target yet)
+        #   (N) NORMAL        — state_out_pred
+        # Recorded on the tape so gradients flow through pending_bundle_q/qd
+        # (bundle branch) or state_out_pred (normal branch).
+        # ============================================================
+        bundle_active_snapshot = self._merge_snapshot_bundle_active[substep]
+        pending_has_result_snapshot = self._merge_snapshot_pending_has_result[substep]
+        pending_target_substep_snapshot = self._merge_snapshot_pending_target_substep[substep]
+        pending_bundle_q_snapshot = self._merge_snapshot_pending_bundle_q[substep]
+        pending_bundle_qd_snapshot = self._merge_snapshot_pending_bundle_qd[substep]
+
+        wp.launch(
+            kernel=copy_int_array,
+            dim=num_envs,
+            inputs=[bundle_active],
+            outputs=[bundle_active_snapshot],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            kernel=copy_int_array,
+            dim=num_envs,
+            inputs=[pending_has_result],
+            outputs=[pending_has_result_snapshot],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            kernel=copy_int_array,
+            dim=num_envs,
+            inputs=[pending_target_substep],
+            outputs=[pending_target_substep_snapshot],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            kernel=merge_state_transitions,
+            dim=num_envs,
+            inputs=[
+                substep,
+                bundle_active_snapshot,
+                pending_has_result_snapshot,
+                pending_target_substep_snapshot,
+                pending_bundle_q_snapshot,
+                pending_bundle_qd_snapshot,
+                model.articulation_coord_start,
+                model.articulation_dof_start,
+                coord_per_env,
+                dof_per_env,
+                state_in.joint_q,
+                state_in.joint_qd,
+                state_out_pred.joint_q,
+                state_out_pred.joint_qd,
+            ],
+            outputs=[state_out.joint_q, state_out.joint_qd],
+            device=device,
+        )
+
+        # ============================================================
+        # Phase E: BOOKKEEPING UPDATE
+        # If pending was just committed this substep, clear pending and zero
+        # bundle_active. Otherwise, if we're inside a hold window, decrement
+        # bundle_active by one.
+        # ============================================================
+        wp.launch(
+            kernel=update_bundle_bookkeeping,
+            dim=num_envs,
+            inputs=[substep],
+            outputs=[bundle_active, pending_has_result, pending_target_substep],
+            device=device,
+            record_tape=False,
+        )
+
+        # ============================================================
+        # Phase F: Final FK/ID/foot states on merged state_out
+        # All other state_out fields (body transforms, body velocity, foot
+        # positions, etc.) are derived from the merged joint state.
+        # ============================================================
+        # eval_rigid_fk (kernel 2)
+        wp.launch(
+            kernel=eval_rigid_fk,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.joint_q,
+                model.joint_X_p,
+                model.joint_X_cm,
+                model.joint_axis,
+            ],
+            outputs=[state_out.body_X_sc, state_out.body_X_sm],
+            device=device,
+        )
+
+        # eval_rigid_id (kernel 1)
+        wp.launch(
+            kernel=eval_rigid_id,
+            dim=num_envs,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                state_out.joint_q,
+                state_out.joint_qd,
+                model.joint_axis,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                model.body_I_m,
+                state_out.body_X_sc,
+                state_out.body_X_sm,
+                model.joint_X_p,
+                model.gravity,
+            ],
+            outputs=[
+                state_out.joint_S_s,
+                state_out.body_I_s,
+                state_out.body_v_s,
+                state_out.body_f_s,
+                state_out.body_a_s,
+            ],
+            device=device,
+        )
+
+        # body position and velocity in inertial frame (kernel 0)
+        wp.launch(
+            kernel=inertial_body_pos_vel,
+            dim=num_envs,
+            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
+            outputs=[state_out.body_q, state_out.body_qd],
+        )
+
+        # copy relevant states (kernel -1)
+        wp.launch(
+            kernel=copy_relevant_states,
+            dim=num_envs,
+            inputs=[state_mid.percussion],
+            outputs=[state_out.percussion],
+        )
+
+        # get_foot_states (kernel -2)
+        wp.launch(
+            kernel=get_foot_states,
+            dim=num_envs,
+            inputs=[
+                model.rigid_contact_max,
+                num_envs,
                 state_out.body_X_sc,
                 state_out.body_v_s,
                 model.rigid_contact_body0,

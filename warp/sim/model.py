@@ -3889,6 +3889,121 @@ class ModelBuilder:
         for i in range(self.shape_count - 1):
             self.shape_collision_filter_pairs.add((i, ground_id))
 
+    def finalize_bundle(self, n_bundle_samples, device=None, requires_grad=False) -> Model:
+        """Finalize a bundle model containing ``n_bundle_samples`` copies of every
+        environment currently in this builder.
+
+        The returned :class:`Model` has ``self.num_envs * n_bundle_samples``
+        environments / articulations and is constructed in the same way as
+        :meth:`finalize`. This is intended for use with the bundle simulation
+        path in :class:`MoreauIntegrator`, which expects a ``bundle_model``
+        holding one slot per ``(main_env, sample)`` pair.
+
+        Args:
+            n_bundle_samples: Number of copies of the current builder state.
+            device: The simulation device to use, e.g.: 'cpu', 'cuda'.
+            requires_grad: Whether to enable gradient computation for the model.
+
+        Returns:
+            A finalized :class:`Model` with replicated environments.
+        """
+
+        bundle_builder = ModelBuilder(up_vector=self.up_vector, gravity=self.gravity)
+        bundle_builder.composite_rigid_body_alg = self.composite_rigid_body_alg
+        # Inherit ground plane parameters from the source builder
+        if hasattr(self, '_ground_params'):
+            bundle_builder._ground_params = copy.deepcopy(self._ground_params)
+
+        plain_attrs = [
+            # joints (no index offset needed)
+            "joint_X_p", "joint_X_c", "joint_q", "joint_qd", "joint_act",
+            "joint_type", "joint_enabled", "joint_armature",
+            "joint_axis", "joint_axis_dim", "joint_axis_mode", "joint_name",
+            "joint_limit_lower", "joint_limit_upper",
+            "joint_limit_ke", "joint_limit_kd",
+            "joint_target", "joint_target_ke", "joint_target_kd",
+            "joint_static_friction", "joint_dynamic_friction",
+            "joint_linear_compliance", "joint_angular_compliance",
+            # bodies
+            "body_q", "body_qd", "body_inertia", "body_mass",
+            "body_inv_inertia", "body_inv_mass", "body_com", "body_name",
+            # shapes
+            "shape_transform", "shape_geo_type", "shape_geo_scale", "shape_geo_src",
+            "shape_geo_is_solid", "shape_geo_thickness",
+            "shape_material_ke", "shape_material_kd", "shape_material_kf",
+            "shape_material_mu", "shape_material_restitution",
+            "shape_collision_radius", "shape_ground_collision",
+        ]
+
+        for _ in range(n_bundle_samples):
+            body_offset = bundle_builder.body_count
+            shape_offset = bundle_builder.shape_count
+            joint_offset = bundle_builder.joint_count
+            coord_offset = bundle_builder.joint_coord_count
+            dof_offset = bundle_builder.joint_dof_count
+            axis_offset = bundle_builder.joint_axis_total_count
+            group_offset = bundle_builder.last_collision_group + 1
+
+            # articulation boundaries
+            bundle_builder.articulation_start.extend(
+                [a + joint_offset for a in self.articulation_start]
+            )
+
+            # joint topology with offsets
+            bundle_builder.joint_parent.extend(
+                [p + body_offset if p != -1 else -1 for p in self.joint_parent]
+            )
+            bundle_builder.joint_child.extend(
+                [c + body_offset for c in self.joint_child]
+            )
+            bundle_builder.joint_q_start.extend(
+                [c + coord_offset for c in self.joint_q_start]
+            )
+            bundle_builder.joint_qd_start.extend(
+                [c + dof_offset for c in self.joint_qd_start]
+            )
+            bundle_builder.joint_axis_start.extend(
+                [a + axis_offset for a in self.joint_axis_start]
+            )
+
+            # shapes <-> bodies
+            bundle_builder.shape_body.extend(
+                [b + body_offset if b != -1 else -1 for b in self.shape_body]
+            )
+            for b, shapes in self.body_shapes.items():
+                bundle_builder.body_shapes[b + body_offset] = [
+                    s + shape_offset for s in shapes
+                ]
+
+            # collision groups (mirror add_builder's separate-group behavior)
+            bundle_builder.shape_collision_group.extend(
+                [g + group_offset if g > -1 else -1 for g in self.shape_collision_group]
+            )
+            for i, j in self.shape_collision_filter_pairs:
+                bundle_builder.shape_collision_filter_pairs.add(
+                    (i + shape_offset, j + shape_offset)
+                )
+            for group, shapes in self.shape_collision_group_map.items():
+                new_group = group + group_offset if group > -1 else -1
+                if new_group not in bundle_builder.shape_collision_group_map:
+                    bundle_builder.shape_collision_group_map[new_group] = []
+                bundle_builder.shape_collision_group_map[new_group].extend(
+                    [s + shape_offset for s in shapes]
+                )
+            bundle_builder.last_collision_group += (self.last_collision_group + 1)
+
+            # plain (deep-copied) extends
+            for attr in plain_attrs:
+                getattr(bundle_builder, attr).extend(copy.deepcopy(getattr(self, attr)))
+
+            # counters
+            bundle_builder.joint_dof_count += self.joint_dof_count
+            bundle_builder.joint_coord_count += self.joint_coord_count
+            bundle_builder.joint_axis_total_count += self.joint_axis_total_count
+            bundle_builder.num_envs += max(1, self.num_envs)
+
+        return bundle_builder.finalize(device=device, requires_grad=requires_grad)
+
     def finalize(self, device=None, requires_grad=False) -> Model:
         """Convert this builder object to a concrete model for simulation.
 
