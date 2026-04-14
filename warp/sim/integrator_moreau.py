@@ -1882,6 +1882,15 @@ def copy_joint_actions_to_bundle(
         joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
 
 
+@wp.func
+def quat_from_rotvec(rotvec: wp.vec3, eps: float):
+    angle = wp.length(rotvec)
+    if angle <= eps:
+        return wp.quat_identity()
+
+    return wp.quat_from_axis_angle(rotvec / angle, angle)
+
+
 @wp.kernel
 def average_bundle_into_buffer(
     # inputs
@@ -1906,15 +1915,10 @@ def average_bundle_into_buffer(
     the main joint_q / joint_qd.
 
     When root_q_dim == 7 (floating-base free joint), the quaternion at indices
-    [main_q_start+3 .. main_q_start+6] is averaged with double-cover sign
-    correction: each sample's quaternion is flipped if its dot product with
-    sample-0's quaternion is negative, so all samples lie in the same hemisphere
-    before averaging.  The normalization step is intentionally kept OFF the warp
-    tape (see the separate normalize_bundle_avg_quat kernel launched with
-    record_tape=False directly after this launch).  This ensures the backward pass
-    through the averaging is a plain 1/N scaling with no projection Jacobian,
-    which makes the bundle gradient match the soft-mode gradient exactly when
-    num_bundle_samples==1 and sigma==0.
+    [main_q_start+3 .. main_q_start+6] is averaged in the tangent space of
+    sample 0's quaternion. Each sample contributes the short-arc rotation vector
+    from the reference to that sample; the mean rotation vector is then mapped
+    back to quaternion space and composed with the reference quaternion.
 
     Non-triggered envs leave the buffer slot untouched.
     """
@@ -1927,46 +1931,54 @@ def average_bundle_into_buffer(
     main_qd_start = articulation_dof_start[tid]
     inv_n = 1.0 / float(num_bundle_samples)
 
-    # Read reference quaternion from sample 0 for sign-consistency check.
-    # Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id
-    # (tid here is env_id, running 0..num_envs-1).
-    ref_qx = float(0.0)
-    ref_qy = float(0.0)
-    ref_qz = float(0.0)
-    ref_qw = float(1.0)
     if root_q_dim == 7:
-        s0_q_start = (0 * num_envs + tid) * coord_count
-        ref_qx = bundle_joint_q[s0_q_start + 3]
-        ref_qy = bundle_joint_q[s0_q_start + 4]
-        ref_qz = bundle_joint_q[s0_q_start + 5]
-        ref_qw = bundle_joint_q[s0_q_start + 6]
+        # Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id
+        # (tid here is env_id, running 0..num_envs-1).
+        s0_q_start = tid * coord_count
+        q_ref = wp.normalize(
+            wp.quat(
+                bundle_joint_q[s0_q_start + 3],
+                bundle_joint_q[s0_q_start + 4],
+                bundle_joint_q[s0_q_start + 5],
+                bundle_joint_q[s0_q_start + 6],
+            )
+        )
+        q_ref_inv = wp.quat_inverse(q_ref)
+        rotvec_sum = wp.vec3(0.0, 0.0, 0.0)
 
-    # Average joint_q, with quaternion sign flip for the free joint.
+        for s in range(num_bundle_samples):
+            bundle_q_start = (s * num_envs + tid) * coord_count
+            q_sample = wp.normalize(
+                wp.quat(
+                    bundle_joint_q[bundle_q_start + 3],
+                    bundle_joint_q[bundle_q_start + 4],
+                    bundle_joint_q[bundle_q_start + 5],
+                    bundle_joint_q[bundle_q_start + 6],
+                )
+            )
+            q_rel = wp.mul(q_ref_inv, q_sample)
+            axis = wp.vec3()
+            angle = float(0.0)
+            wp.quat_to_axis_angle(q_rel, axis, angle)
+            rotvec_sum = rotvec_sum + axis * angle
+
+        q_avg = wp.mul(q_ref, quat_from_rotvec(rotvec_sum * inv_n, 1.0e-8))
+        bundle_avg_q[main_q_start + 3] = q_avg[0]
+        bundle_avg_q[main_q_start + 4] = q_avg[1]
+        bundle_avg_q[main_q_start + 5] = q_avg[2]
+        bundle_avg_q[main_q_start + 6] = q_avg[3]
+
+    # Average the non-quaternion coordinates linearly.
     for qi in range(coord_count):
+        if root_q_dim == 7 and qi >= 3 and qi < 7:
+            continue
+
         avg = float(0.0)
         for s in range(num_bundle_samples):
             bundle_slot = s * num_envs + tid
             bundle_q_start = bundle_slot * coord_count
-            val = bundle_joint_q[bundle_q_start + qi]
-            # For quaternion indices [3..6] of the free joint, flip sign if
-            # this sample is in the opposite hemisphere to sample 0.
-            if root_q_dim == 7 and qi >= 3 and qi < 7:
-                sq_start = bundle_slot * coord_count
-                dot = (
-                    bundle_joint_q[sq_start + 3] * ref_qx
-                    + bundle_joint_q[sq_start + 4] * ref_qy
-                    + bundle_joint_q[sq_start + 5] * ref_qz
-                    + bundle_joint_q[sq_start + 6] * ref_qw
-                )
-                if dot < 0.0:
-                    val = -val
-            avg = avg + val
+            avg = avg + bundle_joint_q[bundle_q_start + qi]
         bundle_avg_q[main_q_start + qi] = avg * inv_n
-
-    # NOTE: quaternion renormalization is NOT done here so that the warp tape
-    # backward sees a plain linear average (Jacobian = I/n).  A separate
-    # normalize_bundle_avg_quat kernel launched with record_tape=False
-    # restores unit-length after this kernel.
 
     # Average joint_qd (spatial velocity — pure tangent vector, no sign issues).
     for qdi in range(dof_count):
@@ -1976,43 +1988,6 @@ def average_bundle_into_buffer(
             bundle_qd_start = bundle_slot * dof_count
             avg = avg + bundle_joint_qd[bundle_qd_start + qdi]
         bundle_avg_qd[main_qd_start + qdi] = avg * inv_n
-
-
-@wp.kernel
-def normalize_bundle_avg_quat(
-    # inputs
-    bundle_trigger: wp.array(dtype=int),
-    root_q_dim: int,
-    articulation_coord_start: wp.array(dtype=int),
-    # in-out
-    bundle_avg_q: wp.array(dtype=float),
-):
-    """Renormalize the free-joint quaternion in bundle_avg_q (off-tape).
-
-    Launched with record_tape=False immediately after average_bundle_into_buffer
-    so that the normalization does NOT appear in the warp autodiff graph.
-    This keeps the backward-pass Jacobian of the averaging step equal to I/n,
-    matching the soft-mode gradient exactly when num_bundle_samples==1 and
-    sigma==0, while still guaranteeing a unit-length quaternion in the forward
-    pass for all configurations.
-    """
-    tid = wp.tid()
-    if bundle_trigger[tid] == 0:
-        return
-    if root_q_dim != 7:
-        return
-    main_q_start = articulation_coord_start[tid]
-    qx = bundle_avg_q[main_q_start + 3]
-    qy = bundle_avg_q[main_q_start + 4]
-    qz = bundle_avg_q[main_q_start + 5]
-    qw = bundle_avg_q[main_q_start + 6]
-    quat_len = wp.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-    if quat_len > 0.0:
-        inv_len = 1.0 / quat_len
-        bundle_avg_q[main_q_start + 3] = qx * inv_len
-        bundle_avg_q[main_q_start + 4] = qy * inv_len
-        bundle_avg_q[main_q_start + 5] = qz * inv_len
-        bundle_avg_q[main_q_start + 6] = qw * inv_len
 
 
 @wp.kernel
@@ -3508,20 +3483,6 @@ class MoreauIntegrator:
                 ],
                 outputs=[pending_bundle_q_slot, pending_bundle_qd_slot],
                 device=device,
-            )
-            # Renormalize the averaged quaternion off-tape so the backward
-            # through averaging remains a plain I/n Jacobian (matching soft mode).
-            wp.launch(
-                kernel=normalize_bundle_avg_quat,
-                dim=num_envs,
-                inputs=[
-                    bundle_trigger,
-                    root_q_dim,
-                    model.articulation_coord_start,
-                ],
-                outputs=[pending_bundle_q_slot],
-                device=device,
-                record_tape=False,
             )
 
             # 5) Stage pending metadata for these envs.
