@@ -12,6 +12,7 @@ models + state forward in time.
 
 import torch
 import warp as wp
+from .articulation import eval_articulation_fk
 from .model import ModelShapeGeometry, ModelShapeMaterials
 
 
@@ -2323,6 +2324,21 @@ class MoreauIntegrator:
         # training trajectories identical when sigma==0 / n_samples==1.
         self._bundle_rng = torch.Generator(device="cpu")
 
+        # Bundle perturbation settings for _init_bundle_branches.
+        #   perturbation_mode:
+        #     "jacobian"    — 1-step FD FK Jacobian pseudoinverse (default, fast, accurate)
+        #     "iterative"   — iterative IK on top of FD Jacobian (more accurate, ~n_iter × slower)
+        #     "joint_space" — sample delta_q directly in joint space (different semantics)
+        #   perturbation_n_iter  — max iterations for "iterative" mode
+        #   perturbation_tol     — early-exit residual tolerance for "iterative" mode
+        #   perturbation_clamp_q  — hard limit on |delta_q| per DOF [rad]; 0 = no clamp
+        #   perturbation_clamp_qd — hard limit on |delta_qd| per DOF [rad/s]; 0 = no clamp
+        self._bundle_perturbation_mode = "jacobian"
+        self._bundle_perturbation_n_iter = 5
+        self._bundle_perturbation_tol = 1e-5
+        self._bundle_perturbation_clamp_q = 0.1
+        self._bundle_perturbation_clamp_qd = 0.5
+
     def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps):
         """Allocate persistent bundle state buffers owned by the integrator.
 
@@ -2427,6 +2443,13 @@ class MoreauIntegrator:
         self._bundle_num_envs = num_envs
         self._bundle_num_samples = num_bundle_samples
         self._bundle_horizon_substeps = bundle_horizon_substeps
+
+        # Scratch buffers for iterative-IK FK evaluation during bundle perturbation.
+        # Sized to the MAIN model (not bundle_model) — FK is run on main-model kinematics.
+        self._fk_scratch_state = model.state(requires_grad=False)
+        self._fk_scratch_joint_q = wp.zeros(model.joint_coord_count, dtype=float, device=device)
+        self._fk_scratch_joint_qd = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+
         self._bundle_initialized = True
 
     def reset_bundle(self):
@@ -2439,6 +2462,149 @@ class MoreauIntegrator:
         self._pending_bundle_q.zero_()
         self._pending_bundle_qd.zero_()
 
+    def _run_fk_foot_pos(self, model):
+        """Evaluate FK using self._fk_scratch_joint_q/_qd; return foot positions.
+
+        The caller must write the desired joint configuration into
+        ``self._fk_scratch_joint_q`` (and optionally ``self._fk_scratch_joint_qd``)
+        before calling.  After the call the values remain in the scratch arrays.
+
+        Returns: torch.Tensor, shape ``(num_envs, 4, 3)`` on the model device.
+                 Detached — does NOT participate in any autograd tape.
+        """
+        state = self._fk_scratch_state
+        device = model.device
+        wp.launch(
+            kernel=eval_articulation_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                None,
+                self._fk_scratch_joint_q,
+                self._fk_scratch_joint_qd,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_axis_start,
+                model.joint_axis_dim,
+                model.body_com,
+            ],
+            outputs=[state.body_q, state.body_qd],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            kernel=get_foot_states,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_max,
+                model.articulation_count,
+                state.body_q,
+                state.body_qd,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+            ],
+            outputs=[state.point_vec, state.foot_vel],
+            device=device,
+            record_tape=False,
+        )
+        wp.synchronize_device()
+        return wp.to_torch(state.point_vec).reshape(model.articulation_count, 4, 3)
+
+    def _compute_fd_leg_jacobian(self, model, e, active_feet, main_foot_pos_e,
+                                  root_q_dim, coord_per_env, epsilon=1e-4):
+        """Finite-difference FK Jacobian for env e, active feet only.
+
+        Returns J_fd of shape (3*n_active_feet, leg_dof_count) mapping
+        leg-DOF perturbations to world-space foot-position changes.
+        Computed at the current _fk_scratch_joint_q configuration.
+        """
+        num_envs = model.articulation_count
+        leg_dof_count = coord_per_env - root_q_dim  # revolute: 1 coord = 1 DOF
+        n_task = 3 * len(active_feet)
+        torch_device = wp.device_to_torch(model.device)
+        e_coord_start = e * coord_per_env
+
+        fk_jq_t = wp.to_torch(self._fk_scratch_joint_q)
+        # Save the leg-joint slice of the current config (main state).
+        main_leg_q = fk_jq_t[e_coord_start + root_q_dim : e_coord_start + coord_per_env].clone()
+
+        J_fd = torch.zeros(n_task, leg_dof_count, dtype=torch.float32, device=torch_device)
+        for i in range(leg_dof_count):
+            # +epsilon
+            fk_jq_t[e_coord_start + root_q_dim + i] += epsilon
+            fp_plus = self._run_fk_foot_pos(model)
+            fp_plus_e = fp_plus[e, active_feet, :]
+
+            # -epsilon
+            fk_jq_t[e_coord_start + root_q_dim + i] -= 2.0 * epsilon
+            fp_minus = self._run_fk_foot_pos(model)
+            fp_minus_e = fp_minus[e, active_feet, :]
+
+            J_fd[:, i] = (fp_plus_e - fp_minus_e).reshape(-1) / (2.0 * epsilon)
+
+            # Restore
+            fk_jq_t[e_coord_start + root_q_dim + i] = main_leg_q[i]
+
+        return J_fd
+
+    def _compute_fd_leg_jacobians_batched(
+        self, model, triggered_env_ids, active_feet_per_env,
+        main_jq_snap, root_q_dim, coord_per_env, epsilon=1e-4
+    ):
+        """Compute FD FK Jacobians for all triggered envs in 2*leg_dof_count FK calls.
+
+        Instead of computing each env's Jacobian sequentially (2*leg_dof_count FK calls
+        per env), this perturbs DOF i for ALL triggered envs simultaneously, requiring
+        only 2*leg_dof_count FK evaluations total regardless of how many envs triggered.
+
+        Returns: dict[int, Tensor] mapping env_id -> J_fd of shape (3*n_active_feet, leg_dof_count)
+        """
+        leg_dof_count = coord_per_env - root_q_dim
+        torch_device = wp.device_to_torch(model.device)
+        num_envs = model.articulation_count
+
+        fk_jq_t = wp.to_torch(self._fk_scratch_joint_q)
+        e_tensor = torch.tensor(triggered_env_ids, device=torch_device, dtype=torch.long)
+        dof_base = e_tensor * coord_per_env + root_q_dim  # (n_triggered,)
+
+        # J_fd_full[env, foot*3+xyz, dof_i] for all 4 feet (active masking done below)
+        J_fd_full = torch.zeros(num_envs, 12, leg_dof_count, dtype=torch.float32, device=torch_device)
+
+        for i in range(leg_dof_count):
+            dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
+
+            # Perturb DOF i for ALL triggered envs simultaneously, then run FK once.
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+            # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
+            # the second FK call would overwrite fp_plus in-place without it.
+            fp_plus = self._run_fk_foot_pos(model).clone()  # (num_envs, 4, 3)
+
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+            fp_minus = self._run_fk_foot_pos(model)  # (num_envs, 4, 3)
+
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
+
+            J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, 12)
+
+        # Slice out only the active-feet rows for each env.
+        J_fd_dict = {}
+        for e in triggered_env_ids:
+            active_feet = active_feet_per_env.get(e, [])
+            if not active_feet:
+                continue
+            active_rows = [3 * f + xyz for f in active_feet for xyz in range(3)]
+            J_fd_dict[e] = J_fd_full[e][active_rows, :]  # (3*n_active_feet, leg_dof_count)
+
+        return J_fd_dict
+
     def _init_bundle_branches(
         self,
         model,
@@ -2448,8 +2614,8 @@ class MoreauIntegrator:
         should_bundle,
         contact_feet_mask,
         num_bundle_samples,
-        bundle_sigma_q,
-        bundle_sigma_qd,
+        bundle_sigma_pos,
+        bundle_sigma_vel,
         delta_q_buf,
         delta_qd_buf,
         root_q_dim,
@@ -2457,19 +2623,25 @@ class MoreauIntegrator:
         requires_grad,
         damping=1e-4,
     ):
-        """Initialize bundle branch states with Jacobian-based perturbations.
+        """Initialize bundle branch states with perturbations.
 
-        Called every substep for every env with ``should_bundle[e] == 1`` (both
-        newly-triggered envs and envs continuing inside an active bundle window).
-        Computes per-sample, per-env joint-space deltas (in DOF space, restricted
-        to leg DOFs) from a damped pseudoinverse of the main model's contact
-        Jacobian — whose leg set was freshly re-detected this substep, so any
-        newly-contacting leg is automatically included — stages them into
-        ``delta_q_buf`` / ``delta_qd_buf`` (warp arrays the caller owns and never
-        tape-records), and launches a warp kernel that copies the main joint
-        state into the bundle slots and adds the leg-DOF deltas. No torch-side
-        mutation of the bundle state aliases occurs.
+        Supports three modes (set via ``self._bundle_perturbation_mode``):
 
+        - ``"jacobian"``    — 1-step damped pseudoinverse of the contact Jacobian.
+                              Fast but inaccurate when the linear approximation breaks
+                              down (large sigma or near-singular configurations).
+        - ``"iterative"``   — Iterative IK refinement using the fixed main-state
+                              Jacobian.  Applies the initial delta_q, evaluates FK to
+                              measure the residual, and corrects with the same
+                              Jacobian until convergence or ``_bundle_perturbation_n_iter``
+                              iterations.  Significantly more accurate for large sigmas.
+        - ``"joint_space"`` — Samples delta_q directly in joint space; bypasses the
+                              task-space inversion entirely.  Always achieves the
+                              requested joint-space delta (no FK error), but the
+                              sigma parameters have joint-space (radian) semantics
+                              rather than Cartesian-space (metre) semantics.
+
+        Called every substep for every env with ``should_bundle[e] == 1``.
         Sample 0 is perturbed identically to all other samples.
         """
         del bundle_model  # unused — main model's Jc is the source for init perturbations
@@ -2479,6 +2651,16 @@ class MoreauIntegrator:
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
         leg_dof_count = dof_per_env - root_qd_dim
+
+        perturbation_mode = getattr(self, "_bundle_perturbation_mode", "jacobian")
+        n_iter = getattr(self, "_bundle_perturbation_n_iter", 5)
+        iter_tol = getattr(self, "_bundle_perturbation_tol", 1e-5)
+        clamp_q  = getattr(self, "_bundle_perturbation_clamp_q",  0.1)
+        clamp_qd = getattr(self, "_bundle_perturbation_clamp_qd", 0.5)
+        # Build clamp tuples; 0 means no clamping (use large sentinel value).
+        _INF = 1e9
+        dq_clamp  = (-clamp_q,  clamp_q)  if clamp_q  > 0 else (-_INF, _INF)
+        dqd_clamp = (-clamp_qd, clamp_qd) if clamp_qd > 0 else (-_INF, _INF)
 
         with torch.no_grad():
             should_t = wp.to_torch(should_bundle)
@@ -2492,71 +2674,161 @@ class MoreauIntegrator:
 
             if len(triggered_envs) > 0:
                 feet_mask_t = wp.to_torch(contact_feet_mask)
-                Jc_flat = wp.to_torch(model.Jc)
-                Jc_start = wp.to_torch(model.articulation_Jc_start)
 
-                for env_idx in triggered_envs:
-                    e = int(env_idx.item())
+                # Move to CPU once to avoid per-element D2H sync overhead from .item() calls.
+                triggered_list = triggered_envs.cpu().tolist()
+                feet_mask_list = feet_mask_t.cpu().tolist()
 
-                    mask = int(feet_mask_t[e].item())
-                    active_feet = [f for f in range(4) if mask & (1 << f)]
-                    if len(active_feet) == 0:
+                # Pre-collect active feet for all triggered envs (shared across all modes).
+                active_feet_per_env = {}
+                valid_triggered = []
+                for e in triggered_list:
+                    mask = int(feet_mask_list[e])
+                    af = [f for f in range(4) if mask & (1 << f)]
+                    if af:
+                        active_feet_per_env[e] = af
+                        valid_triggered.append(e)
+
+                if perturbation_mode in ("jacobian", "iterative"):
+                    # Pre-compute main foot positions for all envs once.
+                    # Used by both FD Jacobian computation and iterative IK.
+                    fk_jq = wp.to_torch(self._fk_scratch_joint_q)
+                    fk_jqd = wp.to_torch(self._fk_scratch_joint_qd)
+                    fk_jq.copy_(wp.to_torch(state_in.joint_q))
+                    fk_jqd.zero_()
+                    main_foot_pos_all = self._run_fk_foot_pos(model).clone()  # (num_envs, 4, 3)
+                    # Keep a snapshot for restore during FD and iterative IK.
+                    main_jq_snap = fk_jq.clone()
+
+                    # Single batched FD Jacobian call: 2*leg_dof_count FK evaluations total
+                    # regardless of how many envs triggered (vs. 2*leg_dof_count per env before).
+                    J_fd_dict = {}
+                    if valid_triggered:
+                        J_fd_dict = self._compute_fd_leg_jacobians_batched(
+                            model, valid_triggered, active_feet_per_env,
+                            main_jq_snap, root_q_dim, coord_per_env,
+                        )
+                        # fk_jq is fully restored to main_jq_snap inside the helper.
+
+                for e in triggered_list:
+                    active_feet = active_feet_per_env.get(e)
+                    if active_feet is None:
                         continue
 
-                    jc_offset = int(Jc_start[e].item())
-                    Jc_blocks = []
-                    for f in active_feet:
-                        start_idx = jc_offset + f * 3 * dof_per_env
-                        block = Jc_flat[start_idx:start_idx + 3 * dof_per_env].reshape(3, dof_per_env)
-                        Jc_blocks.append(block)
-                    Jc_active = torch.cat(Jc_blocks, dim=0)  # (3*Nf, dof_per_env)
-
-                    JJt_damped = (
-                        Jc_active @ Jc_active.T
-                        + damping * torch.eye(Jc_active.shape[0], device=torch_device, dtype=Jc_active.dtype)
-                    )
                     task_dim = 3 * len(active_feet)
 
-                    for s in range(num_bundle_samples):
-                        # Bundle model uses samples-major layout: slot = s * num_envs + e
-                        bundle_idx = s * num_envs + e
-                        # Use the dedicated bundle RNG so the global torch RNG is
-                        # never advanced by bundle operations (keeps soft/bundle
-                        # mode identical when sigma==0).
-                        delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
-                            device=torch_device, dtype=Jc_active.dtype
-                        ) * bundle_sigma_q
-                        delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
-                            device=torch_device, dtype=Jc_active.dtype
-                        ) * bundle_sigma_qd
+                    # ------------------------------------------------------------------
+                    # joint_space mode: bypass task-space inversion entirely.
+                    # Samples delta_q / delta_qd directly from N(0, sigma) in joint space.
+                    # sigma parameters have joint-space (radian / rad·s⁻¹) semantics here.
+                    # ------------------------------------------------------------------
+                    if perturbation_mode == "joint_space":
+                        for s in range(num_bundle_samples):
+                            bundle_idx = s * num_envs + e
+                            # Consume same number of RNG draws as Jacobian-based methods
+                            # (task_dim per delta_x and delta_v) but map them to leg DOFs.
+                            # We draw task_dim values and project to leg_dof_count via randn;
+                            # for simplicity we draw leg_dof_count directly.
+                            delta_q = torch.randn(leg_dof_count, generator=self._bundle_rng).to(
+                                device=torch_device, dtype=torch.float32
+                            ) * bundle_sigma_pos
+                            delta_qd = torch.randn(leg_dof_count, generator=self._bundle_rng).to(
+                                device=torch_device, dtype=torch.float32
+                            ) * bundle_sigma_vel
+                            delta_q_torch[bundle_idx, :leg_dof_count] = delta_q.clamp(*dq_clamp)
+                            delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd.clamp(*dqd_clamp)
+                        continue
 
-                        alpha_q = torch.linalg.solve(JJt_damped, delta_x)
-                        delta_q = (Jc_active.T @ alpha_q).clamp(-0.1, 0.1)
+                    # ------------------------------------------------------------------
+                    # jacobian / iterative modes: use pre-computed batched FD Jacobian.
+                    #
+                    # The Warp contact Jacobian (model.Jc) is computed at state_mid
+                    # and uses a different sign convention than eval_articulation_fk.
+                    # Instead we build J_fd — the true linearisation of FK at state_in —
+                    # by central finite differences over the leg DOFs.
+                    # ------------------------------------------------------------------
+                    J_fd = J_fd_dict.get(e)
+                    if J_fd is None:
+                        continue
 
-                        alpha_qd = torch.linalg.solve(JJt_damped, delta_v)
-                        delta_qd = (Jc_active.T @ alpha_qd).clamp(-0.5, 0.5)
+                    main_foot_pos_e = main_foot_pos_all[e, active_feet, :]  # (n_active, 3)
+                    e_coord_start = e * coord_per_env
+                    e_leg_slice = slice(e_coord_start + root_q_dim, e_coord_start + coord_per_env)
 
-                        # Stage only the leg-DOF portion (root joint dofs are unperturbed)
-                        delta_q_torch[bundle_idx, :leg_dof_count] = delta_q[root_qd_dim:]
-                        delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd[root_qd_dim:]
+                    JJt_fd = (
+                        J_fd @ J_fd.T
+                        + damping * torch.eye(task_dim, device=torch_device, dtype=J_fd.dtype)
+                    )
+
+                    if perturbation_mode == "iterative":
+                        # Iterative mode requires per-sample FK calls; keep sequential loop.
+                        for s in range(num_bundle_samples):
+                            bundle_idx = s * num_envs + e
+                            delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
+                                device=torch_device, dtype=J_fd.dtype
+                            ) * bundle_sigma_pos
+                            delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
+                                device=torch_device, dtype=J_fd.dtype
+                            ) * bundle_sigma_vel
+
+                            alpha_q = torch.linalg.solve(JJt_fd, delta_x)
+                            delta_q_iter = (J_fd.T @ alpha_q).clamp(*dq_clamp)
+
+                            for _ in range(n_iter):
+                                fk_jq[e_coord_start : e_coord_start + coord_per_env].copy_(
+                                    main_jq_snap[e_coord_start : e_coord_start + coord_per_env]
+                                )
+                                fk_jq[e_leg_slice] += delta_q_iter
+                                trial_foot_pos = self._run_fk_foot_pos(model)
+                                trial_foot_pos_e = trial_foot_pos[e, active_feet, :]
+                                actual_delta_x = (trial_foot_pos_e - main_foot_pos_e).reshape(-1)
+                                residual = delta_x - actual_delta_x
+                                if residual.abs().max().item() < iter_tol:
+                                    break
+                                alpha_corr = torch.linalg.solve(JJt_fd, residual)
+                                correction = J_fd.T @ alpha_corr
+                                delta_q_iter = (delta_q_iter + 0.5 * correction).clamp(*dq_clamp)
+
+                            alpha_qd = torch.linalg.solve(JJt_fd, delta_v)
+                            delta_q_torch[bundle_idx, :leg_dof_count] = delta_q_iter
+                            delta_qd_torch[bundle_idx, :leg_dof_count] = (J_fd.T @ alpha_qd).clamp(*dqd_clamp)
+                    else:
+                        # jacobian mode: batch all num_bundle_samples solves into one call.
+                        # Generate all random samples on CPU (preserves _bundle_rng sequence),
+                        # transfer to GPU in two H2D copies, then solve all at once.
+                        dx_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_pos
+                        dv_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_vel
+                        dx_gpu = dx_cpu.to(device=torch_device, dtype=J_fd.dtype)  # (task_dim, S)
+                        dv_gpu = dv_cpu.to(device=torch_device, dtype=J_fd.dtype)  # (task_dim, S)
+
+                        # Solve all S right-hand sides at once: JJt_fd @ alpha = delta.
+                        alpha_q = torch.linalg.solve(JJt_fd, dx_gpu)  # (task_dim, S)
+                        alpha_qd = torch.linalg.solve(JJt_fd, dv_gpu)  # (task_dim, S)
+                        delta_q_all = (J_fd.T @ alpha_q).clamp(*dq_clamp)   # (leg_dof_count, S)
+                        delta_qd_all = (J_fd.T @ alpha_qd).clamp(*dqd_clamp) # (leg_dof_count, S)
+
+                        # Scatter into the staging buffers.
+                        bundle_indices = torch.arange(num_bundle_samples, device=torch_device) * num_envs + e
+                        delta_q_torch[bundle_indices, :leg_dof_count] = delta_q_all.T
+                        delta_qd_torch[bundle_indices, :leg_dof_count] = delta_qd_all.T
 
         # Launch warp kernel to copy main state into bundle slots and add the deltas.
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
                 dim=num_envs * num_bundle_samples,
                 inputs=[
-                should_bundle,
-                num_envs,
-                model.articulation_coord_start,
-                model.articulation_dof_start,
-                coord_per_env,
-                dof_per_env,
-                root_q_dim,
-                root_qd_dim,
-                state_in.joint_q,
-                state_in.joint_qd,
-                delta_q_buf,
-                delta_qd_buf,
+                    should_bundle,
+                    num_envs,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
+                    coord_per_env,
+                    dof_per_env,
+                    root_q_dim,
+                    root_qd_dim,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    delta_q_buf,
+                    delta_qd_buf,
                 ],
                 outputs=[bundle_state_in.joint_q, bundle_state_in.joint_qd],
                 device=device,
@@ -2571,8 +2843,8 @@ class MoreauIntegrator:
         bundle_trigger,
         num_bundle_samples,
         main_model,
-        bundle_sigma_q,
-        bundle_sigma_qd,
+        bundle_sigma_pos,
+        bundle_sigma_vel,
         delta_q_buf,
         delta_qd_buf,
         root_q_dim,
@@ -2596,6 +2868,11 @@ class MoreauIntegrator:
         coord_per_env = int(bundle_model.joint_coord_count / bundle_model.articulation_count)
         dof_per_env = int(bundle_model.joint_dof_count / bundle_model.articulation_count)
         leg_dof_count = dof_per_env - root_qd_dim
+        clamp_q  = getattr(self, "_bundle_perturbation_clamp_q",  0.1)
+        clamp_qd = getattr(self, "_bundle_perturbation_clamp_qd", 0.5)
+        _INF = 1e9
+        dq_clamp  = (-clamp_q,  clamp_q)  if clamp_q  > 0 else (-_INF, _INF)
+        dqd_clamp = (-clamp_qd, clamp_qd) if clamp_qd > 0 else (-_INF, _INF)
 
         # 1) detect contacts in every bundle branch
         branch_contact_mask = wp.zeros(bundle_model.articulation_count, dtype=int, device=device)
@@ -2666,16 +2943,16 @@ class MoreauIntegrator:
                     # Use the dedicated bundle RNG (never the global torch RNG).
                     delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
                         device=torch_device, dtype=Jc_active.dtype
-                    ) * bundle_sigma_q
+                    ) * bundle_sigma_pos
                     delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
                         device=torch_device, dtype=Jc_active.dtype
-                    ) * bundle_sigma_qd
+                    ) * bundle_sigma_vel
 
                     alpha_q = torch.linalg.solve(JJt_damped, delta_x)
-                    delta_q = (Jc_active.T @ alpha_q).clamp(-0.1, 0.1)
+                    delta_q = (Jc_active.T @ alpha_q).clamp(*dq_clamp)
 
                     alpha_qd = torch.linalg.solve(JJt_damped, delta_v)
-                    delta_qd = (Jc_active.T @ alpha_qd).clamp(-0.5, 0.5)
+                    delta_qd = (Jc_active.T @ alpha_qd).clamp(*dqd_clamp)
 
                     delta_q_torch[bundle_idx, :leg_dof_count] = delta_q[root_qd_dim:]
                     delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd[root_qd_dim:]
@@ -2722,8 +2999,8 @@ class MoreauIntegrator:
         bundle_model=None,
         num_bundle_samples=8,
         bundle_horizon_substeps=4,
-        bundle_sigma_q=0.01,
-        bundle_sigma_qd=0.01,
+        bundle_sigma_pos=0.01,
+        bundle_sigma_vel=0.01,
         bundle_inner_mode=None,
     ):
         if mode == "bundle":
@@ -2732,7 +3009,7 @@ class MoreauIntegrator:
                 requires_grad, update_mass_matrix, prox_iter, max_torque,
                 substep, num_substeps, bundle_model,
                 num_bundle_samples, bundle_horizon_substeps,
-                bundle_sigma_q, bundle_sigma_qd,
+                bundle_sigma_pos, bundle_sigma_vel,
                 bundle_inner_mode,
             )
 
@@ -3021,8 +3298,8 @@ class MoreauIntegrator:
         bundle_model,
         num_bundle_samples,
         bundle_horizon_substeps,
-        bundle_sigma_q,
-        bundle_sigma_qd,
+        bundle_sigma_pos,
+        bundle_sigma_vel,
         bundle_inner_mode,
     ):
         """Bundle-mode simulate with horizon-end averaging and deferred commit.
@@ -3397,7 +3674,7 @@ class MoreauIntegrator:
             self._init_bundle_branches(
                 model, state_in, bundle_model, bundle_traj[0],
                 bundle_trigger, contact_feet_mask,
-                num_bundle_samples, bundle_sigma_q, bundle_sigma_qd,
+                num_bundle_samples, bundle_sigma_pos, bundle_sigma_vel,
                 self._delta_q_buf, self._delta_qd_buf,
                 root_q_dim, root_qd_dim, requires_grad,
             )
@@ -3451,7 +3728,7 @@ class MoreauIntegrator:
                     self._detect_and_perturb_new_contacts(
                         bundle_model, b_out, contact_feet_mask, bundle_trigger,
                         num_bundle_samples, model,
-                        bundle_sigma_q, bundle_sigma_qd,
+                        bundle_sigma_pos, bundle_sigma_vel,
                         self._delta_q_buf, self._delta_qd_buf,
                         root_q_dim, root_qd_dim, requires_grad,
                     )
