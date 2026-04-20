@@ -23,6 +23,15 @@ def offset_sigmoid(x: float, scale: float, offset: float):
     )  # clamp for stability (exp gradients) unstable from around 85
 
 
+@wp.func
+def safe_mat33_inverse(m: wp.mat33) -> wp.mat33:
+    """Return inv(m) if non-singular, else zero matrix. Prevents NaN for airborne contact slots."""
+    det = wp.determinant(m)
+    if wp.abs(det) > float(1e-10):
+        return wp.inverse(m)
+    return wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
 # # Frank & Park definition 3.20, pg 100
 @wp.func
 def spatial_transform_twist(t: wp.transform, x: wp.spatial_vector):
@@ -1023,13 +1032,39 @@ def construct_contact_jacobian(
     contact_shape: wp.array(dtype=int),
     geo: ModelShapeGeometry,
     col_height: float,
+    contact_body_offsets: wp.array(dtype=int),
+    bodies_per_env: int,
+    contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
 
+    # Pre-initialize all 8 foot slots above ground so unused slots are never
+    # mistaken for in-contact feet.
+    above_ground = wp.vec3(0.0, 1.0, 0.0)
+    point_vec[tid * 8 + 0] = above_ground
+    point_vec[tid * 8 + 1] = above_ground
+    point_vec[tid * 8 + 2] = above_ground
+    point_vec[tid * 8 + 3] = above_ground
+    point_vec[tid * 8 + 4] = above_ground
+    point_vec[tid * 8 + 5] = above_ground
+    point_vec[tid * 8 + 6] = above_ground
+    point_vec[tid * 8 + 7] = above_ground
+
     contacts_per_articulation = rigid_contact_max / articulation_count
+
+    # Track the deepest (minimum world-Y) below-ground contact per slot.
+    best_y_0 = float(col_height)
+    best_y_1 = float(col_height)
+    best_y_2 = float(col_height)
+    best_y_3 = float(col_height)
+    best_y_4 = float(col_height)
+    best_y_5 = float(col_height)
+    best_y_6 = float(col_height)
+    best_y_7 = float(col_height)
 
     for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
         contact_id = tid * contacts_per_articulation + i
@@ -1038,33 +1073,117 @@ def construct_contact_jacobian(
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
 
-        if (c_body - tid) % 3 == 0 and i % 2 == 0:  # only consider foot contacts
-            foot_id = (c_body - tid - tid * 12) / 3 - 1
+        body_offset = c_body - tid * bodies_per_env
+
+        # Determine which of the 8 contact slots this sphere belongs to.
+        # contact_local_x_sign and contact_local_y_sign together identify the
+        # quadrant of the local contact point: 0 means no filtering on that axis
+        # (ANYmal where each foot is a separate body), +1 means positive side,
+        # -1 means negative side.
+        foot_id = int(-1)
+        if body_offset == contact_body_offsets[0]:
+            xs = contact_local_x_sign[0]
+            ys = contact_local_y_sign[0]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(0)
+        if body_offset == contact_body_offsets[1]:
+            xs = contact_local_x_sign[1]
+            ys = contact_local_y_sign[1]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(1)
+        if body_offset == contact_body_offsets[2]:
+            xs = contact_local_x_sign[2]
+            ys = contact_local_y_sign[2]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(2)
+        if body_offset == contact_body_offsets[3]:
+            xs = contact_local_x_sign[3]
+            ys = contact_local_y_sign[3]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(3)
+        if body_offset == contact_body_offsets[4]:
+            xs = contact_local_x_sign[4]
+            ys = contact_local_y_sign[4]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(4)
+        if body_offset == contact_body_offsets[5]:
+            xs = contact_local_x_sign[5]
+            ys = contact_local_y_sign[5]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(5)
+        if body_offset == contact_body_offsets[6]:
+            xs = contact_local_x_sign[6]
+            ys = contact_local_y_sign[6]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(6)
+        if body_offset == contact_body_offsets[7]:
+            xs = contact_local_x_sign[7]
+            ys = contact_local_y_sign[7]
+            x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+            y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(7)
+
+        if foot_id >= 0:
             X_s = body_X_sc[c_body]
             n = wp.vec3(0.0, 1.0, 0.0)
-            # transform point to world space
-            p = (
-                wp.transform_point(X_s, c_point) - n * c_dist
-            )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
-            p_skew = wp.skew(wp.vec3(p[0], p[1], p[2]))
-            # check ground contact
+            p = wp.transform_point(X_s, c_point) - n * c_dist
             c = wp.dot(n, p)
 
-            if c <= col_height:
-                # Jc = J_p - skew(p)*J_r
-                for j in range(0, 3):  # iterate all contact dofs
-                    for k in range(0, dof_count):  # iterate all joint dofs
+            # Keep only the deepest (lowest world-Y) contact per slot.
+            is_best = bool(False)
+            if foot_id == 0 and c < best_y_0:
+                best_y_0 = c
+                is_best = bool(True)
+            if foot_id == 1 and c < best_y_1:
+                best_y_1 = c
+                is_best = bool(True)
+            if foot_id == 2 and c < best_y_2:
+                best_y_2 = c
+                is_best = bool(True)
+            if foot_id == 3 and c < best_y_3:
+                best_y_3 = c
+                is_best = bool(True)
+            if foot_id == 4 and c < best_y_4:
+                best_y_4 = c
+                is_best = bool(True)
+            if foot_id == 5 and c < best_y_5:
+                best_y_5 = c
+                is_best = bool(True)
+            if foot_id == 6 and c < best_y_6:
+                best_y_6 = c
+                is_best = bool(True)
+            if foot_id == 7 and c < best_y_7:
+                best_y_7 = c
+                is_best = bool(True)
+
+            if is_best:
+                p_skew = wp.skew(wp.vec3(p[0], p[1], p[2]))
+                for j in range(0, 3):
+                    for k in range(0, dof_count):
                         Jc[dense_J_index(Jc_start, 3, dof_count, tid, foot_id, j, k)] = (
-                            J[
-                                dense_J_index(J_start, 6, dof_count, 0, c_body, j + 3, k)
-                            ]  # tid is 0 because c_body already iterates over full J
+                            J[dense_J_index(J_start, 6, dof_count, 0, c_body, j + 3, k)]
                             - p_skew[j, 0] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 0, k)]
                             - p_skew[j, 1] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 1, k)]
                             - p_skew[j, 2] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 2, k)]
                         )
 
-            c_body_vec[tid * 4 + foot_id] = c_body
-            point_vec[tid * 4 + foot_id] = p
+                c_body_vec[tid * 8 + foot_id] = c_body
+                point_vec[tid * 8 + foot_id] = p
 
 
 @wp.func
@@ -1303,6 +1422,193 @@ def prox_loop(
 
 
 @wp.func
+def prox_loop_8(
+    tid: int,
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec_0: wp.vec3,
+    c_vec_1: wp.vec3,
+    c_vec_2: wp.vec3,
+    c_vec_3: wp.vec3,
+    c_vec_4: wp.vec3,
+    c_vec_5: wp.vec3,
+    c_vec_6: wp.vec3,
+    c_vec_7: wp.vec3,
+    mu: float,
+    prox_iter: int,
+    p_0: wp.vec3,
+    p_1: wp.vec3,
+    p_2: wp.vec3,
+    p_3: wp.vec3,
+    p_4: wp.vec3,
+    p_5: wp.vec3,
+    p_6: wp.vec3,
+    p_7: wp.vec3,
+):
+    for it in range(prox_iter):
+        # CONTACT 0
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 0, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 0, 0])
+        sum += G_mat[tid, 0, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 0, 1])
+        sum += G_mat[tid, 0, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 0, 2])
+        sum += G_mat[tid, 0, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 0, 3])
+        sum += G_mat[tid, 0, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 0, 4])
+        sum += G_mat[tid, 0, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 0, 5])
+        sum += G_mat[tid, 0, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 0, 6])
+        sum += G_mat[tid, 0, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 0, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_0 = p_0 - r * (sum + c_vec_0)
+        if p_0[1] <= 0.0:
+            p_0 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_0[0] != 0.0 or p_0[2] != 0.0:
+            fm = wp.sqrt(p_0[0] ** 2.0 + p_0[2] ** 2.0)
+            if mu * p_0[1] < fm:
+                p_0 = wp.vec3(p_0[0] * mu * p_0[1] / fm, p_0[1], p_0[2] * mu * p_0[1] / fm)
+
+        # CONTACT 1
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 1, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 1, 0])
+        sum += G_mat[tid, 1, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 1, 1])
+        sum += G_mat[tid, 1, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 1, 2])
+        sum += G_mat[tid, 1, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 1, 3])
+        sum += G_mat[tid, 1, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 1, 4])
+        sum += G_mat[tid, 1, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 1, 5])
+        sum += G_mat[tid, 1, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 1, 6])
+        sum += G_mat[tid, 1, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 1, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_1 = p_1 - r * (sum + c_vec_1)
+        if p_1[1] <= 0.0:
+            p_1 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_1[0] != 0.0 or p_1[2] != 0.0:
+            fm = wp.sqrt(p_1[0] ** 2.0 + p_1[2] ** 2.0)
+            if mu * p_1[1] < fm:
+                p_1 = wp.vec3(p_1[0] * mu * p_1[1] / fm, p_1[1], p_1[2] * mu * p_1[1] / fm)
+
+        # CONTACT 2
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 2, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 2, 0])
+        sum += G_mat[tid, 2, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 2, 1])
+        sum += G_mat[tid, 2, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 2, 2])
+        sum += G_mat[tid, 2, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 2, 3])
+        sum += G_mat[tid, 2, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 2, 4])
+        sum += G_mat[tid, 2, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 2, 5])
+        sum += G_mat[tid, 2, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 2, 6])
+        sum += G_mat[tid, 2, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 2, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_2 = p_2 - r * (sum + c_vec_2)
+        if p_2[1] <= 0.0:
+            p_2 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_2[0] != 0.0 or p_2[2] != 0.0:
+            fm = wp.sqrt(p_2[0] ** 2.0 + p_2[2] ** 2.0)
+            if mu * p_2[1] < fm:
+                p_2 = wp.vec3(p_2[0] * mu * p_2[1] / fm, p_2[1], p_2[2] * mu * p_2[1] / fm)
+
+        # CONTACT 3
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 3, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 3, 0])
+        sum += G_mat[tid, 3, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 3, 1])
+        sum += G_mat[tid, 3, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 3, 2])
+        sum += G_mat[tid, 3, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 3, 3])
+        sum += G_mat[tid, 3, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 3, 4])
+        sum += G_mat[tid, 3, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 3, 5])
+        sum += G_mat[tid, 3, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 3, 6])
+        sum += G_mat[tid, 3, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 3, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_3 = p_3 - r * (sum + c_vec_3)
+        if p_3[1] <= 0.0:
+            p_3 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_3[0] != 0.0 or p_3[2] != 0.0:
+            fm = wp.sqrt(p_3[0] ** 2.0 + p_3[2] ** 2.0)
+            if mu * p_3[1] < fm:
+                p_3 = wp.vec3(p_3[0] * mu * p_3[1] / fm, p_3[1], p_3[2] * mu * p_3[1] / fm)
+
+        # CONTACT 4
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 4, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 4, 0])
+        sum += G_mat[tid, 4, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 4, 1])
+        sum += G_mat[tid, 4, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 4, 2])
+        sum += G_mat[tid, 4, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 4, 3])
+        sum += G_mat[tid, 4, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 4, 4])
+        sum += G_mat[tid, 4, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 4, 5])
+        sum += G_mat[tid, 4, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 4, 6])
+        sum += G_mat[tid, 4, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 4, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_4 = p_4 - r * (sum + c_vec_4)
+        if p_4[1] <= 0.0:
+            p_4 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_4[0] != 0.0 or p_4[2] != 0.0:
+            fm = wp.sqrt(p_4[0] ** 2.0 + p_4[2] ** 2.0)
+            if mu * p_4[1] < fm:
+                p_4 = wp.vec3(p_4[0] * mu * p_4[1] / fm, p_4[1], p_4[2] * mu * p_4[1] / fm)
+
+        # CONTACT 5
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 5, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 5, 0])
+        sum += G_mat[tid, 5, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 5, 1])
+        sum += G_mat[tid, 5, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 5, 2])
+        sum += G_mat[tid, 5, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 5, 3])
+        sum += G_mat[tid, 5, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 5, 4])
+        sum += G_mat[tid, 5, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 5, 5])
+        sum += G_mat[tid, 5, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 5, 6])
+        sum += G_mat[tid, 5, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 5, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_5 = p_5 - r * (sum + c_vec_5)
+        if p_5[1] <= 0.0:
+            p_5 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_5[0] != 0.0 or p_5[2] != 0.0:
+            fm = wp.sqrt(p_5[0] ** 2.0 + p_5[2] ** 2.0)
+            if mu * p_5[1] < fm:
+                p_5 = wp.vec3(p_5[0] * mu * p_5[1] / fm, p_5[1], p_5[2] * mu * p_5[1] / fm)
+
+        # CONTACT 6
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 6, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 6, 0])
+        sum += G_mat[tid, 6, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 6, 1])
+        sum += G_mat[tid, 6, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 6, 2])
+        sum += G_mat[tid, 6, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 6, 3])
+        sum += G_mat[tid, 6, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 6, 4])
+        sum += G_mat[tid, 6, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 6, 5])
+        sum += G_mat[tid, 6, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 6, 6])
+        sum += G_mat[tid, 6, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 6, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_6 = p_6 - r * (sum + c_vec_6)
+        if p_6[1] <= 0.0:
+            p_6 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_6[0] != 0.0 or p_6[2] != 0.0:
+            fm = wp.sqrt(p_6[0] ** 2.0 + p_6[2] ** 2.0)
+            if mu * p_6[1] < fm:
+                p_6 = wp.vec3(p_6[0] * mu * p_6[1] / fm, p_6[1], p_6[2] * mu * p_6[1] / fm)
+
+        # CONTACT 7
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 7, 0] * p_0; r_sum += wp.determinant(G_mat[tid, 7, 0])
+        sum += G_mat[tid, 7, 1] * p_1; r_sum += wp.determinant(G_mat[tid, 7, 1])
+        sum += G_mat[tid, 7, 2] * p_2; r_sum += wp.determinant(G_mat[tid, 7, 2])
+        sum += G_mat[tid, 7, 3] * p_3; r_sum += wp.determinant(G_mat[tid, 7, 3])
+        sum += G_mat[tid, 7, 4] * p_4; r_sum += wp.determinant(G_mat[tid, 7, 4])
+        sum += G_mat[tid, 7, 5] * p_5; r_sum += wp.determinant(G_mat[tid, 7, 5])
+        sum += G_mat[tid, 7, 6] * p_6; r_sum += wp.determinant(G_mat[tid, 7, 6])
+        sum += G_mat[tid, 7, 7] * p_7; r_sum += wp.determinant(G_mat[tid, 7, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_7 = p_7 - r * (sum + c_vec_7)
+        if p_7[1] <= 0.0:
+            p_7 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_7[0] != 0.0 or p_7[2] != 0.0:
+            fm = wp.sqrt(p_7[0] ** 2.0 + p_7[2] ** 2.0)
+            if mu * p_7[1] < fm:
+                p_7 = wp.vec3(p_7[0] * mu * p_7[1] / fm, p_7[1], p_7[2] * mu * p_7[1] / fm)
+
+    return p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7
+
+
+@wp.func
 def prox_loop_soft(
     tid: int,
     G_mat: wp.array3d(dtype=wp.mat33),
@@ -1435,6 +1741,202 @@ def prox_loop_soft(
     return p_0, p_1, p_2, p_3
 
 
+@wp.func
+def prox_loop_soft_8(
+    tid: int,
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec_0: wp.vec3,
+    c_vec_1: wp.vec3,
+    c_vec_2: wp.vec3,
+    c_vec_3: wp.vec3,
+    c_vec_4: wp.vec3,
+    c_vec_5: wp.vec3,
+    c_vec_6: wp.vec3,
+    c_vec_7: wp.vec3,
+    c_0: float,
+    c_1: float,
+    c_2: float,
+    c_3: float,
+    c_4: float,
+    c_5: float,
+    c_6: float,
+    c_7: float,
+    scale: float,
+    mu: float,
+    prox_iter: int,
+    p_0: wp.vec3,
+    p_1: wp.vec3,
+    p_2: wp.vec3,
+    p_3: wp.vec3,
+    p_4: wp.vec3,
+    p_5: wp.vec3,
+    p_6: wp.vec3,
+    p_7: wp.vec3,
+):
+    for it in range(prox_iter):
+        # CONTACT 0
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 0, 0] * p_0;                                          r_sum += wp.determinant(G_mat[tid, 0, 0])
+        sum += G_mat[tid, 0, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 1])
+        sum += G_mat[tid, 0, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 2])
+        sum += G_mat[tid, 0, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 3])
+        sum += G_mat[tid, 0, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 4])
+        sum += G_mat[tid, 0, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 5])
+        sum += G_mat[tid, 0, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 6])
+        sum += G_mat[tid, 0, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 0, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_0 = p_0 - r * (sum + c_vec_0)
+        if p_0[1] <= 0.0:
+            p_0 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_0[0] != 0.0 or p_0[2] != 0.0:
+            fm = wp.sqrt(p_0[0] ** 2.0 + p_0[2] ** 2.0)
+            if mu * p_0[1] < fm:
+                p_0 = wp.vec3(p_0[0] * mu * p_0[1] / fm, p_0[1], p_0[2] * mu * p_0[1] / fm)
+
+        # CONTACT 1
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 1, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 0])
+        sum += G_mat[tid, 1, 1] * p_1;                                          r_sum += wp.determinant(G_mat[tid, 1, 1])
+        sum += G_mat[tid, 1, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 2])
+        sum += G_mat[tid, 1, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 3])
+        sum += G_mat[tid, 1, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 4])
+        sum += G_mat[tid, 1, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 5])
+        sum += G_mat[tid, 1, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 6])
+        sum += G_mat[tid, 1, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 1, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_1 = p_1 - r * (sum + c_vec_1)
+        if p_1[1] <= 0.0:
+            p_1 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_1[0] != 0.0 or p_1[2] != 0.0:
+            fm = wp.sqrt(p_1[0] ** 2.0 + p_1[2] ** 2.0)
+            if mu * p_1[1] < fm:
+                p_1 = wp.vec3(p_1[0] * mu * p_1[1] / fm, p_1[1], p_1[2] * mu * p_1[1] / fm)
+
+        # CONTACT 2
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 2, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 0])
+        sum += G_mat[tid, 2, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 1])
+        sum += G_mat[tid, 2, 2] * p_2;                                          r_sum += wp.determinant(G_mat[tid, 2, 2])
+        sum += G_mat[tid, 2, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 3])
+        sum += G_mat[tid, 2, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 4])
+        sum += G_mat[tid, 2, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 5])
+        sum += G_mat[tid, 2, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 6])
+        sum += G_mat[tid, 2, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 2, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_2 = p_2 - r * (sum + c_vec_2)
+        if p_2[1] <= 0.0:
+            p_2 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_2[0] != 0.0 or p_2[2] != 0.0:
+            fm = wp.sqrt(p_2[0] ** 2.0 + p_2[2] ** 2.0)
+            if mu * p_2[1] < fm:
+                p_2 = wp.vec3(p_2[0] * mu * p_2[1] / fm, p_2[1], p_2[2] * mu * p_2[1] / fm)
+
+        # CONTACT 3
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 3, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 0])
+        sum += G_mat[tid, 3, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 1])
+        sum += G_mat[tid, 3, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 2])
+        sum += G_mat[tid, 3, 3] * p_3;                                          r_sum += wp.determinant(G_mat[tid, 3, 3])
+        sum += G_mat[tid, 3, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 4])
+        sum += G_mat[tid, 3, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 5])
+        sum += G_mat[tid, 3, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 6])
+        sum += G_mat[tid, 3, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 3, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_3 = p_3 - r * (sum + c_vec_3)
+        if p_3[1] <= 0.0:
+            p_3 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_3[0] != 0.0 or p_3[2] != 0.0:
+            fm = wp.sqrt(p_3[0] ** 2.0 + p_3[2] ** 2.0)
+            if mu * p_3[1] < fm:
+                p_3 = wp.vec3(p_3[0] * mu * p_3[1] / fm, p_3[1], p_3[2] * mu * p_3[1] / fm)
+
+        # CONTACT 4
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 4, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 0])
+        sum += G_mat[tid, 4, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 1])
+        sum += G_mat[tid, 4, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 2])
+        sum += G_mat[tid, 4, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 3])
+        sum += G_mat[tid, 4, 4] * p_4;                                          r_sum += wp.determinant(G_mat[tid, 4, 4])
+        sum += G_mat[tid, 4, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 5])
+        sum += G_mat[tid, 4, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 6])
+        sum += G_mat[tid, 4, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 4, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_4 = p_4 - r * (sum + c_vec_4)
+        if p_4[1] <= 0.0:
+            p_4 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_4[0] != 0.0 or p_4[2] != 0.0:
+            fm = wp.sqrt(p_4[0] ** 2.0 + p_4[2] ** 2.0)
+            if mu * p_4[1] < fm:
+                p_4 = wp.vec3(p_4[0] * mu * p_4[1] / fm, p_4[1], p_4[2] * mu * p_4[1] / fm)
+
+        # CONTACT 5
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 5, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 0])
+        sum += G_mat[tid, 5, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 1])
+        sum += G_mat[tid, 5, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 2])
+        sum += G_mat[tid, 5, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 3])
+        sum += G_mat[tid, 5, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 4])
+        sum += G_mat[tid, 5, 5] * p_5;                                          r_sum += wp.determinant(G_mat[tid, 5, 5])
+        sum += G_mat[tid, 5, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 6])
+        sum += G_mat[tid, 5, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 5, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_5 = p_5 - r * (sum + c_vec_5)
+        if p_5[1] <= 0.0:
+            p_5 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_5[0] != 0.0 or p_5[2] != 0.0:
+            fm = wp.sqrt(p_5[0] ** 2.0 + p_5[2] ** 2.0)
+            if mu * p_5[1] < fm:
+                p_5 = wp.vec3(p_5[0] * mu * p_5[1] / fm, p_5[1], p_5[2] * mu * p_5[1] / fm)
+
+        # CONTACT 6
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 6, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 0])
+        sum += G_mat[tid, 6, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 1])
+        sum += G_mat[tid, 6, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 2])
+        sum += G_mat[tid, 6, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 3])
+        sum += G_mat[tid, 6, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 4])
+        sum += G_mat[tid, 6, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 5])
+        sum += G_mat[tid, 6, 6] * p_6;                                          r_sum += wp.determinant(G_mat[tid, 6, 6])
+        sum += G_mat[tid, 6, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 6, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_6 = p_6 - r * (sum + c_vec_6)
+        if p_6[1] <= 0.0:
+            p_6 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_6[0] != 0.0 or p_6[2] != 0.0:
+            fm = wp.sqrt(p_6[0] ** 2.0 + p_6[2] ** 2.0)
+            if mu * p_6[1] < fm:
+                p_6 = wp.vec3(p_6[0] * mu * p_6[1] / fm, p_6[1], p_6[2] * mu * p_6[1] / fm)
+
+        # CONTACT 7
+        sum = wp.vec3(0.0, 0.0, 0.0)
+        r_sum = 0.0
+        sum += G_mat[tid, 7, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 0])
+        sum += G_mat[tid, 7, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 1])
+        sum += G_mat[tid, 7, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 2])
+        sum += G_mat[tid, 7, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 3])
+        sum += G_mat[tid, 7, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 4])
+        sum += G_mat[tid, 7, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 5])
+        sum += G_mat[tid, 7, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);       r_sum += wp.determinant(G_mat[tid, 7, 6])
+        sum += G_mat[tid, 7, 7] * p_7;                                          r_sum += wp.determinant(G_mat[tid, 7, 7])
+        r = 1.0 / (1.0 + r_sum)
+        p_7 = p_7 - r * (sum + c_vec_7)
+        if p_7[1] <= 0.0:
+            p_7 = wp.vec3(0.0, 0.0, 0.0)
+        elif p_7[0] != 0.0 or p_7[2] != 0.0:
+            fm = wp.sqrt(p_7[0] ** 2.0 + p_7[2] ** 2.0)
+            if mu * p_7[1] < fm:
+                p_7 = wp.vec3(p_7[0] * mu * p_7[1] / fm, p_7[1], p_7[2] * mu * p_7[1] / fm)
+
+    return p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7
+
+
 @wp.kernel
 def prox_iteration_unrolled(
     # inputs
@@ -1460,15 +1962,10 @@ def prox_iteration_unrolled(
     mu = shape_materials.mu[shape_idx]  # we only access 1 body for each env assuming mu is the same for all bodies
 
     # initialize percussions with steady state
-    p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
-    p_1 = -wp.inverse(G_mat[tid, 1, 1]) * c_vec_1
-    p_2 = -wp.inverse(G_mat[tid, 2, 2]) * c_vec_2
-    p_3 = -wp.inverse(G_mat[tid, 3, 3]) * c_vec_3
-    # overwrite percussions with steady state only in normal direction
-    # p_0 = wp.vec3(0.0, p_0[1], 0.0)
-    # p_1 = wp.vec3(0.0, p_1[1], 0.0)
-    # p_2 = wp.vec3(0.0, p_2[1], 0.0)
-    # p_3 = wp.vec3(0.0, p_3[1], 0.0)
+    p_0 = -safe_mat33_inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -safe_mat33_inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = -safe_mat33_inverse(G_mat[tid, 2, 2]) * c_vec_2
+    p_3 = -safe_mat33_inverse(G_mat[tid, 3, 3]) * c_vec_3
 
     p_0, p_1, p_2, p_3 = prox_loop(tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, mu, prox_iter, p_0, p_1, p_2, p_3)
 
@@ -1496,10 +1993,10 @@ def prox_iteration_unrolled_soft(
 
     scale = scale_array[0]
     n = wp.vec3(0.0, 1.0, 0.0)
-    point_0 = point_vec[tid * 4]
-    point_1 = point_vec[tid * 4 + 1]
-    point_2 = point_vec[tid * 4 + 2]
-    point_3 = point_vec[tid * 4 + 3]
+    point_0 = point_vec[tid * 8]
+    point_1 = point_vec[tid * 8 + 1]
+    point_2 = point_vec[tid * 8 + 2]
+    point_3 = point_vec[tid * 8 + 3]
     c_0 = wp.dot(n, point_0)
     c_1 = wp.dot(n, point_1)
     c_2 = wp.dot(n, point_2)
@@ -1515,10 +2012,10 @@ def prox_iteration_unrolled_soft(
     mu = shape_materials.mu[shape_idx]  # we only access 1 body for each env assuming mu is the same for all bodies
 
     # initialize percussions with steady state
-    p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
-    p_1 = -wp.inverse(G_mat[tid, 1, 1]) * c_vec_1
-    p_2 = -wp.inverse(G_mat[tid, 2, 2]) * c_vec_2
-    p_3 = -wp.inverse(G_mat[tid, 3, 3]) * c_vec_3
+    p_0 = -safe_mat33_inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -safe_mat33_inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = -safe_mat33_inverse(G_mat[tid, 2, 2]) * c_vec_2
+    p_3 = -safe_mat33_inverse(G_mat[tid, 3, 3]) * c_vec_3
 
     p_0, p_1, p_2, p_3 = prox_loop_soft(
         tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_0, c_1, c_2, c_3, scale, mu, prox_iter, p_0, p_1, p_2, p_3
@@ -1531,11 +2028,212 @@ def prox_iteration_unrolled_soft(
 
 
 @wp.kernel
+def prox_iteration_unrolled_2contacts(
+    # inputs
+    articulation_count: int,
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec: wp.array2d(dtype=wp.vec3),
+    prox_iter: int,
+    shape_materials: ModelShapeMaterials,
+    # outputs
+    percussion: wp.array2d(dtype=wp.vec3),
+):
+    """2-contact variant of prox_iteration_unrolled for humanoids with 2 feet.
+
+    Slots 2 and 3 are explicitly set to zero to avoid wp.inverse(zero_matrix) → NaN.
+    """
+    tid = wp.tid()
+
+    c_vec_0 = c_vec[tid, 0]
+    c_vec_1 = c_vec[tid, 1]
+    c_vec_2 = wp.vec3(0.0, 0.0, 0.0)
+    c_vec_3 = wp.vec3(0.0, 0.0, 0.0)
+
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]
+
+    p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -wp.inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = wp.vec3(0.0, 0.0, 0.0)  # unused contact slot: avoid inverting zero matrix
+    p_3 = wp.vec3(0.0, 0.0, 0.0)  # unused contact slot: avoid inverting zero matrix
+
+    p_0, p_1, p_2, p_3 = prox_loop(tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, mu, prox_iter, p_0, p_1, p_2, p_3)
+
+    percussion[tid, 0] = p_0
+    percussion[tid, 1] = p_1
+    percussion[tid, 2] = wp.vec3(0.0, 0.0, 0.0)
+    percussion[tid, 3] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def prox_iteration_unrolled_soft_2contacts(
+    # inputs
+    articulation_count: int,
+    point_vec: wp.array(dtype=wp.vec3),
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec: wp.array2d(dtype=wp.vec3),
+    prox_iter: int,
+    scale_array: wp.array(dtype=float),
+    shape_materials: ModelShapeMaterials,
+    # outputs
+    percussion: wp.array2d(dtype=wp.vec3),
+):
+    """2-contact variant of prox_iteration_unrolled_soft for humanoids with 2 feet.
+
+    Slots 2 and 3 are explicitly set to zero to avoid wp.inverse(zero_matrix) → NaN.
+    """
+    tid = wp.tid()
+
+    scale = scale_array[0]
+    n = wp.vec3(0.0, 1.0, 0.0)
+    point_0 = point_vec[tid * 8]
+    point_1 = point_vec[tid * 8 + 1]
+    c_0 = wp.dot(n, point_0)
+    c_1 = wp.dot(n, point_1)
+    c_2 = float(0.0)
+    c_3 = float(0.0)
+    c_vec_0 = c_vec[tid, 0]
+    c_vec_1 = c_vec[tid, 1]
+    c_vec_2 = wp.vec3(0.0, 0.0, 0.0)
+    c_vec_3 = wp.vec3(0.0, 0.0, 0.0)
+
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]
+
+    p_0 = -wp.inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -wp.inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = wp.vec3(0.0, 0.0, 0.0)  # unused contact slot: avoid inverting zero matrix
+    p_3 = wp.vec3(0.0, 0.0, 0.0)  # unused contact slot: avoid inverting zero matrix
+
+    p_0, p_1, p_2, p_3 = prox_loop_soft(
+        tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_0, c_1, c_2, c_3, scale, mu, prox_iter, p_0, p_1, p_2, p_3
+    )
+
+    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, 0.0)
+    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, 0.0)
+    percussion[tid, 2] = wp.vec3(0.0, 0.0, 0.0)
+    percussion[tid, 3] = wp.vec3(0.0, 0.0, 0.0)
+
+
+@wp.kernel
+def prox_iteration_unrolled_8contacts(
+    articulation_count: int,
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec: wp.array2d(dtype=wp.vec3),
+    prox_iter: int,
+    shape_materials: ModelShapeMaterials,
+    percussion: wp.array2d(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    c_vec_0 = c_vec[tid, 0]
+    c_vec_1 = c_vec[tid, 1]
+    c_vec_2 = c_vec[tid, 2]
+    c_vec_3 = c_vec[tid, 3]
+    c_vec_4 = c_vec[tid, 4]
+    c_vec_5 = c_vec[tid, 5]
+    c_vec_6 = c_vec[tid, 6]
+    c_vec_7 = c_vec[tid, 7]
+
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]
+
+    p_0 = -safe_mat33_inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -safe_mat33_inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = -safe_mat33_inverse(G_mat[tid, 2, 2]) * c_vec_2
+    p_3 = -safe_mat33_inverse(G_mat[tid, 3, 3]) * c_vec_3
+    p_4 = -safe_mat33_inverse(G_mat[tid, 4, 4]) * c_vec_4
+    p_5 = -safe_mat33_inverse(G_mat[tid, 5, 5]) * c_vec_5
+    p_6 = -safe_mat33_inverse(G_mat[tid, 6, 6]) * c_vec_6
+    p_7 = -safe_mat33_inverse(G_mat[tid, 7, 7]) * c_vec_7
+
+    p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7 = prox_loop_8(
+        tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_vec_4, c_vec_5, c_vec_6, c_vec_7,
+        mu, prox_iter, p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7
+    )
+
+    percussion[tid, 0] = p_0
+    percussion[tid, 1] = p_1
+    percussion[tid, 2] = p_2
+    percussion[tid, 3] = p_3
+    percussion[tid, 4] = p_4
+    percussion[tid, 5] = p_5
+    percussion[tid, 6] = p_6
+    percussion[tid, 7] = p_7
+
+
+@wp.kernel
+def prox_iteration_unrolled_soft_8contacts(
+    articulation_count: int,
+    point_vec: wp.array(dtype=wp.vec3),
+    G_mat: wp.array3d(dtype=wp.mat33),
+    c_vec: wp.array2d(dtype=wp.vec3),
+    prox_iter: int,
+    scale_array: wp.array(dtype=float),
+    shape_materials: ModelShapeMaterials,
+    percussion: wp.array2d(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    scale = scale_array[0]
+    n = wp.vec3(0.0, 1.0, 0.0)
+    c_0 = wp.dot(n, point_vec[tid * 8 + 0])
+    c_1 = wp.dot(n, point_vec[tid * 8 + 1])
+    c_2 = wp.dot(n, point_vec[tid * 8 + 2])
+    c_3 = wp.dot(n, point_vec[tid * 8 + 3])
+    c_4 = wp.dot(n, point_vec[tid * 8 + 4])
+    c_5 = wp.dot(n, point_vec[tid * 8 + 5])
+    c_6 = wp.dot(n, point_vec[tid * 8 + 6])
+    c_7 = wp.dot(n, point_vec[tid * 8 + 7])
+    c_vec_0 = c_vec[tid, 0]
+    c_vec_1 = c_vec[tid, 1]
+    c_vec_2 = c_vec[tid, 2]
+    c_vec_3 = c_vec[tid, 3]
+    c_vec_4 = c_vec[tid, 4]
+    c_vec_5 = c_vec[tid, 5]
+    c_vec_6 = c_vec[tid, 6]
+    c_vec_7 = c_vec[tid, 7]
+
+    shapes_per_env = (shape_materials.mu.shape[0] - 1) / articulation_count
+    shape_idx = tid * shapes_per_env
+    mu = shape_materials.mu[shape_idx]
+
+    p_0 = -safe_mat33_inverse(G_mat[tid, 0, 0]) * c_vec_0
+    p_1 = -safe_mat33_inverse(G_mat[tid, 1, 1]) * c_vec_1
+    p_2 = -safe_mat33_inverse(G_mat[tid, 2, 2]) * c_vec_2
+    p_3 = -safe_mat33_inverse(G_mat[tid, 3, 3]) * c_vec_3
+    p_4 = -safe_mat33_inverse(G_mat[tid, 4, 4]) * c_vec_4
+    p_5 = -safe_mat33_inverse(G_mat[tid, 5, 5]) * c_vec_5
+    p_6 = -safe_mat33_inverse(G_mat[tid, 6, 6]) * c_vec_6
+    p_7 = -safe_mat33_inverse(G_mat[tid, 7, 7]) * c_vec_7
+
+    p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7 = prox_loop_soft_8(
+        tid, G_mat,
+        c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_vec_4, c_vec_5, c_vec_6, c_vec_7,
+        c_0, c_1, c_2, c_3, c_4, c_5, c_6, c_7,
+        scale, mu, prox_iter,
+        p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7
+    )
+
+    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, 0.0)
+    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, 0.0)
+    percussion[tid, 2] = p_2 * offset_sigmoid(c_2, scale, 0.0)
+    percussion[tid, 3] = p_3 * offset_sigmoid(c_3, scale, 0.0)
+    percussion[tid, 4] = p_4 * offset_sigmoid(c_4, scale, 0.0)
+    percussion[tid, 5] = p_5 * offset_sigmoid(c_5, scale, 0.0)
+    percussion[tid, 6] = p_6 * offset_sigmoid(c_6, scale, 0.0)
+    percussion[tid, 7] = p_7 * offset_sigmoid(c_7, scale, 0.0)
+
+
+@wp.kernel
 def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), G_mat: wp.array3d(dtype=wp.mat33)):
     tid = wp.tid()
 
-    for i in range(4):
-        for j in range(4):
+    for i in range(8):
+        for j in range(8):
             G_mat[tid, i, j] = wp.mat33(
                 G[dense_G_index(G_start, tid, i, j, 0, 0)],
                 G[dense_G_index(G_start, tid, i, j, 0, 1)],
@@ -1571,7 +2269,7 @@ def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int
     k: row index within 3x3 block (0..2)
     l: col index within 3x3 block (0..2)
     """
-    num_contacts = 4
+    num_contacts = 8
     num_block_cols = num_contacts  # G is (N*3) x (N*3)
     num_total_cols = num_block_cols * 3
 
@@ -1585,8 +2283,8 @@ def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int
 def convert_c_to_vector(c: wp.array(dtype=float), c_vec: wp.array2d(dtype=wp.vec3)):
     tid = wp.tid()
 
-    for i in range(4):
-        c_start = tid * 3 * 4 + i * 3  # each articulation has 4 contacts, each contact has 3 dimensions
+    for i in range(8):
+        c_start = tid * 3 * 8 + i * 3
         c_vec[tid, i] = wp.vec3(c[c_start], c[c_start + 1], c[c_start + 2])
 
 
@@ -1594,8 +2292,8 @@ def convert_c_to_vector(c: wp.array(dtype=float), c_vec: wp.array2d(dtype=wp.vec
 def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: wp.array(dtype=float)):
     tid = wp.tid()
 
-    for i in range(4):
-        start = tid * 3 * 4 + i * 3
+    for i in range(8):
+        start = tid * 3 * 8 + i * 3
         percussion_vec[start] = percussion[tid, i][0]
         percussion_vec[start + 1] = percussion[tid, i][1]
         percussion_vec[start + 2] = percussion[tid, i][2]
@@ -1613,11 +2311,11 @@ def p_to_f_s(
 ):
     tid = wp.tid()
 
-    for i in range(4):
+    for i in range(8):
         # foot forces and torques
         f = -percussion[tid, i] / dt
-        t = wp.cross(point_vec[tid * 4 + i], f)
-        wp.atomic_add(body_f_s, c_body_vec[tid * 4 + i], wp.spatial_vector(t, f))
+        t = wp.cross(point_vec[tid * 8 + i], f)
+        wp.atomic_add(body_f_s, c_body_vec[tid * 8 + i], wp.spatial_vector(t, f))
 
 
 @wp.kernel
@@ -1638,22 +2336,46 @@ def split_matrix(
     a_10: wp.array(dtype=float),
     a_11: wp.array(dtype=float),
     a_12: wp.array(dtype=float),
+    a_13: wp.array(dtype=float),
+    a_14: wp.array(dtype=float),
+    a_15: wp.array(dtype=float),
+    a_16: wp.array(dtype=float),
+    a_17: wp.array(dtype=float),
+    a_18: wp.array(dtype=float),
+    a_19: wp.array(dtype=float),
+    a_20: wp.array(dtype=float),
+    a_21: wp.array(dtype=float),
+    a_22: wp.array(dtype=float),
+    a_23: wp.array(dtype=float),
+    a_24: wp.array(dtype=float),
 ):
     tid = wp.tid()
 
     for i in range(dof_count):
         a_1[a_start[tid] + i] = A[A_start[tid] + i]
-        a_2[a_start[tid] + i] = A[A_start[tid] + i + 18]
-        a_3[a_start[tid] + i] = A[A_start[tid] + i + 36]
-        a_4[a_start[tid] + i] = A[A_start[tid] + i + 54]
-        a_5[a_start[tid] + i] = A[A_start[tid] + i + 72]
-        a_6[a_start[tid] + i] = A[A_start[tid] + i + 90]
-        a_7[a_start[tid] + i] = A[A_start[tid] + i + 108]
-        a_8[a_start[tid] + i] = A[A_start[tid] + i + 126]
-        a_9[a_start[tid] + i] = A[A_start[tid] + i + 144]
-        a_10[a_start[tid] + i] = A[A_start[tid] + i + 162]
-        a_11[a_start[tid] + i] = A[A_start[tid] + i + 180]
-        a_12[a_start[tid] + i] = A[A_start[tid] + i + 198]
+        a_2[a_start[tid] + i] = A[A_start[tid] + i + 1 * dof_count]
+        a_3[a_start[tid] + i] = A[A_start[tid] + i + 2 * dof_count]
+        a_4[a_start[tid] + i] = A[A_start[tid] + i + 3 * dof_count]
+        a_5[a_start[tid] + i] = A[A_start[tid] + i + 4 * dof_count]
+        a_6[a_start[tid] + i] = A[A_start[tid] + i + 5 * dof_count]
+        a_7[a_start[tid] + i] = A[A_start[tid] + i + 6 * dof_count]
+        a_8[a_start[tid] + i] = A[A_start[tid] + i + 7 * dof_count]
+        a_9[a_start[tid] + i] = A[A_start[tid] + i + 8 * dof_count]
+        a_10[a_start[tid] + i] = A[A_start[tid] + i + 9 * dof_count]
+        a_11[a_start[tid] + i] = A[A_start[tid] + i + 10 * dof_count]
+        a_12[a_start[tid] + i] = A[A_start[tid] + i + 11 * dof_count]
+        a_13[a_start[tid] + i] = A[A_start[tid] + i + 12 * dof_count]
+        a_14[a_start[tid] + i] = A[A_start[tid] + i + 13 * dof_count]
+        a_15[a_start[tid] + i] = A[A_start[tid] + i + 14 * dof_count]
+        a_16[a_start[tid] + i] = A[A_start[tid] + i + 15 * dof_count]
+        a_17[a_start[tid] + i] = A[A_start[tid] + i + 16 * dof_count]
+        a_18[a_start[tid] + i] = A[A_start[tid] + i + 17 * dof_count]
+        a_19[a_start[tid] + i] = A[A_start[tid] + i + 18 * dof_count]
+        a_20[a_start[tid] + i] = A[A_start[tid] + i + 19 * dof_count]
+        a_21[a_start[tid] + i] = A[A_start[tid] + i + 20 * dof_count]
+        a_22[a_start[tid] + i] = A[A_start[tid] + i + 21 * dof_count]
+        a_23[a_start[tid] + i] = A[A_start[tid] + i + 22 * dof_count]
+        a_24[a_start[tid] + i] = A[A_start[tid] + i + 23 * dof_count]
 
 
 @wp.kernel
@@ -1673,23 +2395,47 @@ def create_matrix(
     a_10: wp.array(dtype=float),
     a_11: wp.array(dtype=float),
     a_12: wp.array(dtype=float),
+    a_13: wp.array(dtype=float),
+    a_14: wp.array(dtype=float),
+    a_15: wp.array(dtype=float),
+    a_16: wp.array(dtype=float),
+    a_17: wp.array(dtype=float),
+    a_18: wp.array(dtype=float),
+    a_19: wp.array(dtype=float),
+    a_20: wp.array(dtype=float),
+    a_21: wp.array(dtype=float),
+    a_22: wp.array(dtype=float),
+    a_23: wp.array(dtype=float),
+    a_24: wp.array(dtype=float),
     A: wp.array(dtype=float),
 ):
     tid = wp.tid()
 
     for i in range(dof_count):
         A[A_start[tid] + i] = a_1[a_start[tid] + i]
-        A[A_start[tid] + i + 18] = a_2[a_start[tid] + i]
-        A[A_start[tid] + i + 36] = a_3[a_start[tid] + i]
-        A[A_start[tid] + i + 54] = a_4[a_start[tid] + i]
-        A[A_start[tid] + i + 72] = a_5[a_start[tid] + i]
-        A[A_start[tid] + i + 90] = a_6[a_start[tid] + i]
-        A[A_start[tid] + i + 108] = a_7[a_start[tid] + i]
-        A[A_start[tid] + i + 126] = a_8[a_start[tid] + i]
-        A[A_start[tid] + i + 144] = a_9[a_start[tid] + i]
-        A[A_start[tid] + i + 162] = a_10[a_start[tid] + i]
-        A[A_start[tid] + i + 180] = a_11[a_start[tid] + i]
-        A[A_start[tid] + i + 198] = a_12[a_start[tid] + i]
+        A[A_start[tid] + i + 1 * dof_count] = a_2[a_start[tid] + i]
+        A[A_start[tid] + i + 2 * dof_count] = a_3[a_start[tid] + i]
+        A[A_start[tid] + i + 3 * dof_count] = a_4[a_start[tid] + i]
+        A[A_start[tid] + i + 4 * dof_count] = a_5[a_start[tid] + i]
+        A[A_start[tid] + i + 5 * dof_count] = a_6[a_start[tid] + i]
+        A[A_start[tid] + i + 6 * dof_count] = a_7[a_start[tid] + i]
+        A[A_start[tid] + i + 7 * dof_count] = a_8[a_start[tid] + i]
+        A[A_start[tid] + i + 8 * dof_count] = a_9[a_start[tid] + i]
+        A[A_start[tid] + i + 9 * dof_count] = a_10[a_start[tid] + i]
+        A[A_start[tid] + i + 10 * dof_count] = a_11[a_start[tid] + i]
+        A[A_start[tid] + i + 11 * dof_count] = a_12[a_start[tid] + i]
+        A[A_start[tid] + i + 12 * dof_count] = a_13[a_start[tid] + i]
+        A[A_start[tid] + i + 13 * dof_count] = a_14[a_start[tid] + i]
+        A[A_start[tid] + i + 14 * dof_count] = a_15[a_start[tid] + i]
+        A[A_start[tid] + i + 15 * dof_count] = a_16[a_start[tid] + i]
+        A[A_start[tid] + i + 16 * dof_count] = a_17[a_start[tid] + i]
+        A[A_start[tid] + i + 17 * dof_count] = a_18[a_start[tid] + i]
+        A[A_start[tid] + i + 18 * dof_count] = a_19[a_start[tid] + i]
+        A[A_start[tid] + i + 19 * dof_count] = a_20[a_start[tid] + i]
+        A[A_start[tid] + i + 20 * dof_count] = a_21[a_start[tid] + i]
+        A[A_start[tid] + i + 21 * dof_count] = a_22[a_start[tid] + i]
+        A[A_start[tid] + i + 22 * dof_count] = a_23[a_start[tid] + i]
+        A[A_start[tid] + i + 23 * dof_count] = a_24[a_start[tid] + i]
 
 
 @wp.kernel
@@ -1701,12 +2447,8 @@ def copy_relevant_states(
 ):
     tid = wp.tid()
 
-    # NOTE: these states assume hardcoded indices for quadruped feet
-
-    percussion_out[tid, 0] = percussion_in[tid, 0]
-    percussion_out[tid, 1] = percussion_in[tid, 1]
-    percussion_out[tid, 2] = percussion_in[tid, 2]
-    percussion_out[tid, 3] = percussion_in[tid, 3]
+    for i in range(8):
+        percussion_out[tid, i] = percussion_in[tid, i]
 
 
 @wp.kernel
@@ -1722,13 +2464,39 @@ def get_foot_states(
     contact_shape: wp.array(dtype=int),
     # shape_materials: ModelShapeMaterials,
     geo: ModelShapeGeometry,
+    contact_body_offsets: wp.array(dtype=int),
+    bodies_per_env: int,
+    contact_local_x_sign: wp.array(dtype=int),
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()  # articulation_count
 
+    # Pre-initialize all foot slots above ground so unused slots (e.g. slots 2,3
+    # for a 2-contact robot) are never mistaken for in-contact feet.
+    above_ground = wp.vec3(0.0, 1.0, 0.0)
+    point_vec[tid * 8 + 0] = above_ground
+    point_vec[tid * 8 + 1] = above_ground
+    point_vec[tid * 8 + 2] = above_ground
+    point_vec[tid * 8 + 3] = above_ground
+    zero_vel = wp.vec3(0.0, 0.0, 0.0)
+    foot_vel[tid * 8 + 0] = zero_vel
+    foot_vel[tid * 8 + 1] = zero_vel
+    foot_vel[tid * 8 + 2] = zero_vel
+    foot_vel[tid * 8 + 3] = zero_vel
+
     contacts_per_articulation = rigid_contact_max / articulation_count
+
+    # Track minimum world-Y contact per foot slot so that foot position and
+    # velocity are always reported at the lowest (most-ground-proximal) sphere.
+    # This matters when multiple spheres share the same foot body (e.g. G1's
+    # 4-sphere ankles): without this, whichever sphere is last in the contact
+    # list wins, which is arbitrary and causes heel-sinking misreporting.
+    best_y_0 = float(1.0e6)
+    best_y_1 = float(1.0e6)
+    best_y_2 = float(1.0e6)
+    best_y_3 = float(1.0e6)
 
     for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
         contact_id = tid * contacts_per_articulation + i
@@ -1737,9 +2505,26 @@ def get_foot_states(
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
 
-        if (c_body - tid) % 3 == 0 and i % 2 == 0:  # only consider foot contacts
-            foot_id = (c_body - tid - tid * 12) / 3 - 1
+        body_offset = c_body - tid * bodies_per_env
+        foot_id = int(-1)
+        if body_offset == contact_body_offsets[0]:
+            xs0 = contact_local_x_sign[0]
+            if xs0 == 0 or (xs0 > 0 and c_point[0] >= float(0.0)) or (xs0 < 0 and c_point[0] < float(0.0)):
+                foot_id = int(0)
+        if body_offset == contact_body_offsets[1]:
+            xs1 = contact_local_x_sign[1]
+            if xs1 == 0 or (xs1 > 0 and c_point[0] >= float(0.0)) or (xs1 < 0 and c_point[0] < float(0.0)):
+                foot_id = int(1)
+        if body_offset == contact_body_offsets[2]:
+            xs2 = contact_local_x_sign[2]
+            if xs2 == 0 or (xs2 > 0 and c_point[0] >= float(0.0)) or (xs2 < 0 and c_point[0] < float(0.0)):
+                foot_id = int(2)
+        if body_offset == contact_body_offsets[3]:
+            xs3 = contact_local_x_sign[3]
+            if xs3 == 0 or (xs3 > 0 and c_point[0] >= float(0.0)) or (xs3 < 0 and c_point[0] < float(0.0)):
+                foot_id = int(3)
 
+        if foot_id >= 0:
             X_s = body_X_s[c_body]  # position of colliding body
             v_s = body_v_s[c_body]  # orientation of colliding body
 
@@ -1750,15 +2535,33 @@ def get_foot_states(
                 wp.transform_point(X_s, c_point) - n * c_dist
             )  # add on 'thickness' of shape, e.g.: radius of sphere/capsule
 
-            # compute contact point velocity
-            w = wp.spatial_top(v_s)
-            v = wp.spatial_bottom(v_s)
+            c = wp.dot(n, p)
 
-            dpdt = v + wp.cross(w, p)
+            # Keep only the deepest (lowest world-Y) contact per foot slot.
+            is_best = bool(False)
+            if foot_id == 0 and c < best_y_0:
+                best_y_0 = c
+                is_best = bool(True)
+            if foot_id == 1 and c < best_y_1:
+                best_y_1 = c
+                is_best = bool(True)
+            if foot_id == 2 and c < best_y_2:
+                best_y_2 = c
+                is_best = bool(True)
+            if foot_id == 3 and c < best_y_3:
+                best_y_3 = c
+                is_best = bool(True)
 
-            # get data
-            point_vec[tid * 4 + foot_id] = p
-            foot_vel[tid * 4 + foot_id] = dpdt
+            if is_best:
+                # compute contact point velocity
+                w = wp.spatial_top(v_s)
+                v = wp.spatial_bottom(v_s)
+
+                dpdt = v + wp.cross(w, p)
+
+                # get data
+                point_vec[tid * 8 + foot_id] = p
+                foot_vel[tid * 8 + foot_id] = dpdt
 
 
 ##############################
@@ -1793,7 +2596,7 @@ def detect_bundle_contacts(
     any_contact = int(0)
 
     for f in range(4):
-        p = point_vec[tid * 4 + f]
+        p = point_vec[tid * 8 + f]
         if p[1] <= col_height:
             mask = mask | (1 << f)
             any_contact = 1
@@ -1835,7 +2638,7 @@ def detect_bundle_branch_contacts(
 
     mask = int(0)
     for f in range(4):
-        p = point_vec[tid * 4 + f]
+        p = point_vec[tid * 8 + f]
         if p[1] <= col_height:
             mask = mask | (1 << f)
 
@@ -2510,13 +3313,16 @@ class MoreauIntegrator:
                 model.rigid_contact_point0,
                 model.rigid_contact_shape0,
                 model.shape_geo,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                model.contact_local_x_sign,
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
             record_tape=False,
         )
         wp.synchronize_device()
-        return wp.to_torch(state.point_vec).reshape(model.articulation_count, 4, 3)
+        return wp.to_torch(state.point_vec).reshape(model.articulation_count, 8, 3)[:, :4, :].clone()
 
     def _compute_fd_leg_jacobian(self, model, e, active_feet, main_foot_pos_e,
                                   root_q_dim, coord_per_env, epsilon=1e-4):
@@ -3013,6 +3819,10 @@ class MoreauIntegrator:
                 bundle_inner_mode,
             )
 
+        # Ensure contact_local_x_sign is present (zeros = no x-axis filtering).
+        if not hasattr(model, "contact_local_x_sign"):
+            model.contact_local_x_sign = wp.zeros(4, dtype=wp.int32, device=model.device)
+
         # integrate position with euler half a step
         # kernel 25 / 20
         wp.launch(
@@ -3275,6 +4085,9 @@ class MoreauIntegrator:
                 model.rigid_contact_point0,
                 model.rigid_contact_shape0,
                 model.shape_geo,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                model.contact_local_x_sign,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -3339,6 +4152,10 @@ class MoreauIntegrator:
         state lands in ``state_out_pred`` and is discarded by the merge for
         HOLD and WRITE-PENDING envs.
         """
+        # Ensure contact_local_x_sign is present (zeros = no x-axis filtering).
+        if not hasattr(model, "contact_local_x_sign"):
+            model.contact_local_x_sign = wp.zeros(4, dtype=wp.int32, device=model.device)
+
         device = model.device
         inner_mode = bundle_inner_mode or "soft"
         num_envs = model.articulation_count
@@ -3933,6 +4750,9 @@ class MoreauIntegrator:
                 model.rigid_contact_point0,
                 model.rigid_contact_shape0,
                 model.shape_geo,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                model.contact_local_x_sign,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -4037,6 +4857,10 @@ class MoreauIntegrator:
                 model.rigid_contact_shape0,
                 model.shape_geo,
                 model.col_height,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                model.contact_local_x_sign,
+                model.contact_local_y_sign,
             ],
             outputs=[model.Jc, model.c_body_vec, state_mid.point_vec],
             device=model.device,
@@ -4065,6 +4889,18 @@ class MoreauIntegrator:
                 state_mid.Jc_10,
                 state_mid.Jc_11,
                 state_mid.Jc_12,
+                state_mid.Jc_13,
+                state_mid.Jc_14,
+                state_mid.Jc_15,
+                state_mid.Jc_16,
+                state_mid.Jc_17,
+                state_mid.Jc_18,
+                state_mid.Jc_19,
+                state_mid.Jc_20,
+                state_mid.Jc_21,
+                state_mid.Jc_22,
+                state_mid.Jc_23,
+                state_mid.Jc_24,
             ],
             device=model.device,
         )
@@ -4262,6 +5098,198 @@ class MoreauIntegrator:
         )
 
         wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_13,
+                state_mid.tmp_13,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_13],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_14,
+                state_mid.tmp_14,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_14],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_15,
+                state_mid.tmp_15,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_15],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_16,
+                state_mid.tmp_16,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_16],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_17,
+                state_mid.tmp_17,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_17],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_18,
+                state_mid.tmp_18,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_18],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_19,
+                state_mid.tmp_19,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_19],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_20,
+                state_mid.tmp_20,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_20],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_21,
+                state_mid.tmp_21,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_21],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_22,
+                state_mid.tmp_22,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_22],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_23,
+                state_mid.tmp_23,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_23],
+            device=model.device,
+        )
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.Jc_24,
+                state_mid.tmp_24,
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t_24],
+            device=model.device,
+        )
+
+        wp.launch(
             kernel=create_matrix,
             dim=model.articulation_count,
             inputs=[
@@ -4280,6 +5308,18 @@ class MoreauIntegrator:
                 state_mid.Inv_M_times_Jc_t_10,
                 state_mid.Inv_M_times_Jc_t_11,
                 state_mid.Inv_M_times_Jc_t_12,
+                state_mid.Inv_M_times_Jc_t_13,
+                state_mid.Inv_M_times_Jc_t_14,
+                state_mid.Inv_M_times_Jc_t_15,
+                state_mid.Inv_M_times_Jc_t_16,
+                state_mid.Inv_M_times_Jc_t_17,
+                state_mid.Inv_M_times_Jc_t_18,
+                state_mid.Inv_M_times_Jc_t_19,
+                state_mid.Inv_M_times_Jc_t_20,
+                state_mid.Inv_M_times_Jc_t_21,
+                state_mid.Inv_M_times_Jc_t_22,
+                state_mid.Inv_M_times_Jc_t_23,
+                state_mid.Inv_M_times_Jc_t_24,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t],
         )
@@ -4393,11 +5433,23 @@ class MoreauIntegrator:
         )
 
     def eval_contact_forces(self, model, state_mid, dt, prox_iter, mode):
+        # Select prox kernel variant based on number of contacts per env
+        n_contacts = getattr(model, "num_contacts_per_env", 4)
+        if n_contacts >= 8:
+            _unrolled = prox_iteration_unrolled_8contacts
+            _unrolled_soft = prox_iteration_unrolled_soft_8contacts
+        elif n_contacts >= 4:
+            _unrolled = prox_iteration_unrolled
+            _unrolled_soft = prox_iteration_unrolled_soft
+        else:
+            _unrolled = prox_iteration_unrolled_2contacts
+            _unrolled_soft = prox_iteration_unrolled_soft_2contacts
+
         # prox iteration
         # kernel 7
         if mode == "hard":
             wp.launch(
-                kernel=prox_iteration_unrolled,
+                kernel=_unrolled,
                 dim=model.articulation_count,
                 inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
                 outputs=[state_mid.percussion],
@@ -4405,7 +5457,7 @@ class MoreauIntegrator:
             )
         elif mode == "soft":
             wp.launch(
-                kernel=prox_iteration_unrolled_soft,
+                kernel=_unrolled_soft,
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_count,
@@ -4422,7 +5474,7 @@ class MoreauIntegrator:
         elif mode == "mixed":
             # Soft kernel on tape (recorded for backward pass gradients)
             wp.launch(
-                kernel=prox_iteration_unrolled_soft,
+                kernel=_unrolled_soft,
                 dim=model.articulation_count,
                 inputs=[
                     model.articulation_count,
@@ -4438,7 +5490,7 @@ class MoreauIntegrator:
             )
             # Hard kernel off tape (overwrites with hard forward values, not recorded for backward)
             wp.launch(
-                kernel=prox_iteration_unrolled,
+                kernel=_unrolled,
                 dim=model.articulation_count,
                 inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
                 outputs=[state_mid.percussion],

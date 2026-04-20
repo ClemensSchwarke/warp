@@ -698,20 +698,17 @@ class Model:
 
             s.tmp = wp.zeros_like(self.joint_qd, requires_grad=True)
 
-            # rigid contact data
-            # contact points of quadruped feet
-            s.point_vec = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
-            s.percussion = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
-            # s.percussion_vec = wp.zeros(self.articulation_count*4*3, requires_grad=True)
-            s.foot_vel = wp.zeros(self.articulation_count * 4, dtype=wp.vec3, requires_grad=True)
+            # rigid contact data — 8 slots: 4 per foot x 2 feet
+            s.point_vec = wp.zeros(self.articulation_count * 8, dtype=wp.vec3, requires_grad=True)
+            s.percussion = wp.zeros((self.articulation_count, 8), dtype=wp.vec3, requires_grad=True)
+            s.foot_vel = wp.zeros(self.articulation_count * 8, dtype=wp.vec3, requires_grad=True)
 
             # compute G and c
-            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)  # maybe set to 0?
-            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
-            s.Jc_qd = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
-            s.c = wp.zeros(self.articulation_count * 4 * 3, requires_grad=True)
-            s.c_vec = wp.zeros((self.articulation_count, 4), dtype=wp.vec3, requires_grad=True)
-            # s.JcT_p = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 8 * 3, requires_grad=True)
+            s.Jc_qd = wp.zeros(self.articulation_count * 8 * 3, requires_grad=True)
+            s.c = wp.zeros(self.articulation_count * 8 * 3, requires_grad=True)
+            s.c_vec = wp.zeros((self.articulation_count, 8), dtype=wp.vec3, requires_grad=True)
             s.tmp_inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=True)
 
             s.Jc_1 = wp.zeros_like(self.joint_qd, requires_grad=True)
@@ -726,6 +723,18 @@ class Model:
             s.Jc_10 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.Jc_11 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.Jc_12 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_13 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_14 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_15 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_16 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_17 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_18 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_19 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_20 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_21 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_22 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_23 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Jc_24 = wp.zeros_like(self.joint_qd, requires_grad=True)
 
             s.Inv_M_times_Jc_t_1 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.Inv_M_times_Jc_t_2 = wp.zeros_like(self.joint_qd, requires_grad=True)
@@ -739,9 +748,21 @@ class Model:
             s.Inv_M_times_Jc_t_10 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.Inv_M_times_Jc_t_11 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.Inv_M_times_Jc_t_12 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_13 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_14 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_15 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_16 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_17 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_18 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_19 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_20 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_21 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_22 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_23 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.Inv_M_times_Jc_t_24 = wp.zeros_like(self.joint_qd, requires_grad=True)
 
             s.Inv_M_times_Jc_t = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
-            
+
             s.tmp_1 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_2 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_3 = wp.zeros_like(self.joint_qd, requires_grad=True)
@@ -754,10 +775,22 @@ class Model:
             s.tmp_10 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_11 = wp.zeros_like(self.joint_qd, requires_grad=True)
             s.tmp_12 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_13 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_14 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_15 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_16 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_17 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_18 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_19 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_20 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_21 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_22 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_23 = wp.zeros_like(self.joint_qd, requires_grad=True)
+            s.tmp_24 = wp.zeros_like(self.joint_qd, requires_grad=True)
 
             s.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             s.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            s.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
+            s.G_mat = wp.zeros((self.articulation_count, 8, 8), dtype=wp.mat33, requires_grad=True)
 
             s.toi = wp.zeros(self.articulation_count, dtype=wp.float32, requires_grad=True)
 
@@ -782,7 +815,7 @@ class Model:
             self.L = wp.zeros(self.H_size, dtype=wp.float32, requires_grad=True)
             self.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=True)
             self.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=True)
-            self.G_mat = wp.zeros((self.articulation_count, 4, 4), dtype=wp.mat33, requires_grad=True)
+            self.G_mat = wp.zeros((self.articulation_count, 8, 8), dtype=wp.mat33, requires_grad=True)
 
     def find_shape_contact_pairs(self):
         # find potential contact pairs based on collision groups and collision mask (pairwise filtering)
@@ -925,8 +958,8 @@ class Model:
         self.rigid_contact_inv_weight_prev = wp.zeros(
             len(self.body_q), dtype=wp.float32, device=self.device, requires_grad=requires_grad
         )
-        # contact bodies of quadruped feet
-        self.c_body_vec = wp.zeros(self.articulation_count * 4, dtype=wp.int32, device=self.device)
+        # contact bodies — 8 slots: 4 per foot x 2 feet
+        self.c_body_vec = wp.zeros(self.articulation_count * 8, dtype=wp.int32, device=self.device)
 
     def flatten(self):
         """Returns a list of Tensors stored by the model
@@ -4314,7 +4347,7 @@ class ModelBuilder:
                     articulation_M_start.append(m.M_size)
                     articulation_H_start.append(m.H_size)
                     articulation_Jc_start.append(m.Jc_size)
-                    for i in range(4*3):
+                    for i in range(8*3):
                         articulation_Jc_row_start.append(m.Jc_row_size)
                         m.Jc_row_size += dof_count
                     articulation_G_start.append(m.G_size)
@@ -4327,33 +4360,32 @@ class ModelBuilder:
                     articulation_H_rows.append(dof_count)
                     articulation_J_rows.append(joint_count*6)
                     articulation_J_cols.append(dof_count)
-                    articulation_Jc_rows.append(4*3)
+                    articulation_Jc_rows.append(8*3)
                     articulation_Jc_cols.append(dof_count)
-                    articulation_G_rows.append(4*3)
+                    articulation_G_rows.append(8*3)
                     articulation_vec_size.append(1)
-                    
 
                     m.J_size += 6*joint_count*dof_count
                     m.M_size += 6*joint_count*6*joint_count
                     m.H_size += dof_count*dof_count
-                    m.Jc_size += dof_count*4*3 # assuming 4 contacts per articulation
-                    m.G_size += 4*3*4*3
+                    m.Jc_size += dof_count*8*3  # 8 contact slots per articulation
+                    m.G_size += 8*3*8*3
 
-                    first_contact_dim += 4*3
+                    first_contact_dim += 8*3
 
 
                 # matrix offsets for batched gemm
                 m.articulation_J_start = wp.array(articulation_J_start, dtype=wp.int32)
                 m.articulation_M_start = wp.array(articulation_M_start, dtype=wp.int32)
                 m.articulation_H_start = wp.array(articulation_H_start, dtype=wp.int32)
-                m.articulation_H_start_matrix = wp.array([x for x in articulation_H_start for _ in range(4*3)], dtype=wp.int32)
+                m.articulation_H_start_matrix = wp.array([x for x in articulation_H_start for _ in range(8*3)], dtype=wp.int32)
                 m.articulation_Jc_start = wp.array(articulation_Jc_start, dtype=wp.int32)
                 m.articulation_Jc_row_start = wp.array(articulation_Jc_row_start, dtype=wp.int32)
                 m.articulation_G_start = wp.array(articulation_G_start, dtype=wp.int32)
                 
                 m.articulation_M_rows = wp.array(articulation_M_rows, dtype=wp.int32)
                 m.articulation_H_rows = wp.array(articulation_H_rows, dtype=wp.int32)
-                m.articulation_H_rows_matrix = wp.array([x for x in articulation_H_rows for _ in range(4*3)], dtype=wp.int32)
+                m.articulation_H_rows_matrix = wp.array([x for x in articulation_H_rows for _ in range(8*3)], dtype=wp.int32)
                 m.articulation_J_rows = wp.array(articulation_J_rows, dtype=wp.int32)
                 m.articulation_J_cols = wp.array(articulation_J_cols, dtype=wp.int32)
                 m.articulation_Jc_rows = wp.array(articulation_Jc_rows, dtype=wp.int32)
