@@ -1054,7 +1054,14 @@ def construct_contact_jacobian(
     point_vec[tid * 8 + 6] = above_ground
     point_vec[tid * 8 + 7] = above_ground
 
-    contacts_per_articulation = rigid_contact_max / articulation_count
+    # Ground contact records are written by broadphase_collision_pairs at
+    # pair_id * 2 for deterministic Jc ordering.  The records for one
+    # articulation therefore occupy two slots per non-ground shape, not an
+    # equal slice of the full rigid_contact_max capacity.  Using
+    # rigid_contact_max / articulation_count makes G1 envs after env 0 read
+    # the wrong contact slice because G1 has additional non-ground contact
+    # capacity from self-collision pairs.
+    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
 
     # Track the deepest (minimum world-Y) below-ground contact per slot.
     best_y_0 = float(col_height)
@@ -2467,26 +2474,35 @@ def get_foot_states(
     contact_body_offsets: wp.array(dtype=int),
     bodies_per_env: int,
     contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()  # articulation_count
 
-    # Pre-initialize all foot slots above ground so unused slots (e.g. slots 2,3
-    # for a 2-contact robot) are never mistaken for in-contact feet.
+    # Pre-initialize all foot slots above ground so unused slots are never
+    # mistaken for in-contact feet.
     above_ground = wp.vec3(0.0, 1.0, 0.0)
     point_vec[tid * 8 + 0] = above_ground
     point_vec[tid * 8 + 1] = above_ground
     point_vec[tid * 8 + 2] = above_ground
     point_vec[tid * 8 + 3] = above_ground
+    point_vec[tid * 8 + 4] = above_ground
+    point_vec[tid * 8 + 5] = above_ground
+    point_vec[tid * 8 + 6] = above_ground
+    point_vec[tid * 8 + 7] = above_ground
     zero_vel = wp.vec3(0.0, 0.0, 0.0)
     foot_vel[tid * 8 + 0] = zero_vel
     foot_vel[tid * 8 + 1] = zero_vel
     foot_vel[tid * 8 + 2] = zero_vel
     foot_vel[tid * 8 + 3] = zero_vel
+    foot_vel[tid * 8 + 4] = zero_vel
+    foot_vel[tid * 8 + 5] = zero_vel
+    foot_vel[tid * 8 + 6] = zero_vel
+    foot_vel[tid * 8 + 7] = zero_vel
 
-    contacts_per_articulation = rigid_contact_max / articulation_count
+    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
 
     # Track minimum world-Y contact per foot slot so that foot position and
     # velocity are always reported at the lowest (most-ground-proximal) sphere.
@@ -2497,6 +2513,10 @@ def get_foot_states(
     best_y_1 = float(1.0e6)
     best_y_2 = float(1.0e6)
     best_y_3 = float(1.0e6)
+    best_y_4 = float(1.0e6)
+    best_y_5 = float(1.0e6)
+    best_y_6 = float(1.0e6)
+    best_y_7 = float(1.0e6)
 
     for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
         contact_id = tid * contacts_per_articulation + i
@@ -2509,20 +2529,60 @@ def get_foot_states(
         foot_id = int(-1)
         if body_offset == contact_body_offsets[0]:
             xs0 = contact_local_x_sign[0]
-            if xs0 == 0 or (xs0 > 0 and c_point[0] >= float(0.0)) or (xs0 < 0 and c_point[0] < float(0.0)):
+            ys0 = contact_local_y_sign[0]
+            x_ok = xs0 == 0 or (xs0 > 0 and c_point[0] >= float(0.0)) or (xs0 < 0 and c_point[0] < float(0.0))
+            y_ok = ys0 == 0 or (ys0 > 0 and c_point[1] >= float(0.0)) or (ys0 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
                 foot_id = int(0)
         if body_offset == contact_body_offsets[1]:
             xs1 = contact_local_x_sign[1]
-            if xs1 == 0 or (xs1 > 0 and c_point[0] >= float(0.0)) or (xs1 < 0 and c_point[0] < float(0.0)):
+            ys1 = contact_local_y_sign[1]
+            x_ok = xs1 == 0 or (xs1 > 0 and c_point[0] >= float(0.0)) or (xs1 < 0 and c_point[0] < float(0.0))
+            y_ok = ys1 == 0 or (ys1 > 0 and c_point[1] >= float(0.0)) or (ys1 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
                 foot_id = int(1)
         if body_offset == contact_body_offsets[2]:
             xs2 = contact_local_x_sign[2]
-            if xs2 == 0 or (xs2 > 0 and c_point[0] >= float(0.0)) or (xs2 < 0 and c_point[0] < float(0.0)):
+            ys2 = contact_local_y_sign[2]
+            x_ok = xs2 == 0 or (xs2 > 0 and c_point[0] >= float(0.0)) or (xs2 < 0 and c_point[0] < float(0.0))
+            y_ok = ys2 == 0 or (ys2 > 0 and c_point[1] >= float(0.0)) or (ys2 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
                 foot_id = int(2)
         if body_offset == contact_body_offsets[3]:
             xs3 = contact_local_x_sign[3]
-            if xs3 == 0 or (xs3 > 0 and c_point[0] >= float(0.0)) or (xs3 < 0 and c_point[0] < float(0.0)):
+            ys3 = contact_local_y_sign[3]
+            x_ok = xs3 == 0 or (xs3 > 0 and c_point[0] >= float(0.0)) or (xs3 < 0 and c_point[0] < float(0.0))
+            y_ok = ys3 == 0 or (ys3 > 0 and c_point[1] >= float(0.0)) or (ys3 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
                 foot_id = int(3)
+        if body_offset == contact_body_offsets[4]:
+            xs4 = contact_local_x_sign[4]
+            ys4 = contact_local_y_sign[4]
+            x_ok = xs4 == 0 or (xs4 > 0 and c_point[0] >= float(0.0)) or (xs4 < 0 and c_point[0] < float(0.0))
+            y_ok = ys4 == 0 or (ys4 > 0 and c_point[1] >= float(0.0)) or (ys4 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(4)
+        if body_offset == contact_body_offsets[5]:
+            xs5 = contact_local_x_sign[5]
+            ys5 = contact_local_y_sign[5]
+            x_ok = xs5 == 0 or (xs5 > 0 and c_point[0] >= float(0.0)) or (xs5 < 0 and c_point[0] < float(0.0))
+            y_ok = ys5 == 0 or (ys5 > 0 and c_point[1] >= float(0.0)) or (ys5 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(5)
+        if body_offset == contact_body_offsets[6]:
+            xs6 = contact_local_x_sign[6]
+            ys6 = contact_local_y_sign[6]
+            x_ok = xs6 == 0 or (xs6 > 0 and c_point[0] >= float(0.0)) or (xs6 < 0 and c_point[0] < float(0.0))
+            y_ok = ys6 == 0 or (ys6 > 0 and c_point[1] >= float(0.0)) or (ys6 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(6)
+        if body_offset == contact_body_offsets[7]:
+            xs7 = contact_local_x_sign[7]
+            ys7 = contact_local_y_sign[7]
+            x_ok = xs7 == 0 or (xs7 > 0 and c_point[0] >= float(0.0)) or (xs7 < 0 and c_point[0] < float(0.0))
+            y_ok = ys7 == 0 or (ys7 > 0 and c_point[1] >= float(0.0)) or (ys7 < 0 and c_point[1] < float(0.0))
+            if x_ok and y_ok:
+                foot_id = int(7)
 
         if foot_id >= 0:
             X_s = body_X_s[c_body]  # position of colliding body
@@ -2550,6 +2610,18 @@ def get_foot_states(
                 is_best = bool(True)
             if foot_id == 3 and c < best_y_3:
                 best_y_3 = c
+                is_best = bool(True)
+            if foot_id == 4 and c < best_y_4:
+                best_y_4 = c
+                is_best = bool(True)
+            if foot_id == 5 and c < best_y_5:
+                best_y_5 = c
+                is_best = bool(True)
+            if foot_id == 6 and c < best_y_6:
+                best_y_6 = c
+                is_best = bool(True)
+            if foot_id == 7 and c < best_y_7:
+                best_y_7 = c
                 is_best = bool(True)
 
             if is_best:
@@ -3316,6 +3388,7 @@ class MoreauIntegrator:
                 model.contact_body_offsets,
                 model.bodies_per_env,
                 model.contact_local_x_sign,
+                model.contact_local_y_sign,
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
@@ -4088,6 +4161,7 @@ class MoreauIntegrator:
                 model.contact_body_offsets,
                 model.bodies_per_env,
                 model.contact_local_x_sign,
+                model.contact_local_y_sign,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -4753,6 +4827,7 @@ class MoreauIntegrator:
                 model.contact_body_offsets,
                 model.bodies_per_env,
                 model.contact_local_x_sign,
+                model.contact_local_y_sign,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
