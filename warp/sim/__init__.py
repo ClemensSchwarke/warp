@@ -45,7 +45,11 @@ from .integrator_articulation import SemiImplicitArticulationIntegrator
 
 from .integrator_moreau import MoreauIntegrator
 
+from .integrator_moreau_rough import MoreauRoughIntegrator
+
 from .integrator_toi import TOIIntegrator
+
+from .generate_terrain import generate_terrain
 
 from .collide import collide
 from .articulation import eval_fk, eval_ik

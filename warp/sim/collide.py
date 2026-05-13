@@ -968,6 +968,24 @@ def handle_contact_pairs(
         elif geo_type_b == wp.sim.GEO_PLANE:
             p_b_body = closest_point_plane(geo_scale_b[0], geo_scale_b[1], wp.transform_point(X_sw_b, p_a_world))
             p_b_world = wp.transform_point(X_ws_b, p_b_body)
+        elif geo_type_b == wp.sim.GEO_SDF:
+            volume = geo.source[shape_b]
+            query_b_local = wp.transform_point(X_sw_b, p_a_world)
+            query_sdf_index = wp.volume_world_to_index(volume, wp.cw_div(query_b_local, geo_scale_b))
+
+            grad_sdf_local = wp.vec3(0.0, 0.0, 0.0)
+            d_sdf = wp.volume_sample_grad_f(volume, query_sdf_index, wp.Volume.LINEAR, grad_sdf_local)
+            grad_sdf_local = wp.normalize(grad_sdf_local)
+
+            max_dist = (thickness_a + thickness_b + rigid_contact_margin) / min_scale_b
+
+            if d_sdf < max_dist:
+                p_b_local = query_b_local - grad_sdf_local * d_sdf
+                p_b_world = wp.transform_point(X_ws_b, p_b_local)
+            else:
+                contact_shape0[tid] = -1
+                contact_shape1[tid] = -1
+                return
         else:
             print("Unsupported geometry type in sphere collision handling")
             print(geo_type_b)
@@ -1156,6 +1174,53 @@ def handle_contact_pairs(
         # this is more reliable in practice than using the SDF gradient
         normal = wp.normalize(diff)
         distance = wp.dot(diff, normal)
+
+    elif geo_type_a == wp.sim.GEO_CAPSULE and geo_type_b == wp.sim.GEO_SDF:
+        # capsule endpoints sampled by point_id (0 or 1) → contact against SDF body B
+        half_height_a = geo_scale_a[1]
+        side = float(point_id) * 2.0 - 1.0
+        capsule_endpoint_local = wp.vec3(0.0, side * half_height_a, 0.0)
+        p_a_world = wp.transform_point(X_ws_a, capsule_endpoint_local)
+
+        query_sdf_local = wp.transform_point(X_sw_b, p_a_world)
+        query_sdf_index = wp.volume_world_to_index(
+            geo.source[shape_b], wp.cw_div(query_sdf_local, geo_scale_b)
+        )
+        grad_sdf = wp.vec3(0.0, 0.0, 0.0)
+        d_sdf = wp.volume_sample_grad_f(
+            geo.source[shape_b], query_sdf_index, wp.Volume.LINEAR, grad_sdf
+        )
+        normal_sdf_local = wp.normalize(grad_sdf)
+        normal = wp.transform_vector(X_ws_b, normal_sdf_local)
+
+        p_b_local = query_sdf_local - normal_sdf_local * d_sdf
+        p_b_world = wp.transform_point(X_ws_b, p_b_local)
+
+        # capsule-SDF distance accounts for the capsule radius (geo_scale_a[0])
+        distance = d_sdf - geo_scale_a[0]
+
+    elif geo_type_a == wp.sim.GEO_SDF and geo_type_b == wp.sim.GEO_CAPSULE:
+        # broadphase orders pairs so capsule normally appears as A; this branch is defensive
+        half_height_b = geo_scale_b[1]
+        side = float(point_id) * 2.0 - 1.0
+        capsule_endpoint_local = wp.vec3(0.0, side * half_height_b, 0.0)
+        p_b_world = wp.transform_point(X_ws_b, capsule_endpoint_local)
+
+        query_sdf_local = wp.transform_point(X_sw_a, p_b_world)
+        query_sdf_index = wp.volume_world_to_index(
+            geo.source[shape_a], wp.cw_div(query_sdf_local, geo_scale_a)
+        )
+        grad_sdf = wp.vec3(0.0, 0.0, 0.0)
+        d_sdf = wp.volume_sample_grad_f(
+            geo.source[shape_a], query_sdf_index, wp.Volume.LINEAR, grad_sdf
+        )
+        normal_sdf_local = wp.normalize(grad_sdf)
+        normal = wp.transform_vector(X_ws_a, normal_sdf_local)
+
+        p_a_local = query_sdf_local - normal_sdf_local * d_sdf
+        p_a_world = wp.transform_point(X_ws_a, p_a_local)
+
+        distance = d_sdf - geo_scale_b[0]
 
     elif geo_type_a == wp.sim.GEO_CAPSULE and geo_type_b == wp.sim.GEO_PLANE:
         plane_width = geo_scale_b[0]
