@@ -45,6 +45,19 @@ from .integrator_moreau import (
 )
 
 
+# Temporary flat-ground debug override. Set this to wp.constant(0) to use the
+# collision normals from wp.sim.collide again.
+# MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
+MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
+
+
+@wp.func
+def _rough_contact_normal(collision_normal: wp.vec3) -> wp.vec3:
+    if MOREAU_ROUGH_FORCE_FLAT_NORMAL:
+        return wp.vec3(0.0, 1.0, 0.0)
+    return collision_normal
+
+
 # Active warp lacks the `Integrator` base class and `Control` dataclass that
 # warp-new introduced. Provide the minimum stubs the rough integrator needs.
 class Integrator:
@@ -1877,6 +1890,8 @@ def construct_contact_jacobian(
                 shape_id_other = rigid_contact_shape0[contact_idx]
 
             if process_contact:
+                c_normal = _rough_contact_normal(c_normal)
+
                 # 3. Physics Filtering
                 # Filter A: Static Contact Check. 
                 # We only want contacts against the environment (negative body index or outside range),
@@ -2072,6 +2087,8 @@ def schedule_contacts(
                 shape_id_other = rigid_contact_shape0[i]
                 c_body_other = body_0
 
+            c_normal = _rough_contact_normal(c_normal)
+
             # Calculate Distance
             safe_shape_id = 0
             if shape_id >= 0 and shape_id < shape_count: safe_shape_id = shape_id
@@ -2219,6 +2236,8 @@ def schedule_contacts_8(
                 shape_id_other = rigid_contact_shape0[i]
                 c_body_other = body_0
 
+            c_normal = _rough_contact_normal(c_normal)
+
             safe_shape_id = 0
             if shape_id >= 0 and shape_id < shape_count: safe_shape_id = shape_id
 
@@ -2333,6 +2352,154 @@ def schedule_contacts_8(
         contact_schedule[bi_6] = 6
     if bi_7 != -1:
         contact_schedule[bi_7] = 7
+
+
+@wp.kernel
+def get_foot_states_rough(
+    rigid_contact_count: wp.array(dtype=int),
+    articulation_count: int,
+    num_contacts: int,
+    body_X_s: wp.array(dtype=wp.transform),
+    body_v_s: wp.array(dtype=wp.spatial_vector),
+    contact_body: wp.array(dtype=int),
+    contact_point: wp.array(dtype=wp.vec3),
+    contact_shape: wp.array(dtype=int),
+    geo: ModelShapeGeometry,
+    contact_body_offsets: wp.array(dtype=int),
+    bodies_per_env: int,
+    contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
+    point_vec: wp.array(dtype=wp.vec3),
+    foot_vel: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+
+    above_ground = wp.vec3(0.0, 1.0, 0.0)
+    zero_vel = wp.vec3(0.0, 0.0, 0.0)
+    for slot in range(8):
+        if slot < num_contacts:
+            point_vec[tid * num_contacts + slot] = above_ground
+            foot_vel[tid * num_contacts + slot] = zero_vel
+
+    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
+    total_contacts = rigid_contact_count[0]
+
+    best_y_0 = float(1.0e6)
+    best_y_1 = float(1.0e6)
+    best_y_2 = float(1.0e6)
+    best_y_3 = float(1.0e6)
+    best_y_4 = float(1.0e6)
+    best_y_5 = float(1.0e6)
+    best_y_6 = float(1.0e6)
+    best_y_7 = float(1.0e6)
+
+    for i in range(2, contacts_per_articulation):
+        contact_id = tid * contacts_per_articulation + i
+        if contact_id < total_contacts:
+            c_body = contact_body[contact_id]
+            if c_body >= 0:
+                c_point = contact_point[contact_id]
+                c_shape = contact_shape[contact_id]
+                c_dist = geo.thickness[c_shape]
+
+                body_offset = c_body - tid * bodies_per_env
+                foot_id = int(-1)
+
+                if num_contacts > 0 and body_offset == contact_body_offsets[0]:
+                    xs = contact_local_x_sign[0]
+                    ys = contact_local_y_sign[0]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(0)
+                if num_contacts > 1 and body_offset == contact_body_offsets[1]:
+                    xs = contact_local_x_sign[1]
+                    ys = contact_local_y_sign[1]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(1)
+                if num_contacts > 2 and body_offset == contact_body_offsets[2]:
+                    xs = contact_local_x_sign[2]
+                    ys = contact_local_y_sign[2]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(2)
+                if num_contacts > 3 and body_offset == contact_body_offsets[3]:
+                    xs = contact_local_x_sign[3]
+                    ys = contact_local_y_sign[3]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(3)
+                if num_contacts > 4 and body_offset == contact_body_offsets[4]:
+                    xs = contact_local_x_sign[4]
+                    ys = contact_local_y_sign[4]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(4)
+                if num_contacts > 5 and body_offset == contact_body_offsets[5]:
+                    xs = contact_local_x_sign[5]
+                    ys = contact_local_y_sign[5]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(5)
+                if num_contacts > 6 and body_offset == contact_body_offsets[6]:
+                    xs = contact_local_x_sign[6]
+                    ys = contact_local_y_sign[6]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(6)
+                if num_contacts > 7 and body_offset == contact_body_offsets[7]:
+                    xs = contact_local_x_sign[7]
+                    ys = contact_local_y_sign[7]
+                    x_ok = xs == 0 or (xs > 0 and c_point[0] >= float(0.0)) or (xs < 0 and c_point[0] < float(0.0))
+                    y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
+                    if x_ok and y_ok:
+                        foot_id = int(7)
+
+                if foot_id >= 0 and foot_id < num_contacts:
+                    X_s = body_X_s[c_body]
+                    v_s = body_v_s[c_body]
+                    n = wp.vec3(0.0, 1.0, 0.0)
+                    p = wp.transform_point(X_s, c_point) - n * c_dist
+                    c = wp.dot(n, p)
+
+                    is_best = bool(False)
+                    if foot_id == 0 and c < best_y_0:
+                        best_y_0 = c
+                        is_best = bool(True)
+                    if foot_id == 1 and c < best_y_1:
+                        best_y_1 = c
+                        is_best = bool(True)
+                    if foot_id == 2 and c < best_y_2:
+                        best_y_2 = c
+                        is_best = bool(True)
+                    if foot_id == 3 and c < best_y_3:
+                        best_y_3 = c
+                        is_best = bool(True)
+                    if foot_id == 4 and c < best_y_4:
+                        best_y_4 = c
+                        is_best = bool(True)
+                    if foot_id == 5 and c < best_y_5:
+                        best_y_5 = c
+                        is_best = bool(True)
+                    if foot_id == 6 and c < best_y_6:
+                        best_y_6 = c
+                        is_best = bool(True)
+                    if foot_id == 7 and c < best_y_7:
+                        best_y_7 = c
+                        is_best = bool(True)
+
+                    if is_best:
+                        w = wp.spatial_top(v_s)
+                        v = wp.spatial_bottom(v_s)
+                        point_vec[tid * num_contacts + foot_id] = p
+                        foot_vel[tid * num_contacts + foot_id] = v + wp.cross(w, p)
 
 
 @wp.func
@@ -4673,6 +4840,28 @@ class MoreauRoughIntegrator(Integrator):
                         state_out.body_v_s,
                     ],
                     outputs=[state_out.body_q, state_out.body_qd],
+                    device=model.device,
+                )
+
+                wp.launch(
+                    kernel=get_foot_states_rough,
+                    dim=model.articulation_count,
+                    inputs=[
+                        model.rigid_contact_count,
+                        model.articulation_count,
+                        self.num_contacts,
+                        state_out.body_X_sc,
+                        state_out.body_v_s,
+                        self.rigid_contact_body0,
+                        model.rigid_contact_point0,
+                        model.rigid_contact_shape0,
+                        model.shape_geo,
+                        model.contact_body_offsets,
+                        model.bodies_per_env,
+                        model.contact_local_x_sign,
+                        model.contact_local_y_sign,
+                    ],
+                    outputs=[state_out.point_vec, state_out.foot_vel],
                     device=model.device,
                 )
 
