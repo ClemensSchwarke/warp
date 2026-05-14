@@ -195,7 +195,10 @@ class Mesh:
         self.has_inertia = compute_inertia
 
         if compute_inertia:
-            self.mass, self.com, self.I, _ = compute_mesh_inertia(1.0, vertices, indices, is_solid=is_solid)
+            # Pass the already-flattened indices array (self.indices) so the
+            # 1D-only compute_solid_mesh_inertia / compute_hollow_mesh_inertia
+            # kernels accept it.
+            self.mass, self.com, self.I, _ = compute_mesh_inertia(1.0, self.vertices, self.indices, is_solid=is_solid)
         else:
             self.I = np.eye(3, dtype=np.float32)
             self.mass = 1.0

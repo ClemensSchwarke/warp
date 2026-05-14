@@ -74,6 +74,9 @@ uniform vec3 viewPos;
 uniform vec3 lightColor;
 uniform vec3 sunDirection;
 
+uniform sampler2D albedoMap;
+uniform int useAlbedoTex;  // 0 = checker (ObjectColor1/2), 1 = sample albedoMap
+
 void main()
 {
     float ambientStrength = 0.3;
@@ -98,20 +101,25 @@ void main()
     spec = pow(max(dot(viewDir, reflectDir), 0.0), 64);
     specular += specularStrength * spec * lightColor * 0.3;
 
-    // checkerboard pattern
-    float u = TexCoord.x;
-    float v = TexCoord.y;
-    // blend the checkerboard pattern dependent on the gradient of the texture coordinates
-    // to void Moire patterns
-    vec2 grad = abs(dFdx(TexCoord)) + abs(dFdy(TexCoord));
-    float blendRange = 1.5;
-    float blendFactor = max(grad.x, grad.y) * blendRange;
-    float scale = 2.0;
-    float checker = mod(floor(u * scale) + floor(v * scale), 2.0);
-    checker = mix(checker, 0.5, smoothstep(0.0, 1.0, blendFactor));
-    vec3 checkerColor = mix(ObjectColor1, ObjectColor2, checker);
+    vec3 baseColor;
+    if (useAlbedoTex == 1) {
+        baseColor = texture(albedoMap, TexCoord).rgb;
+    } else {
+        // checkerboard pattern
+        float u = TexCoord.x;
+        float v = TexCoord.y;
+        // blend the checkerboard pattern dependent on the gradient of the texture coordinates
+        // to void Moire patterns
+        vec2 grad = abs(dFdx(TexCoord)) + abs(dFdy(TexCoord));
+        float blendRange = 1.5;
+        float blendFactor = max(grad.x, grad.y) * blendRange;
+        float scale = 2.0;
+        float checker = mod(floor(u * scale) + floor(v * scale), 2.0);
+        checker = mix(checker, 0.5, smoothstep(0.0, 1.0, blendFactor));
+        baseColor = mix(ObjectColor1, ObjectColor2, checker);
+    }
 
-    vec3 result = (ambient + diffuse + specular) * checkerColor;
+    vec3 result = (ambient + diffuse + specular) * baseColor;
     FragColor = vec4(result, 1.0);
 }
 """
@@ -923,6 +931,17 @@ class OpenGLRenderer:
             self._loc_shape_projection = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("projection"))
             self._loc_shape_view_pos = gl.glGetUniformLocation(self._shape_shader.id, str_buffer("viewPos"))
             gl.glUniform3f(self._loc_shape_view_pos, 0, 0, 10)
+            # Optional per-shape albedo texture support
+            self._loc_use_albedo_tex = gl.glGetUniformLocation(
+                self._shape_shader.id, str_buffer("useAlbedoTex")
+            )
+            self._loc_albedo_map = gl.glGetUniformLocation(
+                self._shape_shader.id, str_buffer("albedoMap")
+            )
+            gl.glUniform1i(self._loc_use_albedo_tex, 0)
+        # shape index -> GL texture object id. Shapes registered without a
+        # texture are not present here and fall back to the checker shader path.
+        self._shape_textures = {}
 
         # create grid data
         limit = 10.0
@@ -1646,12 +1665,26 @@ Instances: {len(self._instances)}"""
         for shape, (vao, _, _, tri_count, _) in self._shape_gl_buffers.items():
             num_instances = len(self._shape_instances[shape])
 
+            # Per-shape albedo texture binding (falls back to checker path).
+            tex_id = self._shape_textures.get(shape)
+            if tex_id is not None:
+                gl.glActiveTexture(gl.GL_TEXTURE0)
+                gl.glBindTexture(gl.GL_TEXTURE_2D, tex_id)
+                gl.glUniform1i(self._loc_albedo_map, 0)
+                gl.glUniform1i(self._loc_use_albedo_tex, 1)
+            else:
+                gl.glUniform1i(self._loc_use_albedo_tex, 0)
+
             gl.glBindVertexArray(vao)
             gl.glDrawElementsInstancedBaseInstance(
                 gl.GL_TRIANGLES, tri_count, gl.GL_UNSIGNED_INT, None, num_instances, start_instance_idx
             )
 
             start_instance_idx += num_instances
+
+        # Reset to the checker path so subsequent draws (axes, points, lines)
+        # don't accidentally sample the last-bound texture.
+        gl.glUniform1i(self._loc_use_albedo_tex, 0)
 
         if self.draw_axis:
             self._axis_instancer.render()
@@ -1709,6 +1742,7 @@ Instances: {len(self._instances)}"""
 
     def _mouse_drag_callback(self, x, y, dx, dy, buttons, modifiers):
         import pyglet
+        from pyglet.math import Vec3 as PyVec3
 
         if buttons & pyglet.window.mouse.LEFT:
             sensitivity = 0.1
@@ -1720,10 +1754,16 @@ Instances: {len(self._instances)}"""
 
             self._pitch = max(min(self._pitch, 89.0), -89.0)
 
-            self._camera_front.x = np.cos(np.deg2rad(self._yaw)) * np.cos(np.deg2rad(self._pitch))
-            self._camera_front.y = np.sin(np.deg2rad(self._pitch))
-            self._camera_front.z = np.sin(np.deg2rad(self._yaw)) * np.cos(np.deg2rad(self._pitch))
-            self._camera_front = self._camera_front.normalize()
+            # pyglet >= 2.1 made Vec3 immutable, so construct a new vector
+            # instead of assigning to .x / .y / .z in place.
+            yaw_r = np.deg2rad(self._yaw)
+            pitch_r = np.deg2rad(self._pitch)
+            cos_pitch = np.cos(pitch_r)
+            self._camera_front = PyVec3(
+                float(np.cos(yaw_r) * cos_pitch),
+                float(np.sin(pitch_r)),
+                float(np.sin(yaw_r) * cos_pitch),
+            ).normalize()
             self.update_view_matrix()
 
     def _scroll_callback(self, x, y, scroll_x, scroll_y):
@@ -1776,7 +1816,7 @@ Instances: {len(self._instances)}"""
         self.update_projection_matrix()
         self._setup_framebuffer()
 
-    def register_shape(self, geo_hash, vertices, indices, color1=None, color2=None):
+    def register_shape(self, geo_hash, vertices, indices, color1=None, color2=None, texture_image=None):
         from pyglet import gl
 
         shape = len(self._shapes)
@@ -1787,6 +1827,14 @@ Instances: {len(self._instances)}"""
         # TODO check if we actually need to store the shape data
         self._shapes.append((vertices, indices, color1, color2, geo_hash))
         self._shape_geo_hash[geo_hash] = shape
+
+        # Optional albedo texture binding for this shape. We upload the image as
+        # a GL texture and remember its id in self._shape_textures; the draw
+        # loop binds the texture and toggles `useAlbedoTex` on/off accordingly.
+        if texture_image is not None:
+            tex_id = self._upload_texture(texture_image)
+            if tex_id is not None:
+                self._shape_textures[shape] = tex_id
 
         gl.glUseProgram(self._shape_shader.id)
 
@@ -2006,6 +2054,37 @@ Instances: {len(self._instances)}"""
         if isinstance(body, int):
             return body
         return self._body_name[body]
+
+    def _upload_texture(self, pil_image):
+        """Upload a PIL image as an RGB(A) OpenGL texture. Returns texture id or None."""
+        from pyglet import gl
+
+        try:
+            from PIL import Image as _PILImage
+
+            img = pil_image.convert("RGBA")
+            # PIL row 0 is the TOP of the image; OpenGL texture origin is the
+            # BOTTOM-left. Flip vertically so the resulting texture aligns with
+            # the (0,0)-at-bottom UV convention used by the DAE files we load.
+            img = img.transpose(_PILImage.FLIP_TOP_BOTTOM)
+        except Exception:
+            return None
+        w, h = img.size
+        data = img.tobytes()
+
+        tex_id = gl.GLuint()
+        gl.glGenTextures(1, tex_id)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, tex_id)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
+        gl.glTexImage2D(
+            gl.GL_TEXTURE_2D, 0, gl.GL_RGBA, w, h, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, data
+        )
+        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+        gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
+        return tex_id.value
 
     def is_running(self):
         return not self.app.event_loop.has_exit
@@ -2397,6 +2476,8 @@ Instances: {len(self._instances)}"""
         parent_body: str = None,
         is_template: bool = False,
         smooth_shading: bool = True,
+        uvs=None,
+        texture_image=None,
     ):
         """Add a mesh for visualization
 
@@ -2421,7 +2502,16 @@ Instances: {len(self._instances)}"""
             shape = self._instances[name][2]
             self.update_shape_vertices(shape, points)
             return
-        geo_hash = hash((points.tobytes(), indices.tobytes(), colors.tobytes()))
+        uvs_arr = None
+        if uvs is not None:
+            uvs_arr = np.asarray(uvs, dtype=np.float32).reshape(-1, 2)
+            if len(uvs_arr) != len(points):
+                uvs_arr = None  # mismatch -> ignore
+        # Include the uvs in the geo_hash so two visually-different mappings on
+        # the same geometry produce different cached shapes.
+        uv_bytes = uvs_arr.tobytes() if uvs_arr is not None else b""
+        tex_marker = id(texture_image) if texture_image is not None else 0
+        geo_hash = hash((points.tobytes(), indices.tobytes(), colors.tobytes(), uv_bytes, tex_marker))
         if geo_hash in self._shape_geo_hash:
             shape = self._shape_geo_hash[geo_hash]
             if self.update_shape_instance(name, pos, rot):
@@ -2445,6 +2535,8 @@ Instances: {len(self._instances)}"""
                     outputs=[gfx_vertices],
                 )
                 gfx_vertices = gfx_vertices.numpy()
+                if uvs_arr is not None:
+                    gfx_vertices[:, 6:8] = uvs_arr
                 gfx_indices = indices.flatten()
             else:
                 gfx_vertices = wp.zeros((len(indices) * 3, 8), dtype=float)
@@ -2455,8 +2547,15 @@ Instances: {len(self._instances)}"""
                     outputs=[gfx_vertices],
                 )
                 gfx_vertices = gfx_vertices.numpy()
+                if uvs_arr is not None:
+                    # flat-shading expands every face vertex; remap UVs accordingly
+                    face_idx = indices.flatten()
+                    if len(face_idx) == len(gfx_vertices) and len(uvs_arr) >= face_idx.max() + 1:
+                        gfx_vertices[:, 6:8] = uvs_arr[face_idx]
                 gfx_indices = np.arange(len(indices) * 3)
-            shape = self.register_shape(geo_hash, gfx_vertices, gfx_indices)
+            shape = self.register_shape(
+                geo_hash, gfx_vertices, gfx_indices, texture_image=texture_image
+            )
         if not is_template:
             body = self._resolve_body_id(parent_body)
             self.add_shape_instance(name, shape, body, pos, rot)

@@ -183,7 +183,11 @@ def parse_urdf(
                     for geom in m.geometry.values():
                         vertices = np.array(geom.vertices, dtype=np.float32) * scaling
                         faces = np.array(geom.faces, dtype=np.int32)
-                        mesh = Mesh(vertices, faces)
+                        # compute_inertia=False: body mass/inertia comes from
+                        # URDF <inertial> tags (handled below by
+                        # `ignore_inertial_definitions`); skipping the mesh
+                        # inertia kernel launch avoids redundant work.
+                        mesh = Mesh(vertices, faces, compute_inertia=False)
                         builder.add_shape_mesh(
                             body=link,
                             pos=tf.p,
@@ -201,7 +205,12 @@ def parse_urdf(
                     # a single mesh
                     vertices = np.array(m.vertices, dtype=np.float32) * scaling
                     faces = np.array(m.faces, dtype=np.int32)
-                    mesh = Mesh(vertices, faces)
+                    # compute_inertia=False: body mass/inertia comes from the
+                    # URDF <inertial> tags (see `ignore_inertial_definitions`
+                    # handling below); skipping the mesh inertia computation
+                    # avoids a redundant kernel launch (and historically caused
+                    # a 2D-vs-1D indices kernel crash).
+                    mesh = Mesh(vertices, faces, compute_inertia=False)
                     builder.add_shape_mesh(
                         body=link,
                         pos=tf.p,
