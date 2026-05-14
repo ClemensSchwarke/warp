@@ -856,11 +856,14 @@ def broadphase_collision_pairs(
         if index + num_contacts - 1 >= rigid_contact_max:
             print("Number of rigid contacts exceeded limit. Increase Model.rigid_contact_max.")
             return
-        # allocate contact points
-        for i in range(num_contacts):   # modified to always have the same order for Jc
-            contact_shape0[tid*2 + i] = actual_shape_a
-            contact_shape1[tid*2 + i] = actual_shape_b
-            contact_point_id[tid*2 + i] = i
+        # allocate contact points into the contiguous range reserved above.
+        # SDF pairs can contribute 1 (sphere), 2 (capsule), or 8 (box)
+        # contacts, so indexing by `tid * 2` corrupts neighboring pairs and
+        # leaves valid reserved slots uninitialized.
+        for i in range(num_contacts):
+            contact_shape0[index + i] = actual_shape_a
+            contact_shape1[index + i] = actual_shape_b
+            contact_point_id[index + i] = i
 
 
 @wp.kernel
@@ -982,6 +985,8 @@ def handle_contact_pairs(
             if d_sdf < max_dist:
                 p_b_local = query_b_local - grad_sdf_local * d_sdf
                 p_b_world = wp.transform_point(X_ws_b, p_b_local)
+                normal = wp.normalize(wp.transform_vector(X_ws_b, grad_sdf_local))
+                distance = d_sdf
             else:
                 contact_shape0[tid] = -1
                 contact_shape1[tid] = -1
@@ -990,9 +995,10 @@ def handle_contact_pairs(
             print("Unsupported geometry type in sphere collision handling")
             print(geo_type_b)
             return
-        diff = p_a_world - p_b_world
-        normal = wp.normalize(diff)
-        distance = wp.dot(diff, normal)
+        if geo_type_b != wp.sim.GEO_SDF:
+            diff = p_a_world - p_b_world
+            normal = wp.normalize(diff)
+            distance = wp.dot(diff, normal)
 
     elif geo_type_a == wp.sim.GEO_BOX and geo_type_b == wp.sim.GEO_BOX:
         # edge-based box contact
@@ -1305,6 +1311,27 @@ def handle_contact_pairs(
             contact_shape0[tid] = -1
             contact_shape1[tid] = -1
             return
+
+    elif geo_type_a == wp.sim.GEO_BOX and geo_type_b == wp.sim.GEO_SDF:
+        # vertex-based contact against SDF body B
+        p_a_body = get_box_vertex(point_id, geo_scale_a)
+        p_a_world = wp.transform_point(X_ws_a, p_a_body)
+
+        query_sdf_local = wp.transform_point(X_sw_b, p_a_world)
+        query_sdf_index = wp.volume_world_to_index(
+            geo.source[shape_b], wp.cw_div(query_sdf_local, geo_scale_b)
+        )
+        grad_sdf_local = wp.vec3(0.0, 0.0, 0.0)
+        d_sdf = wp.volume_sample_grad_f(
+            geo.source[shape_b], query_sdf_index, wp.Volume.LINEAR, grad_sdf_local
+        )
+        grad_sdf_local = wp.normalize(grad_sdf_local)
+        normal = wp.normalize(wp.transform_vector(X_ws_b, grad_sdf_local))
+
+        p_b_local = query_sdf_local - grad_sdf_local * d_sdf
+        p_b_world = wp.transform_point(X_ws_b, p_b_local)
+
+        distance = d_sdf
 
     elif geo_type_a == wp.sim.GEO_MESH and geo_type_b == wp.sim.GEO_MESH:
         # vertex-based contact

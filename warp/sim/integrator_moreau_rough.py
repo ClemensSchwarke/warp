@@ -1833,6 +1833,14 @@ def construct_contact_jacobian(
     Jc_offset = Jc_start[tid]
     art_start = articulation_start[tid]
 
+    for slot_id in range(8):
+        if slot_id < num_contacts:
+            slot_vec_idx = tid * num_contacts + slot_id
+            c_body_vec[slot_vec_idx] = -1
+            point_vec[slot_vec_idx] = wp.vec3(0.0)
+            contact_normals[slot_vec_idx] = wp.vec3(0.0, 1.0, 0.0)
+            ground_point_vec[slot_vec_idx] = wp.vec3(0.0)
+
     total_contacts = rigid_contact_count[0]
     
     # Iterate contacts to find ones scheduled for THIS articulation (tid)
@@ -1891,6 +1899,8 @@ def construct_contact_jacobian(
 
             if process_contact:
                 c_normal = _rough_contact_normal(c_normal)
+                normal_ok = wp.dot(c_normal, c_normal) > 1.0e-6 and c_normal[1] > 0.0
+                shape_ok = shape_id >= 0 and shape_id < shape_count
 
                 # 3. Physics Filtering
                 # Filter A: Static Contact Check. 
@@ -1945,31 +1955,22 @@ def construct_contact_jacobian(
 
                 topology_ok = (
                     is_static_contact
+                    and normal_ok
+                    and shape_ok
                     and raw_joint >= 0
                     and local_joint_idx >= 0
                     and local_joint_idx < num_joints_in_art
                 )
 
-                # ---- Hard activation gate (matches active moreau's gradient flow) ----
-                # We use a hard `dist <= col_height` branch identical in spirit
-                # to active moreau's `c < best_y_X` test. Warp's autograd does
-                # NOT propagate gradient through the branch condition, so the
-                # discontinuity in the forward Jc only manifests as a piecewise
-                # change at the boundary — no delta-shaped adjoint. Crucially,
-                # the gate value (0 or 1) does not flow through `dist`, so Jc's
-                # gradient w.r.t. body_X_sc only goes through `p_surface` via
-                # `p_skew`, exactly like active moreau. A previous version used
-                # a sigmoid `1/(1+exp((dist-col_height)/smoothing))` — even
-                # when nominally close to 1, that variant introduced an extra
-                # gradient path d(gate)/d(body_X_sc) that compounded across
-                # substeps and made rough's per-step amplification ~2× larger
-                # than moreau's (a 14× ratio at 100 steps). Going hard restores
-                # parity.
+                # Hard activation gate. Collision generation may report
+                # far-away pairs because the CRBA path uses a huge broadphase
+                # margin; only actual touching/penetrating contacts should
+                # enter the Moreau solve.
                 gate = float(0.0)
                 if topology_ok and dist <= col_height:
                     gate = 1.0
 
-                # 4. Write Jc rows scaled by the smooth gate.
+                # 4. Write Jc rows scaled by the activation gate.
                 p_skew = wp.skew(p_surface)
                 for j in range(3):
                     for k in range(dof_count):
@@ -2005,10 +2006,9 @@ def construct_contact_jacobian(
                         Jc_idx = Jc_offset + _dense_index_rough(dof_count, slot * 3 + j, k)
                         Jc[Jc_idx] = gate * Jc_val
 
-                # Metadata. We still record the contact body/point for the
-                # solver, but a vanishing gate means the row contribution is
-                # already zero in Jc.
-                if topology_ok:
+                # Only active contacts are exported to the solver/force
+                # accumulator. Inactive broadphase candidates stay at -1.
+                if topology_ok and gate > 0.0:
                     c_body_vec[tid * num_contacts + slot] = target_body
                     point_vec[tid * num_contacts + slot] = p_surface
                     contact_normals[tid * num_contacts + slot] = c_normal
@@ -2046,16 +2046,14 @@ def schedule_contacts(
     total_contacts = rigid_contact_count[0]
     limit = wp.min(total_contacts, max_contacts)
 
-    # Local buffer to store the best 4 contacts found so far
-    # Stores the Contact Index (global index i)
+    # Select the four deepest static contacts, but keep only one contact per
+    # dynamic body. This preserves the generalized "deepest contacts" behavior
+    # while preventing repeated candidate points from one limb/body from
+    # starving the remaining slots.
     best_indices = wp.vec4i(-1, -1, -1, -1)
-    # Stores the Distance (for selection purposes)
     best_dists = wp.vec4(1.0e6, 1.0e6, 1.0e6, 1.0e6)
-    # Stores the Shape ID (for sorting purposes)
-    best_shapes = wp.vec4i(2147483647, 2147483647, 2147483647, 2147483647) # Max int
+    best_keys = wp.vec4i(-1, -1, -1, -1)
 
-    # --- PHASE 1: SELECTION (Distance-Based) ---
-    # Find the 4 deepest contacts
     for i in range(limit):
         
         # 1. Check Ownership
@@ -2088,83 +2086,80 @@ def schedule_contacts(
                 c_body_other = body_0
 
             c_normal = _rough_contact_normal(c_normal)
+            normal_ok = wp.dot(c_normal, c_normal) > 1.0e-6 and c_normal[1] > 0.0
+            shape_ok = shape_id >= 0 and shape_id < shape_count
 
-            # Calculate Distance
-            safe_shape_id = 0
-            if shape_id >= 0 and shape_id < shape_count: safe_shape_id = shape_id
-            
-            X_s = body_q[target_body]
-            p_world = wp.transform_point(X_s, c_point_local)
-            p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
+            is_static_contact = (c_body_other < 0) or (c_body_other >= body_count)
+            if is_static_contact and normal_ok and shape_ok:
+                safe_shape_id = shape_id
 
-            p_world_other = c_point_local_other
-            if c_body_other >= 0 and c_body_other < body_count:
-                X_s_other = body_q[c_body_other]
-                p_world_other = wp.transform_point(X_s_other, c_point_local_other)
-            
-            safe_shape_id_other = 0
-            if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
-            
-            p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
-            
-            dist = wp.dot(c_normal, p_surface - p_surface_other)
+                X_s = body_q[target_body]
+                p_world = wp.transform_point(X_s, c_point_local)
+                p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
 
-            # 3. Insertion Sort (By Distance)
-            # We want the 4 smallest distances
-            insert_val = dist
-            insert_idx = i
-            insert_shape = shape_id
+                p_world_other = c_point_local_other
+                safe_shape_id_other = 0
+                if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
 
-            for k in range(4):
-                if insert_val < best_dists[k]:
-                    # Swap distance
-                    temp_val = best_dists[k]
-                    best_dists[k] = insert_val
-                    insert_val = temp_val
-                    
-                    # Swap index
-                    temp_idx = best_indices[k]
-                    best_indices[k] = insert_idx
-                    insert_idx = temp_idx
+                p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
+                dist = wp.dot(c_normal, p_surface - p_surface_other)
 
-                    # Swap shape
-                    temp_shape = best_shapes[k]
-                    best_shapes[k] = insert_shape
-                    insert_shape = temp_shape
+                # Existing body: keep its deepest point only.
+                duplicate_slot = int(-1)
+                for k in range(4):
+                    if best_keys[k] == target_body:
+                        duplicate_slot = k
 
-    # --- PHASE 2: SORTING (Shape-Based) ---
-    # Now we have the best 4, but they are sorted by distance.
-    # We must Bubble Sort them by shape_id to ensure deterministic slot assignment.
-    # (Since N=4, bubble sort is very fast and easy to unroll)
-    
+                if duplicate_slot >= 0:
+                    if dist < best_dists[duplicate_slot]:
+                        best_dists[duplicate_slot] = dist
+                        best_indices[duplicate_slot] = i
+                else:
+                    insert_val = dist
+                    insert_idx = i
+                    insert_key = target_body
+                    for k in range(4):
+                        if insert_val < best_dists[k]:
+                            temp_val = best_dists[k]
+                            best_dists[k] = insert_val
+                            insert_val = temp_val
+
+                            temp_idx = best_indices[k]
+                            best_indices[k] = insert_idx
+                            insert_idx = temp_idx
+
+                            temp_key = best_keys[k]
+                            best_keys[k] = insert_key
+                            insert_key = temp_key
+
+    # Deterministic slot assignment after deepest-contact selection. Empty
+    # slots sort to the end.
     for i in range(3):
         for j in range(3 - i):
             k = j + 1
-            # Sort valid contacts by shape ID
-            # If indices are -1 (empty), push them to the end (large shape ID)
-            
-            s1 = best_shapes[j]
-            s2 = best_shapes[k]
-            
-            if s1 > s2:
-                # Swap everything
-                ts = best_shapes[j]
-                best_shapes[j] = best_shapes[k]
-                best_shapes[k] = ts
-                
-                ti = best_indices[j]
-                best_indices[j] = best_indices[k]
-                best_indices[k] = ti
-                
-                # (Distance doesn't need swapping anymore as it's not used for the final slot output,
-                # but good for debugging if needed)
+            key_j = best_keys[j]
+            key_k = best_keys[k]
+            if best_indices[j] == -1:
+                key_j = 2147483647
+            if best_indices[k] == -1:
+                key_k = 2147483647
 
-    # --- PHASE 3: ASSIGNMENT ---
+            if key_j > key_k:
+                temp_key = best_keys[j]
+                best_keys[j] = best_keys[k]
+                best_keys[k] = temp_key
+
+                temp_idx = best_indices[j]
+                best_indices[j] = best_indices[k]
+                best_indices[k] = temp_idx
+
+                temp_dist = best_dists[j]
+                best_dists[j] = best_dists[k]
+                best_dists[k] = temp_dist
+
     for k in range(4):
         contact_idx = best_indices[k]
         if contact_idx != -1:
-            # Assign slot 'k' to this contact index
-            # Now 'k' is determined by Shape ID rank, not Distance rank!
             contact_schedule[contact_idx] = k
 
 
@@ -2187,11 +2182,9 @@ def schedule_contacts_8(
     # Outputs
     contact_schedule: wp.array(dtype=int),
 ):
-    # 8-slot variant of schedule_contacts (used by G1, which has 4 contact
-    # spheres per foot × 2 feet). Functionally identical to schedule_contacts
-    # except the per-thread "best 8" buffer is held as 8 scalar variables
-    # since wp.vec4i / wp.vec4 can't be widened to 8 elements without a custom
-    # vector type (and Warp's selection-sort idiom is easier to audit unrolled).
+    # 8-slot variant. Use shape id as the uniqueness key so multi-sphere feet
+    # such as G1 can keep separate contact points on the same body, while
+    # duplicate endpoints from the same collision shape collapse to one slot.
     tid = wp.tid()
 
     total_contacts = rigid_contact_count[0]
@@ -2206,10 +2199,9 @@ def schedule_contacts_8(
     bd_0 = float(1.0e6); bd_1 = float(1.0e6); bd_2 = float(1.0e6); bd_3 = float(1.0e6)
     bd_4 = float(1.0e6); bd_5 = float(1.0e6); bd_6 = float(1.0e6); bd_7 = float(1.0e6)
 
-    bs_0 = int(2147483647); bs_1 = int(2147483647); bs_2 = int(2147483647); bs_3 = int(2147483647)
-    bs_4 = int(2147483647); bs_5 = int(2147483647); bs_6 = int(2147483647); bs_7 = int(2147483647)
+    bk_0 = int(-1); bk_1 = int(-1); bk_2 = int(-1); bk_3 = int(-1)
+    bk_4 = int(-1); bk_5 = int(-1); bk_6 = int(-1); bk_7 = int(-1)
 
-    # --- PHASE 1: SELECTION (Distance-Based) ---
     for i in range(limit):
         body_0 = rigid_contact_body0[i]
         body_1 = rigid_contact_body1[i]
@@ -2237,105 +2229,155 @@ def schedule_contacts_8(
                 c_body_other = body_0
 
             c_normal = _rough_contact_normal(c_normal)
+            normal_ok = wp.dot(c_normal, c_normal) > 1.0e-6 and c_normal[1] > 0.0
+            shape_ok = shape_id >= 0 and shape_id < shape_count
 
-            safe_shape_id = 0
-            if shape_id >= 0 and shape_id < shape_count: safe_shape_id = shape_id
+            is_static_contact = (c_body_other < 0) or (c_body_other >= body_count)
+            if is_static_contact and normal_ok and shape_ok:
+                safe_shape_id = shape_id
 
-            X_s = body_q[target_body]
-            p_world = wp.transform_point(X_s, c_point_local)
-            p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
+                X_s = body_q[target_body]
+                p_world = wp.transform_point(X_s, c_point_local)
+                p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
 
-            p_world_other = c_point_local_other
-            if c_body_other >= 0 and c_body_other < body_count:
-                X_s_other = body_q[c_body_other]
-                p_world_other = wp.transform_point(X_s_other, c_point_local_other)
+                p_world_other = c_point_local_other
+                safe_shape_id_other = 0
+                if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
 
-            safe_shape_id_other = 0
-            if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
+                p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
+                dist = wp.dot(c_normal, p_surface - p_surface_other)
 
-            p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
+                duplicate_slot = int(-1)
+                if bk_0 == shape_id: duplicate_slot = 0
+                if bk_1 == shape_id: duplicate_slot = 1
+                if bk_2 == shape_id: duplicate_slot = 2
+                if bk_3 == shape_id: duplicate_slot = 3
+                if bk_4 == shape_id: duplicate_slot = 4
+                if bk_5 == shape_id: duplicate_slot = 5
+                if bk_6 == shape_id: duplicate_slot = 6
+                if bk_7 == shape_id: duplicate_slot = 7
 
-            dist = wp.dot(c_normal, p_surface - p_surface_other)
+                if duplicate_slot == 0 and dist < bd_0:
+                    bd_0 = dist; bi_0 = i
+                if duplicate_slot == 1 and dist < bd_1:
+                    bd_1 = dist; bi_1 = i
+                if duplicate_slot == 2 and dist < bd_2:
+                    bd_2 = dist; bi_2 = i
+                if duplicate_slot == 3 and dist < bd_3:
+                    bd_3 = dist; bi_3 = i
+                if duplicate_slot == 4 and dist < bd_4:
+                    bd_4 = dist; bi_4 = i
+                if duplicate_slot == 5 and dist < bd_5:
+                    bd_5 = dist; bi_5 = i
+                if duplicate_slot == 6 and dist < bd_6:
+                    bd_6 = dist; bi_6 = i
+                if duplicate_slot == 7 and dist < bd_7:
+                    bd_7 = dist; bi_7 = i
 
-            # 3. Insertion sort (by distance) into the 8-element buffer.
-            insert_val = dist
-            insert_idx = i
-            insert_shape = shape_id
+                if duplicate_slot == -1:
+                    insert_val = dist
+                    insert_idx = i
+                    insert_key = shape_id
 
-            # Slot 0
-            if insert_val < bd_0:
-                tv = bd_0; bd_0 = insert_val; insert_val = tv
-                ti = bi_0; bi_0 = insert_idx; insert_idx = ti
-                ts = bs_0; bs_0 = insert_shape; insert_shape = ts
-            # Slot 1
-            if insert_val < bd_1:
-                tv = bd_1; bd_1 = insert_val; insert_val = tv
-                ti = bi_1; bi_1 = insert_idx; insert_idx = ti
-                ts = bs_1; bs_1 = insert_shape; insert_shape = ts
-            # Slot 2
-            if insert_val < bd_2:
-                tv = bd_2; bd_2 = insert_val; insert_val = tv
-                ti = bi_2; bi_2 = insert_idx; insert_idx = ti
-                ts = bs_2; bs_2 = insert_shape; insert_shape = ts
-            # Slot 3
-            if insert_val < bd_3:
-                tv = bd_3; bd_3 = insert_val; insert_val = tv
-                ti = bi_3; bi_3 = insert_idx; insert_idx = ti
-                ts = bs_3; bs_3 = insert_shape; insert_shape = ts
-            # Slot 4
-            if insert_val < bd_4:
-                tv = bd_4; bd_4 = insert_val; insert_val = tv
-                ti = bi_4; bi_4 = insert_idx; insert_idx = ti
-                ts = bs_4; bs_4 = insert_shape; insert_shape = ts
-            # Slot 5
-            if insert_val < bd_5:
-                tv = bd_5; bd_5 = insert_val; insert_val = tv
-                ti = bi_5; bi_5 = insert_idx; insert_idx = ti
-                ts = bs_5; bs_5 = insert_shape; insert_shape = ts
-            # Slot 6
-            if insert_val < bd_6:
-                tv = bd_6; bd_6 = insert_val; insert_val = tv
-                ti = bi_6; bi_6 = insert_idx; insert_idx = ti
-                ts = bs_6; bs_6 = insert_shape; insert_shape = ts
-            # Slot 7
-            if insert_val < bd_7:
-                tv = bd_7; bd_7 = insert_val; insert_val = tv
-                ti = bi_7; bi_7 = insert_idx; insert_idx = ti
-                ts = bs_7; bs_7 = insert_shape; insert_shape = ts
+                    if insert_val < bd_0:
+                        tv = bd_0; bd_0 = insert_val; insert_val = tv
+                        ti = bi_0; bi_0 = insert_idx; insert_idx = ti
+                        tk = bk_0; bk_0 = insert_key; insert_key = tk
+                    if insert_val < bd_1:
+                        tv = bd_1; bd_1 = insert_val; insert_val = tv
+                        ti = bi_1; bi_1 = insert_idx; insert_idx = ti
+                        tk = bk_1; bk_1 = insert_key; insert_key = tk
+                    if insert_val < bd_2:
+                        tv = bd_2; bd_2 = insert_val; insert_val = tv
+                        ti = bi_2; bi_2 = insert_idx; insert_idx = ti
+                        tk = bk_2; bk_2 = insert_key; insert_key = tk
+                    if insert_val < bd_3:
+                        tv = bd_3; bd_3 = insert_val; insert_val = tv
+                        ti = bi_3; bi_3 = insert_idx; insert_idx = ti
+                        tk = bk_3; bk_3 = insert_key; insert_key = tk
+                    if insert_val < bd_4:
+                        tv = bd_4; bd_4 = insert_val; insert_val = tv
+                        ti = bi_4; bi_4 = insert_idx; insert_idx = ti
+                        tk = bk_4; bk_4 = insert_key; insert_key = tk
+                    if insert_val < bd_5:
+                        tv = bd_5; bd_5 = insert_val; insert_val = tv
+                        ti = bi_5; bi_5 = insert_idx; insert_idx = ti
+                        tk = bk_5; bk_5 = insert_key; insert_key = tk
+                    if insert_val < bd_6:
+                        tv = bd_6; bd_6 = insert_val; insert_val = tv
+                        ti = bi_6; bi_6 = insert_idx; insert_idx = ti
+                        tk = bk_6; bk_6 = insert_key; insert_key = tk
+                    if insert_val < bd_7:
+                        tv = bd_7; bd_7 = insert_val; insert_val = tv
+                        ti = bi_7; bi_7 = insert_idx; insert_idx = ti
+                        tk = bk_7; bk_7 = insert_key; insert_key = tk
 
-    # --- PHASE 2: SORT BY SHAPE ID (deterministic slot assignment) ---
-    # Bubble-sort the 8 elements by shape ID. Unrolled.
+    # Deterministic slot assignment after deepest-contact selection. Empty
+    # slots sort to the end.
     for _outer in range(7):
-        # 0/1
-        if bs_0 > bs_1:
-            t = bs_0; bs_0 = bs_1; bs_1 = t
+        key_a = bk_0
+        key_b = bk_1
+        if bi_0 == -1: key_a = 2147483647
+        if bi_1 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_0; bk_0 = bk_1; bk_1 = t
             t = bi_0; bi_0 = bi_1; bi_1 = t
-        # 1/2
-        if bs_1 > bs_2:
-            t = bs_1; bs_1 = bs_2; bs_2 = t
-            t = bi_1; bi_1 = bi_2; bi_2 = t
-        # 2/3
-        if bs_2 > bs_3:
-            t = bs_2; bs_2 = bs_3; bs_3 = t
-            t = bi_2; bi_2 = bi_3; bi_3 = t
-        # 3/4
-        if bs_3 > bs_4:
-            t = bs_3; bs_3 = bs_4; bs_4 = t
-            t = bi_3; bi_3 = bi_4; bi_4 = t
-        # 4/5
-        if bs_4 > bs_5:
-            t = bs_4; bs_4 = bs_5; bs_5 = t
-            t = bi_4; bi_4 = bi_5; bi_5 = t
-        # 5/6
-        if bs_5 > bs_6:
-            t = bs_5; bs_5 = bs_6; bs_6 = t
-            t = bi_5; bi_5 = bi_6; bi_6 = t
-        # 6/7
-        if bs_6 > bs_7:
-            t = bs_6; bs_6 = bs_7; bs_7 = t
-            t = bi_6; bi_6 = bi_7; bi_7 = t
+            tv = bd_0; bd_0 = bd_1; bd_1 = tv
 
-    # --- PHASE 3: ASSIGNMENT ---
+        key_a = bk_1
+        key_b = bk_2
+        if bi_1 == -1: key_a = 2147483647
+        if bi_2 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_1; bk_1 = bk_2; bk_2 = t
+            t = bi_1; bi_1 = bi_2; bi_2 = t
+            tv = bd_1; bd_1 = bd_2; bd_2 = tv
+
+        key_a = bk_2
+        key_b = bk_3
+        if bi_2 == -1: key_a = 2147483647
+        if bi_3 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_2; bk_2 = bk_3; bk_3 = t
+            t = bi_2; bi_2 = bi_3; bi_3 = t
+            tv = bd_2; bd_2 = bd_3; bd_3 = tv
+
+        key_a = bk_3
+        key_b = bk_4
+        if bi_3 == -1: key_a = 2147483647
+        if bi_4 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_3; bk_3 = bk_4; bk_4 = t
+            t = bi_3; bi_3 = bi_4; bi_4 = t
+            tv = bd_3; bd_3 = bd_4; bd_4 = tv
+
+        key_a = bk_4
+        key_b = bk_5
+        if bi_4 == -1: key_a = 2147483647
+        if bi_5 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_4; bk_4 = bk_5; bk_5 = t
+            t = bi_4; bi_4 = bi_5; bi_5 = t
+            tv = bd_4; bd_4 = bd_5; bd_5 = tv
+
+        key_a = bk_5
+        key_b = bk_6
+        if bi_5 == -1: key_a = 2147483647
+        if bi_6 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_5; bk_5 = bk_6; bk_6 = t
+            t = bi_5; bi_5 = bi_6; bi_6 = t
+            tv = bd_5; bd_5 = bd_6; bd_6 = tv
+
+        key_a = bk_6
+        key_b = bk_7
+        if bi_6 == -1: key_a = 2147483647
+        if bi_7 == -1: key_b = 2147483647
+        if key_a > key_b:
+            t = bk_6; bk_6 = bk_7; bk_7 = t
+            t = bi_6; bi_6 = bi_7; bi_7 = t
+            tv = bd_6; bd_6 = bd_7; bd_7 = tv
+
     if bi_0 != -1:
         contact_schedule[bi_0] = 0
     if bi_1 != -1:
@@ -2799,6 +2841,7 @@ def prox_iteration_unrolled_soft(
     mu: float,
     prox_iter: int,
     scale_array: wp.array(dtype=float),
+    activation_offset: float,
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
@@ -2852,13 +2895,13 @@ def prox_iteration_unrolled_soft(
     #     tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_0, c_1, c_2, c_3, scale, mu, prox_iter, p_0, p_1, p_2, p_3
     # )
     p_0, p_1, p_2, p_3 = prox_loop_soft(
-        tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, n0, n1, n2, n3, c_0, c_1, c_2, c_3, scale, mu, prox_iter, p_0, p_1, p_2, p_3
+        tid, G_mat, c_vec_0, c_vec_1, c_vec_2, c_vec_3, n0, n1, n2, n3, c_0, c_1, c_2, c_3, scale, activation_offset, mu, prox_iter, p_0, p_1, p_2, p_3
     )
 
-    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, 0.0)
-    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, 0.0)
-    percussion[tid, 2] = p_2 * offset_sigmoid(c_2, scale, 0.0)
-    percussion[tid, 3] = p_3 * offset_sigmoid(c_3, scale, 0.0)
+    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, activation_offset)
+    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, activation_offset)
+    percussion[tid, 2] = p_2 * offset_sigmoid(c_2, scale, activation_offset)
+    percussion[tid, 3] = p_3 * offset_sigmoid(c_3, scale, activation_offset)
 
 
 @wp.kernel
@@ -3095,6 +3138,7 @@ def prox_loop_soft(
     c_2: float,
     c_3: float,
     scale: float,
+    activation_offset: float,
     mu: float,
     prox_iter: int,
     p_0: wp.vec3,
@@ -3113,11 +3157,11 @@ def prox_loop_soft(
 
         sum += G_mat[tid, 0, 0] * p_0
         r_sum += wp.determinant(G_mat[tid, 0, 0])
-        sum += G_mat[tid, 0, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0)
+        sum += G_mat[tid, 0, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 0, 1])
-        sum += G_mat[tid, 0, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0)
+        sum += G_mat[tid, 0, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 0, 2])
-        sum += G_mat[tid, 0, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0)
+        sum += G_mat[tid, 0, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 0, 3])
 
         r = 1.0 / (STABILITY_ADDITION + r_sum)  # +1 for stability
@@ -3146,13 +3190,13 @@ def prox_loop_soft(
         sum = wp.vec3(0.0, 0.0, 0.0)
         r_sum = 0.0
 
-        sum += G_mat[tid, 1, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0)
+        sum += G_mat[tid, 1, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 1, 0])
         sum += G_mat[tid, 1, 1] * p_1
         r_sum += wp.determinant(G_mat[tid, 1, 1])
-        sum += G_mat[tid, 1, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0)
+        sum += G_mat[tid, 1, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 1, 2])
-        sum += G_mat[tid, 1, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0)
+        sum += G_mat[tid, 1, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 1, 3])
 
         r = 1.0 / (STABILITY_ADDITION + r_sum)  # +1 for stability
@@ -3181,13 +3225,13 @@ def prox_loop_soft(
         sum = wp.vec3(0.0, 0.0, 0.0)
         r_sum = 0.0
 
-        sum += G_mat[tid, 2, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0)
+        sum += G_mat[tid, 2, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 2, 0])
-        sum += G_mat[tid, 2, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0)
+        sum += G_mat[tid, 2, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 2, 1])
         sum += G_mat[tid, 2, 2] * p_2
         r_sum += wp.determinant(G_mat[tid, 2, 2])
-        sum += G_mat[tid, 2, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0)
+        sum += G_mat[tid, 2, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 2, 3])
 
         r = 1.0 / (STABILITY_ADDITION + r_sum)  # +1 for stability
@@ -3216,11 +3260,11 @@ def prox_loop_soft(
         sum = wp.vec3(0.0, 0.0, 0.0)
         r_sum = 0.0
 
-        sum += G_mat[tid, 3, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0)
+        sum += G_mat[tid, 3, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 3, 0])
-        sum += G_mat[tid, 3, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0)
+        sum += G_mat[tid, 3, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 3, 1])
-        sum += G_mat[tid, 3, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0)
+        sum += G_mat[tid, 3, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset)
         r_sum += wp.determinant(G_mat[tid, 3, 2])
         sum += G_mat[tid, 3, 3] * p_3
         r_sum += wp.determinant(G_mat[tid, 3, 3])
@@ -3514,6 +3558,7 @@ def prox_loop_soft_8(
     c_0: float, c_1: float, c_2: float, c_3: float,
     c_4: float, c_5: float, c_6: float, c_7: float,
     scale: float,
+    activation_offset: float,
     mu: float,
     prox_iter: int,
     p_0: wp.vec3, p_1: wp.vec3, p_2: wp.vec3, p_3: wp.vec3,
@@ -3524,13 +3569,13 @@ def prox_loop_soft_8(
         # CONTACT 0
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
         sum += G_mat[tid, 0, 0] * p_0;                                       r_sum += wp.determinant(G_mat[tid, 0, 0])
-        sum += G_mat[tid, 0, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 1])
-        sum += G_mat[tid, 0, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 2])
-        sum += G_mat[tid, 0, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 3])
-        sum += G_mat[tid, 0, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 4])
-        sum += G_mat[tid, 0, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 5])
-        sum += G_mat[tid, 0, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 6])
-        sum += G_mat[tid, 0, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 0, 7])
+        sum += G_mat[tid, 0, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 1])
+        sum += G_mat[tid, 0, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 2])
+        sum += G_mat[tid, 0, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 3])
+        sum += G_mat[tid, 0, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 4])
+        sum += G_mat[tid, 0, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 5])
+        sum += G_mat[tid, 0, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 6])
+        sum += G_mat[tid, 0, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 0, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_0 = p_0 - r * (sum + c_vec_0)
         p_n = wp.dot(n0, p_0)
@@ -3547,14 +3592,14 @@ def prox_loop_soft_8(
 
         # CONTACT 1
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 1, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 0])
+        sum += G_mat[tid, 1, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 0])
         sum += G_mat[tid, 1, 1] * p_1;                                       r_sum += wp.determinant(G_mat[tid, 1, 1])
-        sum += G_mat[tid, 1, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 2])
-        sum += G_mat[tid, 1, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 3])
-        sum += G_mat[tid, 1, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 4])
-        sum += G_mat[tid, 1, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 5])
-        sum += G_mat[tid, 1, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 6])
-        sum += G_mat[tid, 1, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 1, 7])
+        sum += G_mat[tid, 1, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 2])
+        sum += G_mat[tid, 1, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 3])
+        sum += G_mat[tid, 1, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 4])
+        sum += G_mat[tid, 1, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 5])
+        sum += G_mat[tid, 1, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 6])
+        sum += G_mat[tid, 1, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 1, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_1 = p_1 - r * (sum + c_vec_1)
         p_n = wp.dot(n1, p_1)
@@ -3571,14 +3616,14 @@ def prox_loop_soft_8(
 
         # CONTACT 2
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 2, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 0])
-        sum += G_mat[tid, 2, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 1])
+        sum += G_mat[tid, 2, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 0])
+        sum += G_mat[tid, 2, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 1])
         sum += G_mat[tid, 2, 2] * p_2;                                       r_sum += wp.determinant(G_mat[tid, 2, 2])
-        sum += G_mat[tid, 2, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 3])
-        sum += G_mat[tid, 2, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 4])
-        sum += G_mat[tid, 2, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 5])
-        sum += G_mat[tid, 2, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 6])
-        sum += G_mat[tid, 2, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 2, 7])
+        sum += G_mat[tid, 2, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 3])
+        sum += G_mat[tid, 2, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 4])
+        sum += G_mat[tid, 2, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 5])
+        sum += G_mat[tid, 2, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 6])
+        sum += G_mat[tid, 2, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 2, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_2 = p_2 - r * (sum + c_vec_2)
         p_n = wp.dot(n2, p_2)
@@ -3595,14 +3640,14 @@ def prox_loop_soft_8(
 
         # CONTACT 3
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 3, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 0])
-        sum += G_mat[tid, 3, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 1])
-        sum += G_mat[tid, 3, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 2])
+        sum += G_mat[tid, 3, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 0])
+        sum += G_mat[tid, 3, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 1])
+        sum += G_mat[tid, 3, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 2])
         sum += G_mat[tid, 3, 3] * p_3;                                       r_sum += wp.determinant(G_mat[tid, 3, 3])
-        sum += G_mat[tid, 3, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 4])
-        sum += G_mat[tid, 3, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 5])
-        sum += G_mat[tid, 3, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 6])
-        sum += G_mat[tid, 3, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 3, 7])
+        sum += G_mat[tid, 3, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 4])
+        sum += G_mat[tid, 3, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 5])
+        sum += G_mat[tid, 3, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 6])
+        sum += G_mat[tid, 3, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 3, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_3 = p_3 - r * (sum + c_vec_3)
         p_n = wp.dot(n3, p_3)
@@ -3619,14 +3664,14 @@ def prox_loop_soft_8(
 
         # CONTACT 4
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 4, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 0])
-        sum += G_mat[tid, 4, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 1])
-        sum += G_mat[tid, 4, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 2])
-        sum += G_mat[tid, 4, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 3])
+        sum += G_mat[tid, 4, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 0])
+        sum += G_mat[tid, 4, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 1])
+        sum += G_mat[tid, 4, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 2])
+        sum += G_mat[tid, 4, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 3])
         sum += G_mat[tid, 4, 4] * p_4;                                       r_sum += wp.determinant(G_mat[tid, 4, 4])
-        sum += G_mat[tid, 4, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 5])
-        sum += G_mat[tid, 4, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 6])
-        sum += G_mat[tid, 4, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 4, 7])
+        sum += G_mat[tid, 4, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 5])
+        sum += G_mat[tid, 4, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 6])
+        sum += G_mat[tid, 4, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 4, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_4 = p_4 - r * (sum + c_vec_4)
         p_n = wp.dot(n4, p_4)
@@ -3643,14 +3688,14 @@ def prox_loop_soft_8(
 
         # CONTACT 5
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 5, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 0])
-        sum += G_mat[tid, 5, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 1])
-        sum += G_mat[tid, 5, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 2])
-        sum += G_mat[tid, 5, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 3])
-        sum += G_mat[tid, 5, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 4])
+        sum += G_mat[tid, 5, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 0])
+        sum += G_mat[tid, 5, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 1])
+        sum += G_mat[tid, 5, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 2])
+        sum += G_mat[tid, 5, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 3])
+        sum += G_mat[tid, 5, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 4])
         sum += G_mat[tid, 5, 5] * p_5;                                       r_sum += wp.determinant(G_mat[tid, 5, 5])
-        sum += G_mat[tid, 5, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 6])
-        sum += G_mat[tid, 5, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 5, 7])
+        sum += G_mat[tid, 5, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 6])
+        sum += G_mat[tid, 5, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 5, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_5 = p_5 - r * (sum + c_vec_5)
         p_n = wp.dot(n5, p_5)
@@ -3667,14 +3712,14 @@ def prox_loop_soft_8(
 
         # CONTACT 6
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 6, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 0])
-        sum += G_mat[tid, 6, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 1])
-        sum += G_mat[tid, 6, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 2])
-        sum += G_mat[tid, 6, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 3])
-        sum += G_mat[tid, 6, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 4])
-        sum += G_mat[tid, 6, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 5])
+        sum += G_mat[tid, 6, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 0])
+        sum += G_mat[tid, 6, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 1])
+        sum += G_mat[tid, 6, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 2])
+        sum += G_mat[tid, 6, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 3])
+        sum += G_mat[tid, 6, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 4])
+        sum += G_mat[tid, 6, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 5])
         sum += G_mat[tid, 6, 6] * p_6;                                       r_sum += wp.determinant(G_mat[tid, 6, 6])
-        sum += G_mat[tid, 6, 7] * p_7 * offset_sigmoid(c_7, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 6, 7])
+        sum += G_mat[tid, 6, 7] * p_7 * offset_sigmoid(c_7, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 6, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_6 = p_6 - r * (sum + c_vec_6)
         p_n = wp.dot(n6, p_6)
@@ -3691,13 +3736,13 @@ def prox_loop_soft_8(
 
         # CONTACT 7
         sum = wp.vec3(0.0, 0.0, 0.0); r_sum = 0.0
-        sum += G_mat[tid, 7, 0] * p_0 * offset_sigmoid(c_0, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 0])
-        sum += G_mat[tid, 7, 1] * p_1 * offset_sigmoid(c_1, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 1])
-        sum += G_mat[tid, 7, 2] * p_2 * offset_sigmoid(c_2, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 2])
-        sum += G_mat[tid, 7, 3] * p_3 * offset_sigmoid(c_3, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 3])
-        sum += G_mat[tid, 7, 4] * p_4 * offset_sigmoid(c_4, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 4])
-        sum += G_mat[tid, 7, 5] * p_5 * offset_sigmoid(c_5, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 5])
-        sum += G_mat[tid, 7, 6] * p_6 * offset_sigmoid(c_6, scale, 0.0);     r_sum += wp.determinant(G_mat[tid, 7, 6])
+        sum += G_mat[tid, 7, 0] * p_0 * offset_sigmoid(c_0, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 0])
+        sum += G_mat[tid, 7, 1] * p_1 * offset_sigmoid(c_1, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 1])
+        sum += G_mat[tid, 7, 2] * p_2 * offset_sigmoid(c_2, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 2])
+        sum += G_mat[tid, 7, 3] * p_3 * offset_sigmoid(c_3, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 3])
+        sum += G_mat[tid, 7, 4] * p_4 * offset_sigmoid(c_4, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 4])
+        sum += G_mat[tid, 7, 5] * p_5 * offset_sigmoid(c_5, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 5])
+        sum += G_mat[tid, 7, 6] * p_6 * offset_sigmoid(c_6, scale, activation_offset);     r_sum += wp.determinant(G_mat[tid, 7, 6])
         sum += G_mat[tid, 7, 7] * p_7;                                       r_sum += wp.determinant(G_mat[tid, 7, 7])
         r = 1.0 / (STABILITY_ADDITION + r_sum)
         p_7 = p_7 - r * (sum + c_vec_7)
@@ -3778,6 +3823,7 @@ def prox_iteration_unrolled_soft_8(
     mu: float,
     prox_iter: int,
     scale_array: wp.array(dtype=float),
+    activation_offset: float,
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
@@ -3842,18 +3888,18 @@ def prox_iteration_unrolled_soft_8(
         c_vec_0, c_vec_1, c_vec_2, c_vec_3, c_vec_4, c_vec_5, c_vec_6, c_vec_7,
         n0, n1, n2, n3, n4, n5, n6, n7,
         c_0, c_1, c_2, c_3, c_4, c_5, c_6, c_7,
-        scale, mu, prox_iter,
+        scale, activation_offset, mu, prox_iter,
         p_0, p_1, p_2, p_3, p_4, p_5, p_6, p_7,
     )
 
-    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, 0.0)
-    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, 0.0)
-    percussion[tid, 2] = p_2 * offset_sigmoid(c_2, scale, 0.0)
-    percussion[tid, 3] = p_3 * offset_sigmoid(c_3, scale, 0.0)
-    percussion[tid, 4] = p_4 * offset_sigmoid(c_4, scale, 0.0)
-    percussion[tid, 5] = p_5 * offset_sigmoid(c_5, scale, 0.0)
-    percussion[tid, 6] = p_6 * offset_sigmoid(c_6, scale, 0.0)
-    percussion[tid, 7] = p_7 * offset_sigmoid(c_7, scale, 0.0)
+    percussion[tid, 0] = p_0 * offset_sigmoid(c_0, scale, activation_offset)
+    percussion[tid, 1] = p_1 * offset_sigmoid(c_1, scale, activation_offset)
+    percussion[tid, 2] = p_2 * offset_sigmoid(c_2, scale, activation_offset)
+    percussion[tid, 3] = p_3 * offset_sigmoid(c_3, scale, activation_offset)
+    percussion[tid, 4] = p_4 * offset_sigmoid(c_4, scale, activation_offset)
+    percussion[tid, 5] = p_5 * offset_sigmoid(c_5, scale, activation_offset)
+    percussion[tid, 6] = p_6 * offset_sigmoid(c_6, scale, activation_offset)
+    percussion[tid, 7] = p_7 * offset_sigmoid(c_7, scale, activation_offset)
 
 @wp.kernel
 def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), G_mat: wp.array3d(dtype=wp.mat33)):
@@ -4297,7 +4343,7 @@ class MoreauRoughIntegrator(Integrator):
                 device=model.device,
             )
 
-            self.col_height = 1.0
+            self.col_height = 0.0
 
             # Create body contact arrays
             self.rigid_contact_body0 = wp.empty_like(model.rigid_contact_shape0)
@@ -5206,10 +5252,21 @@ class MoreauRoughIntegrator(Integrator):
                 prox_iteration_unrolled_soft if self.num_contacts == 4
                 else prox_iteration_unrolled_soft_8
             )
+            activation_offset = 0.0
             wp.launch(
                 kernel=soft_kernel,
                 dim=model.articulation_count,
-                inputs=[state_mid.point_vec, state_mid.ground_point_vec, self.G_mat, state_mid.c_vec, state_mid.contact_normals, mu, prox_iter, self.sigmoid_scale],
+                inputs=[
+                    state_mid.point_vec,
+                    state_mid.ground_point_vec,
+                    self.G_mat,
+                    state_mid.c_vec,
+                    state_mid.contact_normals,
+                    mu,
+                    prox_iter,
+                    self.sigmoid_scale,
+                    activation_offset,
+                ],
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
