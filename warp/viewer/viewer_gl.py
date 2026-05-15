@@ -42,13 +42,23 @@ _TERRAIN_COLOR = (0.50, 0.50, 0.50)    # light grey rough terrain (albedo;
                                         # diffuse + a second diffuse + specular,
                                         # so anything > ~0.55 saturates to white)
 _CONTACT_COLOR = (1.00, 0.40, 0.00)    # orange
-_NORMAL_COLOR = (1.00, 0.95, 0.20)     # bright yellow
+_NORMAL_COLOR = (1.00, 0.10, 0.10)     # red (contact normal arrows)
 
 # Sky / ground colors (modeled on newton viewer's neutral palette).
 _SKY_COLOR = (0.22, 0.24, 0.28)        # dark blue-grey background
 _SKY_HAZE = (0.40, 0.42, 0.48)         # lighter neutral haze near the horizon
 _GROUND_TILE_A = (0.38, 0.40, 0.43)    # darker tile
 _GROUND_TILE_B = (0.30, 0.32, 0.34)    # secondary tile
+
+
+# NOTE: the contact-filter Warp kernel lives in ``contact_filter.py`` instead
+# of this module. ``from __future__ import annotations`` (top of this file)
+# stringifies type annotations, which breaks Warp's kernel signature parser —
+# it fails to recognise ``wp.array(...)`` as an array type and raises
+# "Can only subscript assign array, vector, and matrix types" on the first
+# ``out[tid] = ...`` line. The sibling module deliberately omits that future
+# import so kernel parameter types stay as real objects.
+from .contact_filter import filter_ground_contacts_kernel as _filter_ground_contacts_kernel
 
 
 class _NeutralSimRendererOpenGL:
@@ -90,19 +100,33 @@ class ViewerGL(ViewerBase):
         fps: int = 60,
         up_axis: str = "Y",
         show_contacts: bool = True,
+        show_normals: bool = True,
         show_joints: bool = False,
         screen_width: int = 1280,
         screen_height: int = 720,
         scaling: float = 1.0,
         contact_points_radius: float = 0.02,
+        contact_normal_length: float = 0.15,
+        contact_normal_radius: float = 0.006,
+        contact_activation_dist: float = 1.0e-3,
+        contact_dedup_radius: float = 0.015,
         urdf_path: Optional[str] = None,
         urdf_scale: float = 1.0,
         hide_collision_shapes: bool = False,
     ):
         super().__init__()
         self.model = model
+        # User-toggleable display flags. The base SimRenderer's built-in
+        # contact spheres (which draw all broadphase candidates as two spheres
+        # per pair) are disabled below — we replace them with a filtered
+        # one-sphere-per-actual-ground-contact view.
         self.show_contacts = show_contacts
+        self.show_normals = show_normals
         self._contact_points_radius = contact_points_radius
+        self._contact_normal_length = contact_normal_length
+        self._contact_normal_radius = contact_normal_radius
+        self._contact_activation_dist = contact_activation_dist
+        self._contact_dedup_radius = contact_dedup_radius
 
         # Build a SimRendererOpenGL subclass that uses a neutral colour for
         # collision shapes instead of cycling tab10. SimRendererOpenGL forwards
@@ -114,11 +138,11 @@ class ViewerGL(ViewerBase):
             scaling=scaling,
             fps=fps,
             up_axis=up_axis,
-            # When show_contacts=True, the underlying SimRenderer.render() will
-            # transform model.rigid_contact_point0/1 into world coordinates
-            # every frame and draw them as orange/blue points. Users can still
-            # call viewer.log_contacts(...) for custom contact sets.
-            show_rigid_contact_points=show_contacts,
+            # We always disable the base SimRenderer's broadphase contact
+            # spheres — it draws all candidate pairs (two spheres each) whether
+            # in contact or not. Our own filtered pipeline runs in log_state()
+            # below and emits one sphere per *active* ground contact.
+            show_rigid_contact_points=False,
             contact_points_radius=contact_points_radius,
             show_joints=show_joints,
             screen_width=screen_width,
@@ -144,6 +168,25 @@ class ViewerGL(ViewerBase):
         if urdf_path is not None:
             self._register_urdf_visuals(urdf_path, urdf_scale)
 
+        # Persistent device buffers for the filtered ground-contact pipeline.
+        # Sized to rigid_contact_max so we can launch one thread per broadphase
+        # slot; inactive slots are written as a sentinel and dropped on host.
+        rcm = int(getattr(model, "rigid_contact_max", 0) or 0)
+        self._filter_max = rcm
+        if rcm > 0:
+            self._filtered_pos = wp.zeros(rcm, dtype=wp.vec3, device=model.device)
+            self._filtered_normal = wp.zeros(rcm, dtype=wp.vec3, device=model.device)
+            self._filtered_body = wp.zeros(rcm, dtype=wp.int32, device=model.device)
+        else:
+            self._filtered_pos = None
+            self._filtered_normal = None
+            self._filtered_body = None
+
+        # Register a key handler for toggle keys. Pyglet supports multiple
+        # on_key_press handlers via push_handlers; the base renderer already
+        # registered its own (ESC/SPACE/...), so this one runs alongside.
+        self._sim_renderer.window.push_handlers(on_key_press=self._on_key_press)
+
     # ------------------------------------------------------------------
     # frame lifecycle
     # ------------------------------------------------------------------
@@ -159,6 +202,7 @@ class ViewerGL(ViewerBase):
     # ------------------------------------------------------------------
     def log_state(self, state: warp.sim.State) -> None:
         self._sim_renderer.render(state)
+        self._render_filtered_ground_contacts(state)
 
     def log_terrain(self, vertices, indices, name: str = "terrain") -> None:
         if self._terrain_logged:
@@ -258,6 +302,182 @@ class ViewerGL(ViewerBase):
             color1=color,
             color2=color,
         )
+
+    # ------------------------------------------------------------------
+    # filtered ground-contact rendering
+    # ------------------------------------------------------------------
+    _CONTACT_SPHERE_INSTANCER = "ground_contact_points"
+    _CONTACT_NORMAL_INSTANCER = "ground_contact_normals"
+
+    def _render_filtered_ground_contacts(self, state: warp.sim.State) -> None:
+        """Filter the broadphase contact buffer to actual ground contacts and
+        render one sphere + one red normal arrow per contact. Skips work for
+        whichever toggle is off, and removes any stale instancer so toggling
+        off hides the geometry immediately.
+        """
+        if not self.show_contacts and not self.show_normals:
+            self._drop_instancer(self._CONTACT_SPHERE_INSTANCER)
+            self._drop_instancer(self._CONTACT_NORMAL_INSTANCER)
+            return
+        if self._filter_max <= 0:
+            return
+        model = self.model
+        if model is None or not getattr(model, "rigid_contact_max", 0):
+            return
+
+        wp.launch(
+            kernel=_filter_ground_contacts_kernel,
+            dim=self._filter_max,
+            inputs=[
+                state.body_q,
+                model.shape_body,
+                model.shape_geo.thickness,
+                model.rigid_contact_count,
+                model.rigid_contact_shape0,
+                model.rigid_contact_shape1,
+                model.rigid_contact_point0,
+                model.rigid_contact_point1,
+                model.rigid_contact_normal,
+                float(self._contact_activation_dist),
+            ],
+            outputs=[self._filtered_pos, self._filtered_normal, self._filtered_body],
+            device=model.device,
+        )
+
+        pos = self._filtered_pos.numpy()
+        nrm = self._filtered_normal.numpy()
+        bod = self._filtered_body.numpy()
+        # Sentinel-filter (kernel writes -1e8 / -1 for inactive slots).
+        valid = (pos[:, 1] > -1.0e7) & (bod >= 0)
+        pos = pos[valid]
+        nrm = nrm[valid]
+        bod = bod[valid]
+
+        # Deduplicate by *spatial location*: the broadphase occasionally
+        # emits multiple slots at the same contact point (anymal point feet
+        # see this), but G1's foot legitimately produces several contacts at
+        # distinct corners of the same body. Per-body dedup would collapse
+        # the G1 case; greedy spatial clustering within
+        # ``contact_dedup_radius`` only merges contacts that share a body
+        # AND sit on top of each other, which is what we want.
+        if len(pos) > 1 and self._contact_dedup_radius > 0.0:
+            r2 = self._contact_dedup_radius * self._contact_dedup_radius
+            keep_idx: list[int] = []
+            kept_pos: list[np.ndarray] = []
+            kept_bod: list[int] = []
+            for i in range(len(pos)):
+                p_i = pos[i]
+                b_i = int(bod[i])
+                duplicate = False
+                for kp, kb in zip(kept_pos, kept_bod):
+                    if kb != b_i:
+                        continue
+                    d = p_i - kp
+                    if float(d @ d) <= r2:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    keep_idx.append(i)
+                    kept_pos.append(p_i)
+                    kept_bod.append(b_i)
+            keep_arr = np.asarray(keep_idx, dtype=np.int64)
+            pos = pos[keep_arr]
+            nrm = nrm[keep_arr]
+
+        if self.show_contacts:
+            if len(pos) > 0:
+                self._sim_renderer.render_points(
+                    name=self._CONTACT_SPHERE_INSTANCER,
+                    points=np.ascontiguousarray(pos, dtype=np.float32),
+                    radius=self._contact_points_radius,
+                    colors=[_CONTACT_COLOR] * len(pos),
+                )
+            else:
+                self._drop_instancer(self._CONTACT_SPHERE_INSTANCER)
+        else:
+            self._drop_instancer(self._CONTACT_SPHERE_INSTANCER)
+
+        if self.show_normals:
+            if len(pos) > 0:
+                verts, idx = self._build_arrow_segments(pos, nrm, self._contact_normal_length)
+                self._sim_renderer.render_line_list(
+                    name=self._CONTACT_NORMAL_INSTANCER,
+                    vertices=verts,
+                    indices=idx,
+                    color=_NORMAL_COLOR,
+                    radius=self._contact_normal_radius,
+                )
+            else:
+                self._drop_instancer(self._CONTACT_NORMAL_INSTANCER)
+        else:
+            self._drop_instancer(self._CONTACT_NORMAL_INSTANCER)
+
+    @staticmethod
+    def _build_arrow_segments(
+        positions: np.ndarray, normals: np.ndarray, length: float
+    ) -> tuple:
+        """Build a vertex/index buffer drawing an arrow per (position, normal):
+        a shaft segment plus two head segments forming a small "<" at the tip.
+        Returns (vertices [3N*4, 3], indices [3N*2]).
+        """
+        n = len(positions)
+        # Renormalize to unit length (defensive — kernel emits a unit normal).
+        mag = np.linalg.norm(normals, axis=1, keepdims=True)
+        mag[mag < 1.0e-8] = 1.0
+        d = normals / mag
+
+        # Build a perpendicular vector per contact (Hughes-Möller style choice).
+        ref = np.tile(np.array([1.0, 0.0, 0.0], dtype=np.float32), (n, 1))
+        flip = np.abs(d[:, 0]) > 0.9
+        if flip.any():
+            ref[flip] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        perp = np.cross(d, ref)
+        perp /= np.maximum(np.linalg.norm(perp, axis=1, keepdims=True), 1.0e-8)
+
+        head_len = 0.04
+        head_w = 0.03
+        tip = positions + d * length
+        base = positions + d * (length - head_len)
+        h1 = base + perp * head_w
+        h2 = base - perp * head_w
+
+        verts = np.empty((4 * n, 3), dtype=np.float32)
+        verts[0::4] = positions
+        verts[1::4] = tip
+        verts[2::4] = h1
+        verts[3::4] = h2
+        # Three line segments per arrow: shaft, tip→h1, tip→h2.
+        idx = np.empty((n, 6), dtype=np.int32)
+        base_idx = (np.arange(n, dtype=np.int32) * 4)[:, None]
+        idx[:, 0:2] = base_idx + np.array([0, 1], dtype=np.int32)
+        idx[:, 2:4] = base_idx + np.array([1, 2], dtype=np.int32)
+        idx[:, 4:6] = base_idx + np.array([1, 3], dtype=np.int32)
+        return verts, idx.reshape(-1)
+
+    def _drop_instancer(self, name: str) -> None:
+        """Remove a previously-created instancer so it stops drawing.
+
+        ``render_points`` / ``render_line_list`` cache a ``ShapeInstancer`` in
+        ``OpenGLRenderer._shape_instancers``; the per-frame draw loop iterates
+        that dict, so popping the entry hides the geometry immediately.
+        """
+        renderer = self._sim_renderer
+        instancers = getattr(renderer, "_shape_instancers", None)
+        if instancers is None:
+            return
+        instancers.pop(name, None)
+
+    def _on_key_press(self, symbol, modifiers):
+        """Toggle filtered-contact display ('P') and normal arrows ('N')."""
+        import pyglet
+        if symbol == pyglet.window.key.P:
+            self.show_contacts = not self.show_contacts
+            if not self.show_contacts:
+                self._drop_instancer(self._CONTACT_SPHERE_INSTANCER)
+        elif symbol == pyglet.window.key.N:
+            self.show_normals = not self.show_normals
+            if not self.show_normals:
+                self._drop_instancer(self._CONTACT_NORMAL_INSTANCER)
 
     # ------------------------------------------------------------------
     # contact rendering
