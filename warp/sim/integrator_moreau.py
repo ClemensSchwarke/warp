@@ -1054,14 +1054,12 @@ def construct_contact_jacobian(
     point_vec[tid * 8 + 6] = above_ground
     point_vec[tid * 8 + 7] = above_ground
 
-    # Ground contact records are written by broadphase_collision_pairs at
-    # pair_id * 2 for deterministic Jc ordering.  The records for one
-    # articulation therefore occupy two slots per non-ground shape, not an
-    # equal slice of the full rigid_contact_max capacity.  Using
-    # rigid_contact_max / articulation_count makes G1 envs after env 0 read
-    # the wrong contact slice because G1 has additional non-ground contact
-    # capacity from self-collision pairs.
-    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
+    # Broadphase contact pairs are NOT laid out in contiguous per-env blocks
+    # (self-collision pairs interleave foot-ground pairs across envs), so the
+    # old `contact_id = tid * contacts_per_articulation + i` indexing made each
+    # articulation read the wrong slice.  Scan the full contact table and
+    # dispatch each record to its owning articulation by integer-dividing the
+    # body index by `bodies_per_env` (bodies are laid out env-blocked).
 
     # Track the deepest (minimum world-Y) below-ground contact per slot.
     best_y_0 = float(col_height)
@@ -1073,9 +1071,12 @@ def construct_contact_jacobian(
     best_y_6 = float(col_height)
     best_y_7 = float(col_height)
 
-    for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
-        contact_id = tid * contacts_per_articulation + i
+    for contact_id in range(rigid_contact_max):
         c_body = contact_body[contact_id]
+        if c_body < 0:
+            continue
+        if c_body / bodies_per_env != tid:
+            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
@@ -2502,8 +2503,6 @@ def get_foot_states(
     foot_vel[tid * 8 + 6] = zero_vel
     foot_vel[tid * 8 + 7] = zero_vel
 
-    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
-
     # Track minimum world-Y contact per foot slot so that foot position and
     # velocity are always reported at the lowest (most-ground-proximal) sphere.
     # This matters when multiple spheres share the same foot body (e.g. G1's
@@ -2518,9 +2517,16 @@ def get_foot_states(
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
 
-    for i in range(2, contacts_per_articulation):  # iterate (almost) all contacts
-        contact_id = tid * contacts_per_articulation + i
+    # See note in construct_contact_jacobian: scan the full contact table and
+    # filter by `c_body / bodies_per_env == tid`. The previous env-blocked
+    # indexing was incorrect for G1 (self-collision pairs interleave records
+    # across envs).
+    for contact_id in range(rigid_contact_max):
         c_body = contact_body[contact_id]
+        if c_body < 0:
+            continue
+        if c_body / bodies_per_env != tid:
+            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]

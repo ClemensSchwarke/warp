@@ -47,8 +47,15 @@ from .integrator_moreau import (
 
 # Temporary flat-ground debug override. Set this to wp.constant(0) to use the
 # collision normals from wp.sim.collide again.
-# MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
-MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
+# When 1, all contact normals fed into the Moreau prox solver are clamped to
+# (0,1,0).  Required for stable G1 (8-contact) behavior in flat envs — without
+# it the broadphase produces slightly off-axis normals for the four spheres
+# clustered on each foot body, which compound into a slow drift downward.
+# Setting this to 0 re-enables true surface normals (needed for rough terrain
+# / SDF contacts).  Flip back to 0 if you want to exercise rough-terrain
+# behavior on the moreau_rough integrator.
+# MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
+MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
 
 
 @wp.func
@@ -2423,7 +2430,6 @@ def get_foot_states_rough(
             point_vec[tid * num_contacts + slot] = above_ground
             foot_vel[tid * num_contacts + slot] = zero_vel
 
-    contacts_per_articulation = ((geo.type.shape[0] - 1) / articulation_count) * 2
     total_contacts = rigid_contact_count[0]
 
     best_y_0 = float(1.0e6)
@@ -2435,11 +2441,14 @@ def get_foot_states_rough(
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
 
-    for i in range(2, contacts_per_articulation):
-        contact_id = tid * contacts_per_articulation + i
-        if contact_id < total_contacts:
-            c_body = contact_body[contact_id]
-            if c_body >= 0:
+    # Broadphase contact pairs are not env-blocked (self-collision pairs
+    # interleave across envs). Scan the full table and dispatch each record
+    # to its owning articulation by integer-dividing the body index by
+    # `bodies_per_env`. This mirrors construct_contact_jacobian's dispatch.
+    for contact_id in range(total_contacts):
+        c_body = contact_body[contact_id]
+        if c_body >= 0 and (c_body / bodies_per_env) == tid:
+            if True:
                 c_point = contact_point[contact_id]
                 c_shape = contact_shape[contact_id]
                 c_dist = geo.thickness[c_shape]
