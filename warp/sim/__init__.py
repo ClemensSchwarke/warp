@@ -49,7 +49,7 @@ from .integrator_moreau_rough import MoreauRoughIntegrator
 
 from .integrator_toi import TOIIntegrator
 
-from .generate_terrain import generate_terrain
+from .generate_terrain import generate_terrain, rebake_volume
 
 from .collide import collide
 from .articulation import eval_fk, eval_ik

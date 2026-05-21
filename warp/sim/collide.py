@@ -995,7 +995,16 @@ def handle_contact_pairs(
             print("Unsupported geometry type in sphere collision handling")
             print(geo_type_b)
             return
-        if geo_type_b != wp.sim.GEO_SDF:
+        if geo_type_b == wp.sim.GEO_PLANE:
+            # Use the plane's outward normal so the direction stays fixed when
+            # the sphere center penetrates below the plane. `normalize(diff)`
+            # flips sign once diff.y goes negative, producing a downward
+            # "contact" normal that the moreau_rough scheduler then rejects via
+            # its `normal_y > 0` check — leaving deeply-penetrating spheres
+            # without any contact slot. Box-vs-plane already uses this pattern.
+            normal = wp.transform_vector(X_ws_b, wp.vec3(0.0, 1.0, 0.0))
+            distance = wp.dot(p_a_world - p_b_world, normal)
+        elif geo_type_b != wp.sim.GEO_SDF:
             diff = p_a_world - p_b_world
             normal = wp.normalize(diff)
             distance = wp.dot(diff, normal)

@@ -4034,6 +4034,13 @@ class MoreauIntegrator:
         bundle_sigma_pos=0.01,
         bundle_sigma_vel=0.01,
         bundle_inner_mode=None,
+        # PPO ping-pong support: when True, zero the sparse-written mass /
+        # contact buffers and state_mid.percussion before the substep runs.
+        # SHAC allocates a fresh matrix set + fresh state_mid per substep so
+        # these start at zero naturally; PPO reuses one shared set and would
+        # otherwise leak stale Jc entries for inactive contact slots into the
+        # next substep's prox solve. Default False keeps SHAC bit-identical.
+        zero_sparse_buffers=False,
     ):
         if mode == "bundle":
             return self._simulate_bundle(
@@ -4048,6 +4055,16 @@ class MoreauIntegrator:
         # Ensure contact_local_x_sign is present (zeros = no x-axis filtering).
         if not hasattr(model, "contact_local_x_sign"):
             model.contact_local_x_sign = wp.zeros(4, dtype=wp.int32, device=model.device)
+
+        if zero_sparse_buffers:
+            # Match SHAC's per-substep fresh-zero allocation for the matrices
+            # and state buffers that get sparse writes. Without this,
+            # construct_contact_jacobian's sparse writes to model.Jc leave
+            # stale rows for inactive contact slots, and the 4-contact prox
+            # kernel only writes percussion[0..3] (so [4..7] persists from the
+            # prior substep into p_to_f_s).
+            model.Jc.zero_()
+            state_mid.percussion.zero_()
 
         # integrate position with euler half a step
         # kernel 25 / 20

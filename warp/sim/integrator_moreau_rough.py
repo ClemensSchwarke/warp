@@ -54,8 +54,8 @@ from .integrator_moreau import (
 # Setting this to 0 re-enables true surface normals (needed for rough terrain
 # / SDF contacts).  Flip back to 0 if you want to exercise rough-terrain
 # behavior on the moreau_rough integrator.
-# MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
-MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
+MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
+# MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
 
 
 @wp.func
@@ -4352,7 +4352,7 @@ class MoreauRoughIntegrator(Integrator):
                 device=model.device,
             )
 
-            self.col_height = 0.0
+            self.col_height = float(getattr(model, "col_height", 0.0))
 
             # Create body contact arrays
             self.rigid_contact_body0 = wp.empty_like(model.rigid_contact_shape0)
@@ -4551,7 +4551,7 @@ class MoreauRoughIntegrator(Integrator):
 
             target._featherstone_augmented = True
 
-    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, prox_iter: int = 20, mu: float = 0.8 ):
+    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, prox_iter: int = 20, mu: float = 0.8, zero_sparse_buffers: bool = False):
         # Active warp's State doesn't expose `requires_grad` directly — derive
         # it from a representative array. joint_q is always allocated.
         if hasattr(state_in, "requires_grad"):
@@ -4559,7 +4559,21 @@ class MoreauRoughIntegrator(Integrator):
         else:
             requires_grad = bool(getattr(state_in.joint_q, "requires_grad", False))
 
-
+        # PPO ping-pong support: when True, zero the sparse-written matrices
+        # before the substep runs. SHAC allocates a fresh matrix set per
+        # substep (so these start at zero naturally); PPO shares one set across
+        # substeps and would otherwise leak stale Jc entries for inactive
+        # contact slots into the next substep's prox solve. Default False
+        # keeps the SHAC path bit-identical.
+        if zero_sparse_buffers:
+            self.M.zero_()
+            self.J.zero_()
+            self.P.zero_()
+            self.H.zero_()
+            self.L.zero_()
+            self.Jc.zero_()
+            self.G.zero_()
+            self.G_mat.zero_()
 
         # Allocate auxiliary variables on state_mid (used for midpoint computations)
         if not getattr(state_mid, "_featherstone_augmented", False):
