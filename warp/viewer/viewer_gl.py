@@ -37,10 +37,12 @@ from .urdf_visuals import load_urdf_visuals
 
 # Newton-inspired neutral palette
 _COLLISION_COLOR = (0.78, 0.78, 0.80)  # warm grey for collision shapes
-_TERRAIN_COLOR = (0.50, 0.50, 0.50)    # light grey rough terrain (albedo;
-                                        # the shader stacks ambient + sun
-                                        # diffuse + a second diffuse + specular,
-                                        # so anything > ~0.55 saturates to white)
+# Darker terrain albedo so the shader's stacked (ambient + sun diffuse + fill
+# diffuse + specular) lighting does not saturate to white on flat tops, which
+# is what flattens the visible roughness. With albedo ~0.30 the brightest
+# surfaces sit around 0.55-0.65 while shadow-facing surfaces drop to ~0.10,
+# producing the high-contrast matte look IsaacLab achieves with its raked sun.
+_TERRAIN_COLOR = (0.30, 0.30, 0.32)
 _CONTACT_COLOR = (1.00, 0.40, 0.00)    # orange
 _NORMAL_COLOR = (1.00, 0.10, 0.10)     # red (contact normal arrows)
 
@@ -49,6 +51,14 @@ _SKY_COLOR = (0.22, 0.24, 0.28)        # dark blue-grey background
 _SKY_HAZE = (0.40, 0.42, 0.48)         # lighter neutral haze near the horizon
 _GROUND_TILE_A = (0.38, 0.40, 0.43)    # darker tile
 _GROUND_TILE_B = (0.30, 0.32, 0.34)    # secondary tile
+
+# Sun direction. The base renderer ships with a near-vertical sun (-0.2, 0.8,
+# 0.3) which produces uniform high diffuse on almost-horizontal surfaces — bad
+# for showing terrain roughness. We tilt the sun to a more raking angle so the
+# cosine term swings more across small surface tilts, matching IsaacLab's
+# dramatic side-lit look on terrain bumps. (X is the bake's lateral axis; Y is
+# up; Z is the bake's forward axis.)
+_SUN_DIRECTION = (-0.5, 0.55, 0.4)
 
 
 # NOTE: the contact-filter Warp kernel lives in ``contact_filter.py`` instead
@@ -153,6 +163,9 @@ class ViewerGL(ViewerBase):
         # warm orange. Override it to a neutral horizon tint so the scene
         # reads as Newton-like rather than sunset.
         self._patch_sky_haze(_SKY_HAZE)
+        # Tilt the sun to a raking angle so terrain roughness reads via
+        # cos-shading variation instead of saturating to white on flat tops.
+        self._patch_sun_direction(_SUN_DIRECTION)
 
         # Optionally hide collision shapes by scaling them to near-zero so the
         # visual meshes don't fight with them for pixels. Disabled by default
@@ -599,6 +612,35 @@ class ViewerGL(ViewerBase):
             return
         with renderer._sky_shader:
             gl.glUniform3f(loc, *haze_color)
+
+    def _patch_sun_direction(self, direction: tuple) -> None:
+        """Override the shape shader's sun direction with a more raking angle.
+
+        The base renderer sets sun to roughly straight overhead, which makes
+        terrain bumps almost invisible (cos(angle) ≈ 1 everywhere). A lower
+        sun lengthens the cos-shading swing across small tilts, which is the
+        only mechanism the forward-shaded pipeline has to communicate surface
+        roughness (no shadow maps).
+        """
+        from pyglet import gl
+
+        renderer = self._sim_renderer
+        # Normalise so the diffuse term in the shader stays in [-1, 1].
+        d = np.asarray(direction, dtype=np.float32)
+        n = float(np.linalg.norm(d))
+        if n <= 1e-9:
+            return
+        d = d / n
+        # Keep the renderer's cached vector in sync — used by the sky shader's
+        # sun-glow term and any subsequent shader rebuilds.
+        renderer._sun_direction = d
+        loc = gl.glGetUniformLocation(
+            renderer._shape_shader.id, b"sunDirection"
+        )
+        if loc == -1:
+            return
+        with renderer._shape_shader:
+            gl.glUniform3f(loc, float(d[0]), float(d[1]), float(d[2]))
 
     # ------------------------------------------------------------------
     # window helpers

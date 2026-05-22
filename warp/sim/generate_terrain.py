@@ -186,42 +186,57 @@ def _sub_random_rough(tile_size, difficulty, rng):
 def _sub_pyramid_stairs(tile_size, difficulty, rng, inverted=False):
     """Concentric square rings of boxes forming pyramidal stairs.
 
-    Convention: centre of the tile is at y=0. With `inverted=False`, the centre
-    is a flat platform at y=0 and stairs DESCEND outward (rings get LOWER as
-    they go out -> robot trained to descend stairs). With `inverted=True`, the
-    centre is a flat platform at y=0 and stairs ASCEND outward (a stepped pit
-    seen from outside -> robot trained to climb).
+    Mirrors IsaacLab MeshPyramidStairsTerrainCfg geometry (step_height range
+    (0.05, 0.23), step_width=0.3, platform_width=3.0, border_width=1.0).
+    IsaacLab's num_steps formula is used so the ring count matches exactly.
 
-    Each ring is built from 4 axis-aligned rectangular strips. The base slab
-    extends only over the central platform footprint so we don't add ground
-    underneath the deeper steps of the inverted variant.
+    Because the bake uses a single global border slab whose top is at y=0,
+    geometry below y=0 is occluded. We therefore shift IsaacLab's vertical
+    convention up so the deepest top surface is at y=0:
+
+    - inverted=False (raised pyramid): central platform at y=(num_steps+1)*sh
+      (the highest point), outermost ring at y=sh; tops INCREASE going inward.
+      Robot spawns on the elevated platform via
+      _align_done_envs_to_terrain_surface.
+    - inverted=True (raised pit walls): central platform at y=0, outermost
+      ring at y=num_steps*sh; tops DECREASE going inward. Geometrically the
+      same as IsaacLab's pit, just shifted up so the deepest point lands at
+      y=0. Robot spawns at the bottom of the pit.
     """
     centers, halfs, rots = [], [], []
 
-    step_height = 0.05 + 0.18 * difficulty       # 0.05 .. 0.23
-    step_width = 0.30
-    # IsaacLab ROUGH_TERRAINS_CFG uses a 3 m platform for pyramid stairs.
-    # Keeping the spawn patch this wide avoids starting robots on stair edges.
-    platform_w = 3.0
-    half = tile_size / 2.0
-    n_rings = int(math.floor((half - platform_w / 2.0) / step_width))
+    border_width = 1.0                       # IsaacLab MeshPyramidStairsTerrainCfg
+    step_height = 0.05 + 0.18 * difficulty   # 0.05 .. 0.23 (IsaacLab range)
+    step_width = 0.30                        # IsaacLab MeshPyramidStairsTerrainCfg
+    platform_w = 3.0                         # IsaacLab MeshPyramidStairsTerrainCfg
 
-    # central platform spans plat_w; rings tile outside [plat_w/2 .. tile/2]
-    # ring k=0 is the innermost (next to platform); k=n_rings-1 is at the edge.
-    for k in range(n_rings):
-        r_inner = platform_w / 2.0 + k * step_width
-        r_outer = r_inner + step_width
-        if r_outer > half:
-            r_outer = half
+    inner_half = tile_size / 2.0 - border_width
+    inner_span = 2.0 * inner_half
+    # IsaacLab: num_steps = (size - 2*bw - pw) // (2*sw) + 1
+    if inner_span - platform_w > 0.0:
+        num_steps = int(math.floor((inner_span - platform_w) / (2.0 * step_width))) + 1
+    else:
+        num_steps = 0
+
+    # Rings: k=0 is OUTERMOST (next to per-tile border), k=num_steps-1 is
+    # INNERMOST (next to central platform). Each ring is an axis-aligned square
+    # annulus built from 4 strips.
+    for k in range(num_steps):
+        r_outer = inner_half - k * step_width
+        r_inner = r_outer - step_width
+        if r_inner <= 0.0:
+            break
 
         if inverted:
-            # stairs ASCEND going outward (deeper rings are HIGHER)
-            y_top = (k + 1) * step_height
+            # raised-pit walls: tops DECREASE going inward (outer = num_steps*sh,
+            # inner = sh). Equivalent to IsaacLab's pit shifted up by (num_steps+1)*sh.
+            y_top = (num_steps - k) * step_height
         else:
-            # stairs DESCEND going outward (deeper rings are LOWER)
-            y_top = -(k + 1) * step_height
+            # raised pyramid: tops INCREASE going inward (outer = sh,
+            # inner = num_steps*sh). Matches IsaacLab's non-inverted exactly.
+            y_top = (k + 1) * step_height
 
-        thickness = abs(y_top) + 0.5  # ensure box reaches well below ground
+        thickness = y_top + 0.5  # extend box well below the slab top
         center_y = y_top - thickness / 2.0
         # 4 rectangular strips per ring
         strip_specs = [
@@ -236,115 +251,231 @@ def _sub_pyramid_stairs(tile_size, difficulty, rng, inverted=False):
             halfs.append(np.array([hx, thickness / 2.0, hz], dtype=np.float32))
             rots.append(IDENTITY_QUAT.copy())
 
-    # central platform: top at y=0
-    plat_thickness = 0.5
-    centers.append(np.array([0.0, -plat_thickness / 2.0, 0.0], dtype=np.float32))
-    halfs.append(np.array([platform_w / 2.0, plat_thickness / 2.0, platform_w / 2.0], dtype=np.float32))
-    rots.append(IDENTITY_QUAT.copy())
+    # Central platform. Only needed for the raised (non-inverted) variant,
+    # which lifts the central spawn area above the global slab. For the
+    # inverted variant the pit bottom sits at y=0 anyway, so the global slab
+    # already provides the central surface — adding a redundant box there
+    # leaves a visible square crease on the mesh (the SDF gradient is
+    # discontinuous at the inner-box boundary even when the surface heights
+    # agree, and the renderer's per-vertex normals pick that up).
+    if not inverted:
+        # IsaacLab's actual platform half-width is what's left after the rings
+        # consume their share of the inner area (the cfg's platform_width is a
+        # lower bound, not exact); we reproduce that so the platform
+        # interlocks with the innermost ring without overlap.
+        half_pw = max(0.0, (inner_span - 2.0 * num_steps * step_width) / 2.0)
+        if half_pw <= 0.0:
+            half_pw = platform_w / 2.0
+        plat_top = (num_steps + 1) * step_height
+        plat_thickness = plat_top + 0.5
+        centers.append(np.array([0.0, plat_top - plat_thickness / 2.0, 0.0], dtype=np.float32))
+        halfs.append(np.array([half_pw, plat_thickness / 2.0, half_pw], dtype=np.float32))
+        rots.append(IDENTITY_QUAT.copy())
 
     return centers, halfs, rots
 
 
 def _sub_random_grid(tile_size, difficulty, rng):
-    """Regular grid of cells, each with a box at a randomized top height.
+    """Regular grid of cells, each with a box at a randomised top height.
 
-    Mimics IsaacLab MeshRandomGridTerrainCfg: flat platform at centre, grid of
-    raised platforms elsewhere.
+    Matches IsaacLab MeshRandomGridTerrainCfg (grid_width=0.45,
+    grid_height_range=(0.05, 0.20), platform_width=2.0):
+        num_cells = int(tile_size / grid_w)      # contiguous cells, no gap
+        border   = tile_size - num_cells * grid_w
+    IsaacLab samples per-cell heights uniformly in (-h_max, +h_max); we sample
+    in (0, h_max) so cells stay above the global slab (negative tops would be
+    occluded). The raised central platform sits at y=h_max to match IsaacLab's
+    spawn origin.
     """
     centers, halfs, rots = [], [], []
     centers.append(_base_slab(tile_size)[0])
     halfs.append(_base_slab(tile_size)[1])
     rots.append(_base_slab(tile_size)[2])
 
-    grid_w = 0.45
-    height_max = 0.05 + 0.15 * difficulty   # 0.05 .. 0.20
-    # IsaacLab MeshRandomGridTerrainCfg uses a 2 m flat platform.
-    platform_w = 2.0
-    half = tile_size / 2.0
-    n_cells = max(1, int(math.floor((tile_size - 2 * 0.1) / grid_w)))
-    offset = -((n_cells - 1) * grid_w) / 2.0
+    grid_w = 0.45                              # IsaacLab grid_width
+    height_max = 0.05 + 0.15 * difficulty      # 0.05 .. 0.20 (IsaacLab range)
+    platform_w = 2.0                           # IsaacLab platform_width
+
+    # IsaacLab: num_boxes_x = int(cfg.size[0] / cfg.grid_width); leftover is border.
+    n_cells = max(1, int(tile_size / grid_w))
+    border = tile_size - n_cells * grid_w
+    # Cell (0,0) centre sits one cell-half from the inner-side of the border.
+    cell0 = -tile_size / 2.0 + border / 2.0 + grid_w / 2.0
     plat_half = platform_w / 2.0
+
+    # 1% inset between adjacent cells to keep the smooth-min well-conditioned
+    # at cell boundaries (a strict no-gap layout creates a degenerate ridge
+    # along each cell seam under low softmin_k).
+    cell_half = grid_w / 2.0 * 0.99
 
     for i in range(n_cells):
         for j in range(n_cells):
-            cx = offset + i * grid_w
-            cz = offset + j * grid_w
+            cx = cell0 + i * grid_w
+            cz = cell0 + j * grid_w
             if abs(cx) < plat_half and abs(cz) < plat_half:
                 continue   # central platform stays flat
             top = rng.uniform(0.05, height_max)
             thickness = top + 0.5
             centers.append(np.array([cx, top - thickness / 2.0, cz], dtype=np.float32))
-            halfs.append(np.array([grid_w / 2.0 * 0.9, thickness / 2.0, grid_w / 2.0 * 0.9], dtype=np.float32))
+            halfs.append(np.array([cell_half, thickness / 2.0, cell_half], dtype=np.float32))
             rots.append(IDENTITY_QUAT.copy())
+
+    # Central platform raised to height_max (matches IsaacLab origin).
+    plat_top = height_max
+    plat_thickness = plat_top + 0.5
+    centers.append(np.array([0.0, plat_top - plat_thickness / 2.0, 0.0], dtype=np.float32))
+    halfs.append(np.array([plat_half, plat_thickness / 2.0, plat_half], dtype=np.float32))
+    rots.append(IDENTITY_QUAT.copy())
     return centers, halfs, rots
 
 
 def _sub_pyramid_slope(tile_size, difficulty, rng, inverted=False):
-    """Pyramidal slope built from 4 tilted ramp slabs around a central platform.
+    """Pyramid slope sub-terrain.
 
-    Convention: central platform top at y=0. For `inverted=False`, slopes
-    DESCEND outward (apex at centre); for `inverted=True`, slopes ASCEND
-    outward (centre is at the bottom of a pyramidal pit).
+    Two distinct constructions, one per variant:
+
+    inverted=False (raised pyramid):
+        Bilinear heightmap matching IsaacLab HfPyramidSlopedTerrainCfg:
+        h(x, z) = h_max * xx_norm(x) * yy_norm(z), clipped to [0, z_pf], where
+        xx_norm, yy_norm are triangle functions equal to 1 at the tile centre
+        and 0 at the inner-tile border, h_max = slope * inner_half, and
+        z_pf = h_max * (1 - plat_half/inner_half)^2 is the height at the
+        platform corner (i.e. where the bilinear surface first hits the clip).
+        Represented as a height-field grid of axis-aligned column boxes plus a
+        single explicit central platform. This replaces an earlier 4-tilted-
+        ramp construction whose ramps spanned the full tile width and so
+        produced a "+"-shaped ridge instead of a pyramid (each side ramp won
+        the smooth-min in the corner regions opposite to its slope direction).
+        The bilinear surface is not expressible as any finite union of tilted
+        planes, so the column representation is the only correct way to use
+        only oriented boxes.
+
+    inverted=True (raised slope pit):
+        Original 4-tilted-ramp construction preserved verbatim. Geometrically
+        the 4-ramp union is acceptable for the pit because the surface in the
+        outer (corner) regions is supposed to be at the highest point anyway
+        — the over-extension of each side ramp into the adjacent corner just
+        keeps that corner high, which matches the desired shape.
+
+    Both variants are shifted up so the deepest top surface sits at y=0:
+    - non-inverted: central platform at y=z_pf, slopes DESCEND outward to y=0
+      at the per-tile border. Robot spawns on top.
+    - inverted: central platform at y=0, slopes ASCEND outward to y=h_max at
+      the per-tile border. Robot spawns at the bottom.
     """
     centers, halfs, rots = [], [], []
 
-    slope_max = 0.05 + 0.35 * difficulty   # 0.05 .. 0.40 (tangent of slope angle)
-    # IsaacLab pyramid slopes use a 2 m flat platform.
-    platform_w = 2.0
-    half = tile_size / 2.0
-    plat_half = platform_w / 2.0
+    border_width = 0.25                # IsaacLab HfPyramidSlopedTerrainCfg
+    slope = 0.0 + 0.4 * difficulty     # IsaacLab slope_range=(0.0, 0.4)
+    platform_w = 2.0                   # IsaacLab HfPyramidSlopedTerrainCfg
 
-    ramp_len = half - plat_half
-    if ramp_len <= 0.0:
-        # entire tile is platform
-        centers.append(np.array([0.0, -0.25, 0.0], dtype=np.float32))
-        halfs.append(np.array([half, 0.25, half], dtype=np.float32))
+    inner_half = tile_size / 2.0 - border_width
+    plat_half = platform_w / 2.0
+    h_max = slope * inner_half         # IsaacLab: height_max = slope * cfg.size/2
+
+    if inverted:
+        # ----- Original 4-ramp construction for the raised-pit variant -----
+        ramp_len = inner_half - plat_half
+        if ramp_len <= 0.0:
+            return centers, halfs, rots
+
+        plat_top, outer_y = 0.0, h_max
+        # ramp_specs `ts` values were calibrated against a tilt sign where the
+        # outer end of the ramp rotates UP for positive `ts * tilt`. So the
+        # rise is (outer - inner), NOT (inner - outer): an earlier draft
+        # swapped this and the inverted ramps came out upside-down — the
+        # smooth-min then promoted the inner ridge into a square wall around
+        # a sunken platform.
+        tilt = math.atan2(outer_y - plat_top, ramp_len)
+        half_thick = 0.10
+        cos_t = max(abs(math.cos(tilt)), 1e-3)
+        along_half = (ramp_len / 2.0) / cos_t
+        across_half = inner_half
+        mid_y = (plat_top + outer_y) / 2.0
+        mid_inset = plat_half + ramp_len / 2.0
+
+        # Each ramp tilts around the axis perpendicular to its slope direction.
+        # +Z ramp slopes in z, tilts around +X axis.
+        ramp_specs = [
+            # axis_letter, sign_x, sign_z, tilt_sign
+            ("x", 0.0, +1.0, -1.0),
+            ("x", 0.0, -1.0, +1.0),
+            ("z", +1.0, 0.0, +1.0),
+            ("z", -1.0, 0.0, -1.0),
+        ]
+        for axis, sx, sz, ts in ramp_specs:
+            cx = sx * mid_inset
+            cz = sz * mid_inset
+            cy = mid_y
+            ang = ts * tilt
+            if axis == "x":
+                half_ext = np.array([across_half, half_thick, along_half], dtype=np.float32)
+                q = _axis_angle_quat([1.0, 0.0, 0.0], ang)
+            else:
+                half_ext = np.array([along_half, half_thick, across_half], dtype=np.float32)
+                q = _axis_angle_quat([0.0, 0.0, 1.0], ang)
+            centers.append(np.array([cx, cy, cz], dtype=np.float32))
+            halfs.append(half_ext)
+            rots.append(q)
+        # No central platform box for the inverted variant — the pit bottom
+        # sits at y=0, already covered by the global slab, and an inner box
+        # would only contribute an SDF discontinuity at its edge.
+        return centers, halfs, rots
+
+    # ----- Bilinear height-field construction for the raised pyramid -----
+    z_pf = h_max * (1.0 - plat_half / inner_half) ** 2  # platform clip height
+
+    if h_max <= 1e-6 or inner_half <= 0.0:
+        # difficulty=0 -> flat tile, slab handles it.
+        return centers, halfs, rots
+
+    if inner_half - plat_half <= 0.0:
+        # Inner area is all platform -> single flat slab.
+        plat_top = z_pf
+        plat_thickness = plat_top + 0.5
+        centers.append(np.array([0.0, plat_top - plat_thickness / 2.0, 0.0], dtype=np.float32))
+        halfs.append(np.array([inner_half, plat_thickness / 2.0, inner_half], dtype=np.float32))
         rots.append(IDENTITY_QUAT.copy())
         return centers, halfs, rots
 
-    # outer edge is `outer_dy` away from centre in y (negative -> outer is lower)
-    outer_dy = -slope_max * ramp_len
-    if inverted:
-        outer_dy = -outer_dy
-
-    tilt = math.atan(outer_dy / ramp_len)
-    half_thick = 0.10
-    cos_t = max(abs(math.cos(tilt)), 1e-3)
-    along_half = (ramp_len / 2.0) / cos_t
-    across_half = half
-    # midpoint of ramp in y is half-way between platform (y=0) and outer edge
-    mid_y = outer_dy / 2.0
-    mid_inset = (plat_half + ramp_len / 2.0)
-
-    # Each ramp tilts around the axis perpendicular to its slope direction.
-    # +Z ramp slopes in z, tilts around +X axis.
-    ramp_specs = [
-        # axis_letter, sign_x, sign_z, tilt_sign
-        ("x", 0.0, +1.0, -1.0),
-        ("x", 0.0, -1.0, +1.0),
-        ("z", +1.0, 0.0, +1.0),
-        ("z", -1.0, 0.0, -1.0),
-    ]
-    for axis, sx, sz, ts in ramp_specs:
-        cx = sx * mid_inset
-        cz = sz * mid_inset
-        cy = mid_y
-        ang = ts * tilt
-        if axis == "x":
-            half_ext = np.array([across_half, half_thick, along_half], dtype=np.float32)
-            q = _axis_angle_quat([1.0, 0.0, 0.0], ang)
-        else:
-            half_ext = np.array([along_half, half_thick, across_half], dtype=np.float32)
-            q = _axis_angle_quat([0.0, 0.0, 1.0], ang)
-        centers.append(np.array([cx, cy, cz], dtype=np.float32))
-        halfs.append(half_ext)
-        rots.append(q)
-
-    # central platform: top at y=0
-    plat_thickness = 0.5
-    centers.append(np.array([0.0, -plat_thickness / 2.0, 0.0], dtype=np.float32))
+    # Central platform box: covers the inscribed |x|, |z| <= plat_half region
+    # in one piece. Skipping the columns inside this square avoids both the
+    # column-seam artifacts under the spawn point and the tiny inset gap at
+    # x=z=0 that would otherwise sink the surface to the slab.
+    plat_thickness = z_pf + 0.5
+    centers.append(np.array([0.0, z_pf - plat_thickness / 2.0, 0.0], dtype=np.float32))
     halfs.append(np.array([plat_half, plat_thickness / 2.0, plat_half], dtype=np.float32))
     rots.append(IDENTITY_QUAT.copy())
+
+    # Height-field discretisation of the inner-tile region outside the
+    # platform. N columns per axis within (-inner_half, +inner_half). Columns
+    # abut with no inter-column inset: under smooth-min this just rounds off
+    # the vertical seams between adjacent columns at different heights, which
+    # is the desired behaviour. The bake kernel is O(num_voxels * num_boxes),
+    # so N trades bake speed for pyramid smoothness.
+    N = 32
+    col_w = (2.0 * inner_half) / N
+    col_half = col_w / 2.0
+    cell0 = -inner_half + col_w / 2.0
+
+    for i in range(N):
+        cx = cell0 + i * col_w
+        xx_norm = max(0.0, 1.0 - abs(cx) / inner_half)
+        for j in range(N):
+            cz = cell0 + j * col_w
+            # Skip columns inside the explicit platform box (handled above).
+            if abs(cx) <= plat_half and abs(cz) <= plat_half:
+                continue
+            yy_norm = max(0.0, 1.0 - abs(cz) / inner_half)
+            h = h_max * xx_norm * yy_norm
+            top = min(h, z_pf)
+            if top <= 1e-4:
+                continue  # column at slab level — redundant with global slab
+            thickness = top + 0.5  # dip well below y=0 so the slab union is solid
+            centers.append(np.array([cx, top - thickness / 2.0, cz], dtype=np.float32))
+            halfs.append(np.array([col_half, thickness / 2.0, col_half], dtype=np.float32))
+            rots.append(IDENTITY_QUAT.copy())
+
     return centers, halfs, rots
 
 
