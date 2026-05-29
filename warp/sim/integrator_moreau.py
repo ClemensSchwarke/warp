@@ -2775,15 +2775,6 @@ def copy_joint_actions_to_bundle(
         joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
 
 
-@wp.func
-def quat_from_rotvec(rotvec: wp.vec3, eps: float):
-    angle = wp.length(rotvec)
-    if angle <= eps:
-        return wp.quat_identity()
-
-    return wp.quat_from_axis_angle(rotvec / angle, angle)
-
-
 @wp.kernel
 def average_bundle_into_buffer(
     # inputs
@@ -2828,34 +2819,69 @@ def average_bundle_into_buffer(
         # Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id
         # (tid here is env_id, running 0..num_envs-1).
         s0_q_start = tid * coord_count
-        q_ref = wp.normalize(
-            wp.quat(
-                bundle_joint_q[s0_q_start + 3],
-                bundle_joint_q[s0_q_start + 4],
-                bundle_joint_q[s0_q_start + 5],
-                bundle_joint_q[s0_q_start + 6],
-            )
+        # Chordal (linear) quaternion mean, anchored at sample 0's quaternion
+        # (q_ref) and hemisphere-aligned to it:
+        #
+        #     q_avg = q_ref + (1/n) * sum_s (sign_s * q_s - q_ref)
+        #
+        # This is a standard quaternion average for closely-spaced rotations
+        # (the bundle branches), and it is what makes zero-noise bundling
+        # reduce BIT-FOR-BIT to the soft baseline — forward AND adjoint:
+        #
+        #   * Forward: when every sample equals q_ref (single sample, or any
+        #     zero-noise bundle — the branches share the main root quaternion
+        #     verbatim), each (sign_s * q_s - q_ref) is (q_ref - q_ref) == 0
+        #     exactly (identical float operands), so the sum is zero and
+        #     q_avg == q_ref exactly. Note we do NOT re-normalize: q_ref is
+        #     already unit to float precision (eval_rigid_integrate normalized
+        #     it), and normalizing would perturb it by ~1 ulp and reintroduce
+        #     drift. The earlier geodesic (log/exp) mean could not achieve this
+        #     because quat_inverse/quat_to_axis_angle leave a ~1e-9 residual.
+        #   * Adjoint: q_avg is a pure linear combination, so the q_ref terms
+        #     cancel exactly (adj - adj == 0) and the gradient w.r.t. an
+        #     identical sample is exactly 1/n; summed over the (identical)
+        #     branches this is the identity — unlike the geodesic mean, whose
+        #     log/exp Jacobians are not the identity at the near-identity
+        #     config and left a ~1e-7 action-gradient residual that amplified
+        #     through the stiff contact solve.
+        #
+        # For genuinely spread samples the result is slightly sub-unit (the
+        # chordal centroid lies just inside the sphere); that is harmless here
+        # because the committed quaternion is re-normalized by the next step's
+        # integrator, and its rotation direction matches the geodesic mean to
+        # O(spread^2).
+        q_ref = wp.quat(
+            bundle_joint_q[s0_q_start + 3],
+            bundle_joint_q[s0_q_start + 4],
+            bundle_joint_q[s0_q_start + 5],
+            bundle_joint_q[s0_q_start + 6],
         )
-        q_ref_inv = wp.quat_inverse(q_ref)
-        rotvec_sum = wp.vec3(0.0, 0.0, 0.0)
+        q_delta_sum = wp.quat(0.0, 0.0, 0.0, 0.0)
 
         for s in range(num_bundle_samples):
             bundle_q_start = (s * num_envs + tid) * coord_count
-            q_sample = wp.normalize(
-                wp.quat(
-                    bundle_joint_q[bundle_q_start + 3],
-                    bundle_joint_q[bundle_q_start + 4],
-                    bundle_joint_q[bundle_q_start + 5],
-                    bundle_joint_q[bundle_q_start + 6],
-                )
+            q_sample = wp.quat(
+                bundle_joint_q[bundle_q_start + 3],
+                bundle_joint_q[bundle_q_start + 4],
+                bundle_joint_q[bundle_q_start + 5],
+                bundle_joint_q[bundle_q_start + 6],
             )
-            q_rel = wp.mul(q_ref_inv, q_sample)
-            axis = wp.vec3()
-            angle = float(0.0)
-            wp.quat_to_axis_angle(q_rel, axis, angle)
-            rotvec_sum = rotvec_sum + axis * angle
+            # Hemisphere alignment: q and -q are the same rotation, so flip
+            # any sample lying in the opposite hemisphere from q_ref before
+            # averaging. dot(q_ref, q_ref) > 0, so identical samples keep
+            # sign +1 and contribute exactly zero.
+            dot = (
+                q_sample[0] * q_ref[0]
+                + q_sample[1] * q_ref[1]
+                + q_sample[2] * q_ref[2]
+                + q_sample[3] * q_ref[3]
+            )
+            sgn = 1.0
+            if dot < 0.0:
+                sgn = -1.0
+            q_delta_sum = q_delta_sum + (sgn * q_sample - q_ref)
 
-        q_avg = wp.mul(q_ref, quat_from_rotvec(rotvec_sum * inv_n, 1.0e-8))
+        q_avg = q_ref + inv_n * q_delta_sum
         bundle_avg_q[main_q_start + 3] = q_avg[0]
         bundle_avg_q[main_q_start + 4] = q_avg[1]
         bundle_avg_q[main_q_start + 5] = q_avg[2]
@@ -3070,17 +3096,29 @@ def update_bundle_bookkeeping(
     bundle_active: wp.array(dtype=int),
     pending_has_result: wp.array(dtype=int),
     pending_target_substep: wp.array(dtype=int),
+    cache_horizon_remaining: wp.array(dtype=int),
+    cache_is_continuation: wp.array(dtype=int),
 ):
-    """Post-merge bookkeeping update.
+    """Post-merge bookkeeping for the multi-step bundle state machine.
 
-    Must run AFTER the merge kernel and sees the same current_substep:
+    Must run AFTER ``merge_state_transitions`` with the same current_substep.
 
-      - If the pending result was just written this substep
-        (pending_has_result==1 and pending_target_substep==current_substep),
-        clear it and force bundle_active to 0 (the hold window has ended).
+    Two cases per env:
 
-      - Otherwise, if the env is inside a hold window (bundle_active > 0),
-        decrement — one outer substep of the hold window has elapsed.
+      - PENDING COMMITTED THIS SUBSTEP
+        ``pending_has_result==1`` and ``pending_target_substep==current_substep``.
+        Clear pending. Then:
+          * If the bundle's total horizon has expired (``cache_horizon_remaining==0``):
+            the cache is fully consumed → ``bundle_active = 0`` and
+            ``cache_is_continuation = 0``. Env returns to normal-sim semantics
+            at the next substep and may re-trigger if contact occurs.
+          * Else (end-of-outer-step commit with horizon still remaining):
+            keep ``bundle_active = 1``; mark ``cache_is_continuation = 1`` so
+            the next ``step()``'s substep 0 refreshes bundle actions from the
+            policy's freshly-computed action.
+
+      - NO COMMIT THIS SUBSTEP: leave all bookkeeping untouched (the inner
+        substep's horizon decrement happened in ``decrement_cache_horizon``).
     """
     tid = wp.tid()
     if (
@@ -3089,55 +3127,211 @@ def update_bundle_bookkeeping(
     ):
         pending_has_result[tid] = 0
         pending_target_substep[tid] = 0
-        bundle_active[tid] = 0
-    elif bundle_active[tid] > 0:
-        bundle_active[tid] = bundle_active[tid] - 1
+        if cache_horizon_remaining[tid] == 0:
+            bundle_active[tid] = 0
+            cache_is_continuation[tid] = 0
+        else:
+            # end-of-step commit, horizon continues across step() boundary
+            cache_is_continuation[tid] = 1
 
 
 @wp.kernel
-def stage_pending_bundle_trigger(
+def stage_bundle_trigger(
     # inputs
     bundle_trigger: wp.array(dtype=int),
+    horizon: int,
+    # outputs
+    bundle_active: wp.array(dtype=int),
+    cache_horizon_remaining: wp.array(dtype=int),
+):
+    """Mark freshly triggered envs as cache-active for ``horizon`` inner substeps.
+
+    Called once at trigger time (substep s). For each env with
+    ``bundle_trigger==1``:
+        ``bundle_active[e]            = 1``
+        ``cache_horizon_remaining[e]  = horizon``
+
+    The horizon counts inner substeps remaining BEFORE this trigger substep's
+    inner step is consumed; ``decrement_cache_horizon`` runs once AFTER the
+    inner substep, bringing the count to ``horizon - 1`` at the end of the
+    trigger substep.
+    """
+    tid = wp.tid()
+    if bundle_trigger[tid] == 1:
+        bundle_active[tid] = 1
+        cache_horizon_remaining[tid] = horizon
+
+
+@wp.kernel
+def decrement_cache_horizon(
+    # inputs
+    bundle_active: wp.array(dtype=int),
+    # outputs (inout)
+    cache_horizon_remaining: wp.array(dtype=int),
+):
+    """Decrement ``cache_horizon_remaining`` by one for every cache-active env.
+
+    Runs once per outer substep, AFTER the Phase C inner step. Cache-active
+    envs have ``bundle_active==1``; non-active envs are skipped.
+    """
+    tid = wp.tid()
+    if bundle_active[tid] == 1 and cache_horizon_remaining[tid] > 0:
+        cache_horizon_remaining[tid] = cache_horizon_remaining[tid] - 1
+
+
+@wp.kernel
+def compute_do_average(
+    # inputs
+    bundle_active: wp.array(dtype=int),
+    cache_horizon_remaining: wp.array(dtype=int),
     current_substep: int,
-    effective_window: int,
+    num_substeps: int,
+    # outputs
+    do_average: wp.array(dtype=int),
+):
+    """Per-env mask: should we average this env's bundle samples this substep?
+
+    For cache-active envs (``bundle_active==1``) average when EITHER:
+      * the bundle's total horizon has just expired (``cache_horizon_remaining==0``
+        after this substep's decrement) — write the bundle's final averaged
+        state at this substep, then the cache is done; or
+      * this is the last outer substep of the current ``step()`` call — so the
+        policy can see a single averaged state at the env-step boundary even
+        though the bundle continues across the step boundary.
+
+    Otherwise (non-active envs, or active envs in the middle of a horizon
+    inside one ``step()``), no average is written this substep.
+    """
+    tid = wp.tid()
+    end_h = cache_horizon_remaining[tid] == 0
+    end_s = current_substep == num_substeps - 1
+    if bundle_active[tid] == 1 and (end_h or end_s):
+        do_average[tid] = 1
+    else:
+        do_average[tid] = 0
+
+
+@wp.kernel
+def set_pending_after_average(
+    # inputs
+    do_average: wp.array(dtype=int),
+    current_substep: int,
+    # outputs
+    pending_has_result: wp.array(dtype=int),
+    pending_target_substep: wp.array(dtype=int),
+):
+    """Mark each env whose bundle was averaged this substep as having a
+    pending result, with target substep == current_substep (commit immediately
+    via ``merge_state_transitions`` this same substep)."""
+    tid = wp.tid()
+    if do_average[tid] == 1:
+        pending_has_result[tid] = 1
+        pending_target_substep[tid] = current_substep
+
+
+@wp.kernel
+def merge_bundle_input_state(
+    # inputs
+    src_trigger_q: wp.array(dtype=float),     # init_state (perturbed init for triggered envs)
+    src_trigger_qd: wp.array(dtype=float),
+    src_continue_q: wp.array(dtype=float),    # chain[s] (previous substep's chain output)
+    src_continue_qd: wp.array(dtype=float),
+    trigger_mask: wp.array(dtype=int),        # per-env: 1 iff this env was newly triggered this substep
+    cache_active_mask: wp.array(dtype=int),   # per-env: 1 iff cache-active (continuing OR triggered)
+    num_envs: int,
+    coord_count: int,
+    dof_count: int,
+    # outputs
+    dst_q: wp.array(dtype=float),
+    dst_qd: wp.array(dtype=float),
+):
+    """Per-slot merge of two bundle joint arrays into a single fresh state.
+
+    Each bundle slot's joint values come from one of two sources, selected by
+    the per-env masks (env_id = slot_id % num_envs in samples-major layout):
+      * trigger_mask[env]==1      → dst = src_trigger (perturbed init)
+      * cache_active_mask[env]==1 → dst = src_continue (previous chain output)
+      * else                      → dst = 0 (slot unused — kept tidy so the
+                                              inner simulate has well-defined inputs)
+
+    Single-write semantics: dst_q / dst_qd are written exactly once per slot,
+    so the Warp tape records a single output for ``dst``. Adjoint correctly
+    routes each slot's gradient back to exactly one of the two sources.
+    """
+    tid = wp.tid()
+    env_id = tid % num_envs
+    q_base = tid * coord_count
+    qd_base = tid * dof_count
+
+    if trigger_mask[env_id] == 1:
+        for i in range(coord_count):
+            dst_q[q_base + i] = src_trigger_q[q_base + i]
+        for j in range(dof_count):
+            dst_qd[qd_base + j] = src_trigger_qd[qd_base + j]
+    elif cache_active_mask[env_id] == 1:
+        for i in range(coord_count):
+            dst_q[q_base + i] = src_continue_q[q_base + i]
+        for j in range(dof_count):
+            dst_qd[qd_base + j] = src_continue_qd[qd_base + j]
+    else:
+        for i in range(coord_count):
+            dst_q[q_base + i] = 0.0
+        for j in range(dof_count):
+            dst_qd[qd_base + j] = 0.0
+
+
+@wp.kernel
+def clear_continuation_flags(
+    # outputs (inout)
+    cache_is_continuation: wp.array(dtype=int),
+):
+    """Clear the ``cache_is_continuation`` flag for all envs.
+
+    Called once at substep 0 of every ``step()``, AFTER the action-refresh
+    kernel has consumed the flag. The flag is set again later by
+    ``update_bundle_bookkeeping`` if the horizon spans into the next step().
+    """
+    tid = wp.tid()
+    cache_is_continuation[tid] = 0
+
+
+@wp.kernel
+def reset_bundle_envs_kernel(
+    # inputs
+    done_ids: wp.array(dtype=int),
+    n_done: int,
+    coord_per_env: int,
+    dof_per_env: int,
     # outputs
     bundle_active: wp.array(dtype=int),
     pending_has_result: wp.array(dtype=int),
     pending_target_substep: wp.array(dtype=int),
+    cache_horizon_remaining: wp.array(dtype=int),
+    cache_is_continuation: wp.array(dtype=int),
+    pending_bundle_q: wp.array(dtype=float),
+    pending_bundle_qd: wp.array(dtype=float),
 ):
-    """Mark freshly triggered envs for the upcoming hold window.
+    """Clear bundle bookkeeping for envs in done_ids (per-env reset).
 
-    Called once at trigger time (substep s), after the bundle rollout has
-    been run to completion and its averaged end state is in
-    pending_bundle_q/qd. For each env with bundle_trigger==1:
-
-        bundle_active[e]        = effective_window
-        pending_has_result[e]   = 1
-        pending_target_substep[e] = current_substep + effective_window - 1
-
-    Interpretation: the averaged bundle state corresponds to time
-    (s + effective_window) * dt, which is the state_out of outer substep
-    (s + effective_window - 1). That is the single target substep at which
-    the merge kernel will commit it.
-
-    ``bundle_active`` is counted including the trigger substep itself and
-    decrements once per outer substep in ``update_bundle_bookkeeping`` for
-    every non-target substep. On the target substep the bookkeeping kernel
-    zeroes it directly (rather than decrementing), so the hold window is
-    always positive throughout [s .. s + H - 1] and drops to 0 at the end.
-    This keeps ``detect_bundle_contacts`` (gated on ``bundle_active == 0``)
-    from re-triggering while a pending result is still in flight.
-
-    The effective_window == 1 case works naturally:
-        bundle_active          = 1
-        pending_target_substep = s   (merge commits this same substep; the
-                                      bookkeeping then zeroes bundle_active)
+    Used at episode boundaries: terminated envs must drop any in-flight cache,
+    but continuing envs retain their caches so multi-step bundle horizons
+    survive the partial reset.
     """
     tid = wp.tid()
-    if bundle_trigger[tid] == 1:
-        bundle_active[tid] = effective_window
-        pending_has_result[tid] = 1
-        pending_target_substep[tid] = current_substep + effective_window - 1
+    if tid >= n_done:
+        return
+    e = done_ids[tid]
+    bundle_active[e] = 0
+    pending_has_result[e] = 0
+    pending_target_substep[e] = 0
+    cache_horizon_remaining[e] = 0
+    cache_is_continuation[e] = 0
+    q_off = e * coord_per_env
+    qd_off = e * dof_per_env
+    for qi in range(coord_per_env):
+        pending_bundle_q[q_off + qi] = 0.0
+    for qdi in range(dof_per_env):
+        pending_bundle_qd[qd_off + qdi] = 0.0
 
 
 def _debug_absmax(tensor: torch.Tensor) -> float:
@@ -3231,32 +3425,43 @@ class MoreauIntegrator:
         self._bundle_perturbation_clamp_q = 0.1
         self._bundle_perturbation_clamp_qd = 0.5
 
-    def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps):
+    def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps, requires_grad=False):
         """Allocate persistent bundle state buffers owned by the integrator.
 
         Called lazily on the first bundle-mode ``simulate()`` call. Allocates:
 
-          - ``self._bundle_states``: dict of State objects for the bundle rollout
-            (``in`` / ``mid`` / ``out_pred`` / ``out``). These correspond to
-            ``bundle_model`` which already holds ``num_envs * num_bundle_samples``
-            articulations — one slot per (main_env, sample).
           - ``self._delta_q_buf`` / ``self._delta_qd_buf``: per-sample leg-DOF
             delta staging buffers consumed by the perturbation kernels.
           - ``self._pending_bundle_q`` / ``self._pending_bundle_qd``: per-main-env
-            pending averaged bundle end state. When an env triggers bundling at
-            outer substep ``s`` with effective horizon ``H``, the inner rollout
-            writes the averaged end state here; ``merge_state_transitions``
-            later commits it into ``state_out`` at outer substep ``s + H - 1``.
+            pending averaged bundle end state. The inner rollout writes the
+            averaged end state here; ``merge_state_transitions`` commits it
+            into ``state_out`` at the substep stored in
+            ``self._pending_target_substep``.
           - ``self._pending_has_result``: 1 if a pending result is waiting.
           - ``self._pending_target_substep``: outer substep at which the pending
-            result should be committed (= trigger_substep + H - 1).
-          - ``self._bundle_active``: per-env hold-window countdown. Set to
-            ``H - 1`` on trigger (remaining hold substeps AFTER the trigger
-            substep itself); decrements each subsequent outer substep.
+            result should be committed.
+          - ``self._bundle_active``: binary per-env flag, 1 iff the env has a
+            live multi-step bundle cache (covers the entire trigger → horizon-end
+            lifetime, including cross-step continuation). Used as the
+            re-trigger suppression gate in ``detect_bundle_contacts``.
+          - ``self._cache_horizon_remaining``: inner substeps still to roll out
+            for this env's cache. Set to ``H`` on trigger; decremented once per
+            inner substep.
+          - ``self._cache_is_continuation``: set when an end-of-step commit
+            fires with horizon still remaining; consumed at substep 0 of the
+            next ``step()`` to refresh bundle actions from the new policy
+            action, then cleared.
+
+        Bundle state for the cache lives in ``bundle_model.joint_q / joint_qd``;
+        those arrays are persistent buffers that act as the cross-step bridge
+        for cache state (the autograd wrapper plants the input cache torch
+        tensor into them at the start of each ``step()``'s forward, and reads
+        them out into the output cache tensor at the end).
 
         Integrator-owned state: never passed through the ``simulate()`` API.
-        Callers that need to clear it at episode boundaries should call
-        :meth:`reset_bundle`.
+        Callers should call :meth:`reset_bundle` to clear it globally (used in
+        ``reset_grad``), or :meth:`reset_bundle_envs` for per-env clearing on
+        episode termination.
         """
         device = model.device
         num_envs = model.articulation_count
@@ -3270,47 +3475,38 @@ class MoreauIntegrator:
             self._root_qd_dim = int(jqds[1].item() - jqds[0].item())
         leg_dof_count = max(dof_per_env - self._root_qd_dim, 1)
 
+        # Ensure bundle_model.joint_q / joint_qd are grad-enabled so they can
+        # act as the cross-step gradient bridge. The default finalize_bundle
+        # allocates these without requires_grad=True.
+        if requires_grad and not getattr(self, "_bundle_model_state_grad_enabled", False):
+            if not bundle_model.joint_q.requires_grad:
+                bundle_model.joint_q = wp.zeros(
+                    bundle_model.joint_coord_count,
+                    dtype=float, device=device, requires_grad=True,
+                )
+            if not bundle_model.joint_qd.requires_grad:
+                bundle_model.joint_qd = wp.zeros(
+                    bundle_model.joint_dof_count,
+                    dtype=float, device=device, requires_grad=True,
+                )
+            self._bundle_model_state_grad_enabled = True
+
+        # NOTE: bundle action arrays are NOT bound persistently. They're
+        # allocated fresh per-step() forward in the wrapper (and rebound on
+        # bundle_model). This mirrors the original code's per-trigger fresh
+        # allocation and avoids cross-step gradient aliasing on
+        # bundle_model.joint_target's .grad. For cross-step bundle horizons
+        # with continuation envs, the wrapper plumbs continuation refresh by
+        # re-copying main joint_target into the fresh bundle_joint_target at
+        # the start of each step()'s forward (substep 0) for cache-active
+        # envs.
+
         if (
             self._bundle_initialized
             and getattr(self, "_bundle_num_envs", -1) == num_envs
             and getattr(self, "_bundle_num_samples", -1) == num_bundle_samples
-            and getattr(self, "_bundle_horizon_substeps", -1) == bundle_horizon_substeps
         ):
             return
-
-        # Mirror the stable non-bundle path: each inner substep gets its own
-        # state buffers instead of reusing a single mid/out scratch state.
-        self._bundle_state_traj = [
-            bundle_model.state(requires_grad=False)
-            for _ in range(bundle_horizon_substeps + 1)
-        ]
-        self._bundle_state_mid = [
-            bundle_model.state(requires_grad=False)
-            for _ in range(bundle_horizon_substeps)
-        ]
-        self._bundle_state_out_pred = [
-            bundle_model.state(requires_grad=False)
-            for _ in range(bundle_horizon_substeps)
-        ]
-
-        # The normal wrapper swaps in a fresh matrix set per substep. Do the
-        # same for bundle rollout steps so contact/Jacobian scratch does not
-        # alias across the inner horizon.
-        self._bundle_matrices = []
-        for _ in range(bundle_horizon_substeps):
-            bundle_model.alloc_mass_matrix()
-            self._bundle_matrices.append(
-                [
-                    bundle_model.M,
-                    bundle_model.J,
-                    bundle_model.P,
-                    bundle_model.H,
-                    bundle_model.L,
-                    bundle_model.Jc,
-                    bundle_model.G,
-                    bundle_model.G_mat,
-                ]
-            )
 
         total_slots = num_envs * num_bundle_samples
         self._delta_q_buf = wp.zeros(
@@ -3331,6 +3527,8 @@ class MoreauIntegrator:
         self._pending_has_result = wp.zeros(num_envs, dtype=int, device=device)
         self._pending_target_substep = wp.zeros(num_envs, dtype=int, device=device)
         self._bundle_active = wp.zeros(num_envs, dtype=int, device=device)
+        self._cache_horizon_remaining = wp.zeros(num_envs, dtype=int, device=device)
+        self._cache_is_continuation = wp.zeros(num_envs, dtype=int, device=device)
 
         self._bundle_num_envs = num_envs
         self._bundle_num_samples = num_bundle_samples
@@ -3345,14 +3543,61 @@ class MoreauIntegrator:
         self._bundle_initialized = True
 
     def reset_bundle(self):
-        """Clear all pending bundle bookkeeping (call at episode boundaries)."""
+        """Clear all pending bundle bookkeeping (call at episode boundaries
+        via ``reset_grad``). For per-env termination clearing during normal
+        env resets, use :meth:`reset_bundle_envs` instead.
+        """
         if not self._bundle_initialized:
             return
         self._pending_has_result.zero_()
         self._pending_target_substep.zero_()
         self._bundle_active.zero_()
+        self._cache_horizon_remaining.zero_()
+        self._cache_is_continuation.zero_()
         self._pending_bundle_q.zero_()
         self._pending_bundle_qd.zero_()
+
+    def reset_bundle_envs(self, done_ids):
+        """Clear bundle bookkeeping for terminated envs only.
+
+        ``done_ids`` is a 1-D torch tensor of env indices that just terminated.
+        Their per-env bundle state (active flag, horizon counter, pending result,
+        continuation flag, pending q/qd slices) is zeroed; other envs are
+        untouched so their multi-step caches survive the partial reset.
+
+        Note: the per-sample cache state held in ``bundle_model.joint_q/qd``
+        is cleared on the autograd-wrapper side (per-env zeroing of the cache
+        torch tensors), not here — this method clears integrator-owned arrays.
+        """
+        if not self._bundle_initialized:
+            return
+        if done_ids is None:
+            return
+        n_done = int(done_ids.numel())
+        if n_done == 0:
+            return
+
+        device = self._bundle_active.device
+        torch_device = wp.device_to_torch(device)
+        done_ids_wp = wp.from_torch(done_ids.to(torch_device).to(torch.int32).contiguous())
+        coord_per_env = int(self._pending_bundle_q.shape[0] / self._bundle_num_envs)
+        dof_per_env = int(self._pending_bundle_qd.shape[0] / self._bundle_num_envs)
+        wp.launch(
+            kernel=reset_bundle_envs_kernel,
+            dim=n_done,
+            inputs=[done_ids_wp, n_done, coord_per_env, dof_per_env],
+            outputs=[
+                self._bundle_active,
+                self._pending_has_result,
+                self._pending_target_substep,
+                self._cache_horizon_remaining,
+                self._cache_is_continuation,
+                self._pending_bundle_q,
+                self._pending_bundle_qd,
+            ],
+            device=device,
+            record_tape=False,
+        )
 
     def _run_fk_foot_pos(self, model):
         """Evaluate FK using self._fk_scratch_joint_q/_qd; return foot positions.
@@ -4406,37 +4651,11 @@ class MoreauIntegrator:
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
 
-        if getattr(self, "_merge_snapshot_num_substeps", -1) != num_substeps:
-            self._merge_snapshot_bundle_active = [
-                wp.zeros(num_envs, dtype=int, device=device)
-                for _ in range(num_substeps)
-            ]
-            self._merge_snapshot_pending_has_result = [
-                wp.zeros(num_envs, dtype=int, device=device)
-                for _ in range(num_substeps)
-            ]
-            self._merge_snapshot_pending_target_substep = [
-                wp.zeros(num_envs, dtype=int, device=device)
-                for _ in range(num_substeps)
-            ]
-            self._merge_snapshot_pending_bundle_q = [
-                wp.zeros(
-                    model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad
-                )
-                for _ in range(num_substeps)
-            ]
-            self._merge_snapshot_pending_bundle_qd = [
-                wp.zeros(
-                    model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad
-                )
-                for _ in range(num_substeps)
-            ]
-            self._merge_snapshot_num_substeps = num_substeps
-
         # Lazily allocate integrator-owned bundle buffers. Also derives and
         # caches root_q_dim / root_qd_dim from model metadata.
         self._lazy_init_bundle(
-            model, bundle_model, num_bundle_samples, bundle_horizon_substeps
+            model, bundle_model, num_bundle_samples, bundle_horizon_substeps,
+            requires_grad=requires_grad,
         )
         root_q_dim = self._root_q_dim
         root_qd_dim = self._root_qd_dim
@@ -4629,12 +4848,81 @@ class MoreauIntegrator:
         )
 
         # ============================================================
+        # Phase B-pre: ACTION REFRESH FOR CONTINUATION ENVS (substep 0 only)
+        # If any env entered this step with cache_is_continuation==1 (its
+        # bundle horizon spans this step()), refresh its bundle slots' actions
+        # from the main model's current joint_act/target — this is what makes
+        # "actions frozen across substeps, refreshed at every step() boundary"
+        # work for cross-step caches. Then clear the continuation flag so
+        # substeps 1+ within this step() don't re-refresh.
+        # CPU-side any() check: skip the wp.launch entirely (vs running with
+        # an all-zero mask) so the Warp tape sees no multi-write on
+        # bundle_model.joint_act / joint_target when no envs need refreshing.
+        # ============================================================
+        if substep == 0:
+            any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
+            if any_continuation:
+                # Snapshot the continuation flag — the live ``self._cache_is_continuation``
+                # is cleared off-tape immediately after the copy, and is also
+                # rewritten in later step()'s, so the tape adjoint would
+                # otherwise re-read a zeroed mask and skip the gradient
+                # propagation from bundle_model.joint_target back to
+                # model.joint_target for continuation envs.
+                continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
+                wp.launch(
+                    kernel=copy_int_array,
+                    dim=num_envs,
+                    inputs=[self._cache_is_continuation],
+                    outputs=[continuation_mask],
+                    device=device,
+                    record_tape=False,
+                )
+                # Allocate fresh per-substep bundle action arrays. Re-binding
+                # bundle_model.joint_target/joint_act keeps every copy_jt
+                # → inner_sim chain free of multi-write aliasing on the tape:
+                # Warp's adjoint for a write kernel ACCUMULATES (does not zero)
+                # the output .grad, so reusing one shared buffer across
+                # substeps that each fire a copy_jt over-counts gradients by
+                # the number of write-then-read passes.
+                bundle_model.joint_act = wp.zeros(
+                    bundle_model.joint_dof_count, dtype=float, device=device,
+                    requires_grad=requires_grad,
+                )
+                bundle_model.joint_target = wp.zeros(
+                    bundle_model.joint_coord_count, dtype=float, device=device,
+                    requires_grad=requires_grad,
+                )
+                wp.launch(
+                    kernel=copy_joint_actions_to_bundle,
+                    dim=num_envs * num_bundle_samples,
+                    inputs=[
+                        continuation_mask,
+                        num_envs,
+                        model.articulation_coord_start,
+                        model.articulation_dof_start,
+                        model.joint_act,
+                        model.joint_target,
+                        dof_per_env,
+                        coord_per_env,
+                    ],
+                    outputs=[bundle_model.joint_act, bundle_model.joint_target],
+                    device=device,
+                    record_tape=requires_grad,
+                )
+                wp.launch(
+                    kernel=clear_continuation_flags,
+                    dim=num_envs,
+                    inputs=[],
+                    outputs=[self._cache_is_continuation],
+                    device=device,
+                    record_tape=False,
+                )
+
+        # ============================================================
         # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
         # detect_bundle_contacts unconditionally fills contact_feet_mask from
-        # the current point_vec (every env), but only sets bundle_trigger=1
-        # for envs with bundle_active==0 (envs inside an active hold window
-        # or with a pending result in flight are suppressed — their state
-        # will be committed when pending_target_substep is reached).
+        # the current point_vec, but only sets bundle_trigger=1 for envs with
+        # bundle_active==0 (cache-active envs are suppressed from re-trigger).
         # ============================================================
         bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
         contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
@@ -4649,66 +4937,44 @@ class MoreauIntegrator:
         )
 
         # ============================================================
-        # Phase C: H-STEP INNER ROLLOUT FOR NEWLY TRIGGERED ENVS
-        # For each env with bundle_trigger==1:
-        #   1) Copy current actions into all bundle slots of that env
-        #      (actions are frozen for the entire inner horizon — user spec).
-        #   2) Initialise num_bundle_samples perturbed branches around the
-        #      current main joint state using the main model's Jc.
-        #   3) Step the bundle_model forward for ``effective_window`` inner
-        #      substeps, re-perturbing any newly-contacting feet mid-rollout.
-        #   4) Average the branch end states ONCE and store into
-        #      self._pending_bundle_q/qd.
-        #   5) Stage pending metadata: bundle_active = H-1,
-        #      pending_target_substep = current_substep + H - 1.
-        # Non-triggered envs leave all bundle buffers untouched.
+        # Phase B': TRIGGER PROCESSING
+        # For each env with bundle_trigger==1 (a brand-new bundle starting):
+        #   1) Copy current main actions into the env's bundle slots.
+        #   2) Build perturbed init state for the bundle samples (fresh
+        #      per-substep init_state; only triggered env slots are written).
+        #   3) Set bundle_active=1 and cache_horizon_remaining=H.
+        # Phase C below then merges init_state (for triggered) and the
+        # cross-substep chain[s] (for continuing envs) into a single fresh
+        # b_in state — so chain[s] is single-write (avoids gradient aliasing).
         # ============================================================
-        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
-        effective_window = max(min(bundle_horizon_substeps, num_substeps - substep), 1)
-        if any_triggered:
-            # Fresh bundle states are required here. simulate() does not fully
-            # overwrite every scratch field on State, so reusing bundle mid/out
-            # buffers across triggers leaks stale contact scratch into later
-            # bundle solves.
-            bundle_traj = [
-                bundle_model.state(requires_grad=requires_grad)
-                for _ in range(effective_window + 1)
-            ]
-            bundle_mid = [
-                bundle_model.state(requires_grad=requires_grad)
-                for _ in range(effective_window)
-            ]
-            bundle_out_pred = [
-                bundle_model.state(requires_grad=requires_grad)
-                for _ in range(effective_window)
-            ]
-            bundle_joint_act = wp.zeros(
-                bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad
-            )
-            bundle_joint_target = wp.zeros(
-                bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad
-            )
-            bundle_matrices = []
-            for _ in range(effective_window):
-                bundle_model.alloc_mass_matrix()
-                bundle_matrices.append(
-                    [
-                        bundle_model.M,
-                        bundle_model.J,
-                        bundle_model.P,
-                        bundle_model.H,
-                        bundle_model.L,
-                        bundle_model.Jc,
-                        bundle_model.G,
-                        bundle_model.G_mat,
-                    ]
-                )
+        # The per-step bundle state chain is allocated and chain[0] is
+        # planted from the cache torch tensor in the wrapper. The integrator
+        # progresses chain[i+1] ← inner_simulate(b_in) at each substep i,
+        # where b_in is built per-env from init_state (triggered envs) or
+        # chain[i] (continuing envs) via merge_bundle_input_state.
+        chain = self._bundle_state_chain
+        chain_in = chain[substep]
+        chain_out = chain[substep + 1]
 
-            # 1) Freeze current-substep actions into all bundle slots of
-            #    newly-triggered envs. These remain fixed for the full
-            #    inner horizon.
-            bundle_model.joint_act = bundle_joint_act
-            bundle_model.joint_target = bundle_joint_target
+        init_state = bundle_model.state(requires_grad=requires_grad)
+
+        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
+        if any_triggered:
+            # 1) Freeze current-substep actions into bundle slots of
+            #    newly-triggered envs (per-env masked write). Allocate fresh
+            #    per-substep target/act buffers — see continuation refresh
+            #    above for the rationale (avoids multi-write aliasing on the
+            #    tape when copy_jt fires at multiple substeps within a step,
+            #    e.g. small bundle_horizon_substeps that lets the cache
+            #    expire and re-trigger inside one step()).
+            bundle_model.joint_act = wp.zeros(
+                bundle_model.joint_dof_count, dtype=float, device=device,
+                requires_grad=requires_grad,
+            )
+            bundle_model.joint_target = wp.zeros(
+                bundle_model.joint_coord_count, dtype=float, device=device,
+                requires_grad=requires_grad,
+            )
             wp.launch(
                 kernel=copy_joint_actions_to_bundle,
                 dim=num_envs * num_bundle_samples,
@@ -4722,96 +4988,173 @@ class MoreauIntegrator:
                     dof_per_env,
                     coord_per_env,
                 ],
-                outputs=[bundle_joint_act, bundle_joint_target],
+                outputs=[bundle_model.joint_act, bundle_model.joint_target],
                 device=device,
                 record_tape=requires_grad,
             )
 
-            # 2) Initialise branches around the current main joint state.
-            #    Uses the main model's contact Jacobian — whose leg set
-            #    was freshly refreshed this substep — so newly contacting
-            #    legs at trigger time are included.
+            # 2) Initialize perturbed branches into init_state (fresh
+            #    per-substep) for triggered envs only.
             self._init_bundle_branches(
-                model, state_in, bundle_model, bundle_traj[0],
+                model, state_in, bundle_model, init_state,
                 bundle_trigger, contact_feet_mask,
                 num_bundle_samples, bundle_sigma_pos, bundle_sigma_vel,
                 self._delta_q_buf, self._delta_qd_buf,
                 root_q_dim, root_qd_dim, requires_grad,
             )
 
-            # 3) H-step inner rollout. Each inner substep uses the non-bundle
-            #    branch of simulate(), then we re-detect newly contacting feet
-            #    in each sample and re-perturb the joint state in place using
-            #    that sample's own Jacobian (per-sample Jc).
-            for h in range(effective_window):
-                b_in = bundle_traj[h]
-                b_out = bundle_traj[h + 1]
-                b_mid = bundle_mid[h]
-                b_out_pred = bundle_out_pred[h]
+            # 3) Stage trigger flags: bundle_active=1, horizon=H.
+            wp.launch(
+                kernel=stage_bundle_trigger,
+                dim=num_envs,
+                inputs=[bundle_trigger, bundle_horizon_substeps],
+                outputs=[bundle_active, self._cache_horizon_remaining],
+                device=device,
+                record_tape=False,
+            )
 
-                (
-                    bundle_model.M,
-                    bundle_model.J,
-                    bundle_model.P,
-                    bundle_model.H,
-                    bundle_model.L,
-                    bundle_model.Jc,
-                    bundle_model.G,
-                    bundle_model.G_mat,
-                ) = bundle_matrices[h]
+        # ============================================================
+        # Phase C: ONE INNER SUBSTEP FOR EVERY CACHE-ACTIVE ENV
+        # Build b_in via per-env merge of init_state (triggers) and chain_in
+        # (continuing). Run one inner moreau substep into chain_out. Reperturb.
+        # ============================================================
+        # Snapshot bundle_active to a fresh per-substep wp.array. This is the
+        # value used by every on-tape kernel below that conditions on
+        # ``cache_active``. The live ``bundle_active`` is mutated off-tape by
+        # ``update_bundle_bookkeeping`` later (clears it at horizon end), so
+        # the tape adjoint would otherwise re-read post-bookkeeping values and
+        # take the wrong branch. The snapshot must be a *fresh* allocation
+        # per substep (not a shared persistent buffer) so multi-step backward
+        # — where multiple step()'s forwards run before any backward — does
+        # not overwrite earlier steps' snapshots in place.
+        bundle_active_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=copy_int_array,
+            dim=num_envs,
+            inputs=[bundle_active],
+            outputs=[bundle_active_snapshot],
+            device=device,
+            record_tape=False,
+        )
 
-                self.simulate(
-                    bundle_model, b_in, b_out_pred, b_mid, b_out,
-                    dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
-                    mode=inner_mode,
-                    substep=0, num_substeps=1,
+        any_active = bool(wp.to_torch(bundle_active).any().item())
+        if any_active:
+            b_in = bundle_model.state(requires_grad=requires_grad)
+            wp.launch(
+                kernel=merge_bundle_input_state,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    init_state.joint_q,
+                    init_state.joint_qd,
+                    chain_in.joint_q,
+                    chain_in.joint_qd,
+                    bundle_trigger,
+                    bundle_active_snapshot,
+                    num_envs,
+                    coord_per_env,
+                    dof_per_env,
+                ],
+                outputs=[b_in.joint_q, b_in.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+
+            b_mid = bundle_model.state(requires_grad=requires_grad)
+            b_out_pred = bundle_model.state(requires_grad=requires_grad)
+            bundle_model.alloc_mass_matrix(requires_grad=requires_grad)
+
+            self.simulate(
+                bundle_model, b_in, b_out_pred, b_mid, chain_out,
+                dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
+                mode=inner_mode,
+                substep=0, num_substeps=1,
+            )
+            if self.debug_print_bundle_inner:
+                _print_bundle_inner_debug(
+                    self.debug_current_outer_call,
+                    substep,
+                    num_substeps,
+                    0,
+                    1,
+                    self.debug_head_values,
+                    wp.to_torch(b_in.joint_q).clone(),
+                    wp.to_torch(b_in.joint_qd).clone(),
+                    wp.to_torch(chain_out.joint_q).clone(),
+                    wp.to_torch(chain_out.joint_qd).clone(),
+                    wp.to_torch(chain_out.point_vec).view(num_envs, 4, 3).clone(),
+                    wp.to_torch(chain_out.foot_vel).view(num_envs, 4, 3).clone(),
                 )
-                if self.debug_print_bundle_inner:
-                    _print_bundle_inner_debug(
-                        self.debug_current_outer_call,
-                        substep,
-                        num_substeps,
-                        h,
-                        effective_window,
-                        self.debug_head_values,
-                        wp.to_torch(b_in.joint_q).clone(),
-                        wp.to_torch(b_in.joint_qd).clone(),
-                        wp.to_torch(b_out.joint_q).clone(),
-                        wp.to_torch(b_out.joint_qd).clone(),
-                        wp.to_torch(b_out.point_vec).view(num_envs, 4, 3).clone(),
-                        wp.to_torch(b_out.foot_vel).view(num_envs, 4, 3).clone(),
-                    )
 
-                if h < effective_window - 1:
-                    # Re-perturb any newly-contacting feet in place, then swap
-                    # (b_out becomes b_in for the next inner substep).
-                    self._detect_and_perturb_new_contacts(
-                        bundle_model, b_out, contact_feet_mask, bundle_trigger,
-                        num_bundle_samples, model,
-                        bundle_sigma_pos, bundle_sigma_vel,
-                        self._delta_q_buf, self._delta_qd_buf,
-                        root_q_dim, root_qd_dim, requires_grad,
-                    )
+            # Mid-rollout reperturbation. Gate is (bundle_active AND
+            # cache_horizon_remaining > 1) — we skip reperturb at the final
+            # inner substep of each bundle so the averaged state is the pure
+            # simulate output, mirroring the original behavior (which only
+            # ran reperturb for h < H-1) and avoiding an extra in-place
+            # write to chain_out on the tape at horizon-end substeps.
+            cache_rem_torch = wp.to_torch(self._cache_horizon_remaining)
+            active_torch = wp.to_torch(bundle_active)
+            reperturb_mask_torch = (
+                ((cache_rem_torch > 1) & (active_torch == 1)).to(torch.int32)
+            )
+            if bool(reperturb_mask_torch.any().item()):
+                reperturb_mask = wp.from_torch(reperturb_mask_torch.contiguous())
+                self._detect_and_perturb_new_contacts(
+                    bundle_model, chain_out, contact_feet_mask, reperturb_mask,
+                    num_bundle_samples, model,
+                    bundle_sigma_pos, bundle_sigma_vel,
+                    self._delta_q_buf, self._delta_qd_buf,
+                    root_q_dim, root_qd_dim, requires_grad,
+                )
 
-            bundle_end_state = bundle_traj[effective_window]
+            # Decrement horizon counter for cache-active envs (non-tape).
+            wp.launch(
+                kernel=decrement_cache_horizon,
+                dim=num_envs,
+                inputs=[bundle_active],
+                outputs=[self._cache_horizon_remaining],
+                device=device,
+                record_tape=False,
+            )
 
-            # 4) Average branch end states into the pending per-env buffers.
-            #    This is the single, horizon-end write: the averaged state
-            #    represents the env at simulated time (substep + H) * dt,
-            #    which is the state_out of outer substep (substep + H - 1).
-            target_substep = substep + effective_window - 1
-            pending_bundle_q_slot = self._merge_snapshot_pending_bundle_q[target_substep]
-            pending_bundle_qd_slot = self._merge_snapshot_pending_bundle_qd[target_substep]
+        # ============================================================
+        # Phase D: AVERAGING (when horizon ends OR end-of-outer-step)
+        # compute_do_average builds a per-env gate. For each gated env, the
+        # bundle samples are averaged into the per-substep pending slot, and
+        # the pending flag is set so the merge writes state_out this substep.
+        # ============================================================
+        do_average = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=compute_do_average,
+            dim=num_envs,
+            inputs=[bundle_active, self._cache_horizon_remaining, substep, num_substeps],
+            outputs=[do_average],
+            device=device,
+            record_tape=False,
+        )
 
+        # Skip the average kernel launch entirely when nothing to average —
+        # avoids placing no-op adjoint records on the tape.
+        #
+        # Pending q/qd are also fresh per substep — they carry the bundle
+        # gradient from the average kernel into merge_state_transitions, and
+        # must not be shared across substeps or across step()'s.
+        pending_bundle_q_slot = wp.zeros(
+            model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+        )
+        pending_bundle_qd_slot = wp.zeros(
+            model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+        )
+        any_avg = bool(wp.to_torch(do_average).any().item())
+        if any_avg:
             wp.launch(
                 kernel=average_bundle_into_buffer,
                 dim=num_envs,
                 inputs=[
-                    bundle_trigger,
+                    do_average,
                     num_bundle_samples,
                     num_envs,
-                    bundle_end_state.joint_q,
-                    bundle_end_state.joint_qd,
+                    chain_out.joint_q,
+                    chain_out.joint_qd,
                     model.articulation_coord_start,
                     model.articulation_dof_start,
                     coord_per_env,
@@ -4822,39 +5165,34 @@ class MoreauIntegrator:
                 device=device,
             )
 
-            # 5) Stage pending metadata for these envs.
             wp.launch(
-                kernel=stage_pending_bundle_trigger,
+                kernel=set_pending_after_average,
                 dim=num_envs,
-                inputs=[bundle_trigger, substep, effective_window],
-                outputs=[bundle_active, pending_has_result, pending_target_substep],
+                inputs=[do_average, substep],
+                outputs=[pending_has_result, pending_target_substep],
                 device=device,
                 record_tape=False,
             )
 
         # ============================================================
-        # Phase D: PER-ENV MERGE INTO state_out.joint_q / joint_qd
+        # Phase E: PER-ENV MERGE INTO state_out.joint_q / joint_qd
         # Three-way transition per env:
         #   (W) WRITE PENDING — pending_has_result && pending_target==substep
         #   (H) HOLD          — bundle_active > 0 (not target yet)
         #   (N) NORMAL        — state_out_pred
         # Recorded on the tape so gradients flow through pending_bundle_q/qd
         # (bundle branch) or state_out_pred (normal branch).
+        #
+        # All conditional-input arrays passed to the merge kernel are snapshots
+        # captured *before* any off-tape mutation: bundle_active was snapshotted
+        # in Phase C (no on-tape kernel touches it between Phase C and Phase E),
+        # and pending_has_result/target_substep are snapshotted here right after
+        # set_pending_after_average. Without these snapshots the tape adjoint
+        # would re-read post-bookkeeping values and route gradient through the
+        # wrong branch.
         # ============================================================
-        bundle_active_snapshot = self._merge_snapshot_bundle_active[substep]
-        pending_has_result_snapshot = self._merge_snapshot_pending_has_result[substep]
-        pending_target_substep_snapshot = self._merge_snapshot_pending_target_substep[substep]
-        pending_bundle_q_snapshot = self._merge_snapshot_pending_bundle_q[substep]
-        pending_bundle_qd_snapshot = self._merge_snapshot_pending_bundle_qd[substep]
-
-        wp.launch(
-            kernel=copy_int_array,
-            dim=num_envs,
-            inputs=[bundle_active],
-            outputs=[bundle_active_snapshot],
-            device=device,
-            record_tape=False,
-        )
+        pending_has_result_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        pending_target_substep_snapshot = wp.zeros(num_envs, dtype=int, device=device)
         wp.launch(
             kernel=copy_int_array,
             dim=num_envs,
@@ -4879,8 +5217,8 @@ class MoreauIntegrator:
                 bundle_active_snapshot,
                 pending_has_result_snapshot,
                 pending_target_substep_snapshot,
-                pending_bundle_q_snapshot,
-                pending_bundle_qd_snapshot,
+                pending_bundle_q_slot,
+                pending_bundle_qd_slot,
                 model.articulation_coord_start,
                 model.articulation_dof_start,
                 coord_per_env,
@@ -4895,16 +5233,23 @@ class MoreauIntegrator:
         )
 
         # ============================================================
-        # Phase E: BOOKKEEPING UPDATE
-        # If pending was just committed this substep, clear pending and zero
-        # bundle_active. Otherwise, if we're inside a hold window, decrement
-        # bundle_active by one.
+        # Phase F: BOOKKEEPING UPDATE
+        # Clears pending result on the commit substep. If horizon ended,
+        # zeroes bundle_active and clears continuation. If end-of-step
+        # commit fired with horizon still remaining, marks continuation=1
+        # so the next step()'s substep 0 refreshes actions.
         # ============================================================
         wp.launch(
             kernel=update_bundle_bookkeeping,
             dim=num_envs,
             inputs=[substep],
-            outputs=[bundle_active, pending_has_result, pending_target_substep],
+            outputs=[
+                bundle_active,
+                pending_has_result,
+                pending_target_substep,
+                self._cache_horizon_remaining,
+                self._cache_is_continuation,
+            ],
             device=device,
             record_tape=False,
         )
