@@ -14,16 +14,18 @@
 # limitations under the License.
 
 import warp as wp
+import torch
 from .model import ModelShapeGeometry
 
 from .articulation import eval_fk
+from .collide import collide
 from .model import Model, State
 
 # The single-body kinematic kernels (FK, ID, tau, jacobian, mass, integrate)
 # in active warp use a different `joint_X_c` convention than warp-new's port,
 # so reusing the warp-new versions produced wrong body transforms (foot
 # contact points ended up below the ground). Import the canonical kernels
-# from the active integrator and use them with their native arg list — the
+# from the active integrator and use them with their native arg list -- the
 # rough integrator only adds the contact-handling layer on top.
 from .integrator_moreau import (
     eval_rigid_fk as _active_eval_rigid_fk,
@@ -44,11 +46,36 @@ from .integrator_moreau import (
     safe_mat33_inverse,
 )
 
+# Bundle-mode kernels and helpers. These are layout-generic: they index the
+# joint state by ``articulation_coord_start`` / ``articulation_dof_start`` and
+# ``coord_per_env`` / ``dof_per_env``, which is identical between the active
+# Moreau integrator and the rough one. Only the *contact-trigger detection*
+# kernels differ (the rough integrator's point_vec layout and inactive-slot
+# sentinel are different), so those are defined locally below as
+# ``detect_bundle_contacts_rough`` / ``detect_bundle_branch_contacts_rough``.
+from .integrator_moreau import (
+    copy_joint_actions_to_bundle,
+    average_bundle_into_buffer,
+    init_bundle_state_with_perturbation,
+    apply_perturbation_to_bundle_slots,
+    merge_state_transitions,
+    update_bundle_bookkeeping,
+    stage_bundle_trigger,
+    decrement_cache_horizon,
+    compute_do_average,
+    set_pending_after_average,
+    merge_bundle_input_state,
+    clear_continuation_flags,
+    reset_bundle_envs_kernel,
+    copy_int_array,
+    _print_bundle_inner_debug,
+)
+
 
 # Temporary flat-ground debug override. Set this to wp.constant(0) to use the
 # collision normals from wp.sim.collide again.
 # When 1, all contact normals fed into the Moreau prox solver are clamped to
-# (0,1,0).  Required for stable G1 (8-contact) behavior in flat envs — without
+# (0,1,0).  Required for stable G1 (8-contact) behavior in flat envs -- without
 # it the broadphase produces slightly off-axis normals for the four spheres
 # clustered on each foot body, which compound into a slow drift downward.
 # Setting this to 0 re-enables true surface normals (needed for rough terrain
@@ -1497,7 +1524,7 @@ def _dense_cholesky_rough(
 # through `(A^-1)b = x`. Active warp's codegen triggers eager parsing of
 # `_dense_cholesky_rough` from the decorator and fails because `_dense_index_rough` (a
 # `@wp.func`) hasn't been registered yet. We keep the same semantics by simply
-# omitting the no-op grad — warp will auto-generate, but `_dense_cholesky_rough` is
+# omitting the no-op grad -- warp will auto-generate, but `_dense_cholesky_rough` is
 # only invoked from `_dense_solve_rough` whose explicit grad below handles the path.
 
 
@@ -1953,7 +1980,7 @@ def construct_contact_jacobian(
                 dist = wp.dot(c_normal, p_surface - p_surface_other)
 
                 # Bounds check for Jacobian lookup. Topology decisions stay
-                # discrete — they're integer/array bounds, not float comparisons,
+                # discrete -- they're integer/array bounds, not float comparisons,
                 # so no gradient flows through them anyway.
                 raw_joint = body_to_joint[target_safe_body]
                 local_joint_idx = raw_joint - art_start
@@ -1987,7 +2014,7 @@ def construct_contact_jacobian(
                         J_rot_z_row = local_joint_idx * 6 + 2
 
                         # When topology_ok is false, local_joint_idx may be
-                        # out of bounds — guard the J reads with a clamp so we
+                        # out of bounds -- guard the J reads with a clamp so we
                         # never index past the end of J. The gate is zero in
                         # that case, so the value we write is zero either way.
                         safe_joint_idx = local_joint_idx
@@ -2671,7 +2698,7 @@ def split_matrix_8(
     a_24: wp.array(dtype=float),
 ):
     # 8-contact (24-row) variant of split_matrix. The Jc / Inv_M_times_Jc_t
-    # matrix layout in the 8-contact case has 24 = 8 contacts × 3 spatial dims
+    # matrix layout in the 8-contact case has 24 = 8 contacts x 3 spatial dims
     # rows per articulation, each of length `dof_count`.
     tid = wp.tid()
 
@@ -2766,7 +2793,7 @@ def matmul_batched(batch_count, m, n, k, t1, t2, A_start, B_start, C_start, A, B
     with 256 threads per batch on GPU (the C++ dense_gemm_batched uses
     tid()/256 to pick the batch and runs one output cell per thread). Our
     earlier (broken) version launched only `batch_count` threads which only
-    filled the first cell of every output matrix — that's where the rough
+    filled the first cell of every output matrix -- that's where the rough
     integrator's H ended up almost-zero. Forward to the active helper.
     """
     _active_matmul_batched(batch_count, m, n, k, t1, t2, A_start, B_start, C_start, A, B, C, device)
@@ -2876,14 +2903,14 @@ def prox_iteration_unrolled_soft(
     ground_2 = ground_point_vec[tid * 4 + 2]
     ground_3 = ground_point_vec[tid * 4 + 3]
     
-    # Signed gap along the contact normal — stop-gradient variant so the
+    # Signed gap along the contact normal -- stop-gradient variant so the
     # offset_sigmoid gate does NOT backprop through point/ground positions.
     c_0 = contact_gap_stop_grad(n0, point_0, ground_0)
     c_1 = contact_gap_stop_grad(n1, point_1, ground_1)
     c_2 = contact_gap_stop_grad(n2, point_2, ground_2)
     c_3 = contact_gap_stop_grad(n3, point_3, ground_3)
 
-    # c_vec is fed UNGATED into the prox loop — only the final percussion is
+    # c_vec is fed UNGATED into the prox loop -- only the final percussion is
     # gated by offset_sigmoid below. This matches active moreau (which has
     # `c_vec_X = c_vec[tid, X]  # * offset_sigmoid(...)` commented out). The
     # earlier rough port double-gated (c_vec at entry AND percussion at exit),
@@ -3332,7 +3359,7 @@ def offset_sigmoid(x: float, scale: float, offset: float):
 
 # ----------------------------------------------------------------------------
 # 8-contact prox functions/kernels (used by G1, which has 4 contact spheres
-# per foot × 2 feet). Mirrors the 4-contact prox_loop / prox_loop_soft but
+# per foot x 2 feet). Mirrors the 4-contact prox_loop / prox_loop_soft but
 # extended to 8 simultaneous contacts. Friction cone is projected against the
 # per-contact normal (not the y-axis), preserving rough-terrain support.
 # ----------------------------------------------------------------------------
@@ -3866,7 +3893,7 @@ def prox_iteration_unrolled_soft_8(
     ground_6 = ground_point_vec[tid * 8 + 6]
     ground_7 = ground_point_vec[tid * 8 + 7]
 
-    # Signed gap along the contact normal — stop-gradient variant (same
+    # Signed gap along the contact normal -- stop-gradient variant (same
     # reasoning as the 4-contact kernel: prevents sigmoid gate from
     # backpropagating ~75x amplification through contact positions to joint_q).
     c_0 = contact_gap_stop_grad(n0, point_0, ground_0)
@@ -4044,7 +4071,7 @@ def compute_body_qd_inertial(
     """
     Transform body velocities from spatial (at joint origin) to inertial (at body origin).
     
-    For FREE joint (base): v_inertial = v + ω × r
+    For FREE joint (base): v_inertial = v + w x r
     For other joints: We need to propagate spatial velocities through the chain.
     
     This kernel handles the FREE joint case for body 0.
@@ -4073,6 +4100,138 @@ def compute_body_qd_inertial(
 
 ############################# Moreau specific Kernels & Functions  END  #############################
 
+
+############################# Bundle-mode contact detection (rough)  BEGIN  #########################
+
+
+@wp.kernel
+def detect_bundle_contacts_rough(
+    # inputs
+    c_body_vec: wp.array(dtype=int),
+    num_contacts: int,
+    bundle_active: wp.array(dtype=int),
+    bundle_slot_to_group: wp.array(dtype=int),
+    # outputs
+    bundle_trigger: wp.array(dtype=int),
+    contact_feet_mask: wp.array(dtype=int),
+):
+    """Rough-integrator bundle trigger detection.
+
+    The rough contact solver marks an ``(articulation, slot)`` pair as active by
+    writing ``c_body_vec[tid*num_contacts+slot] >= 0`` (the contacting body
+    index), and ``-1`` for inactive slots (see ``construct_contact_jacobian``).
+    This activation flag is the robust trigger signal: unlike the active Moreau
+    integrator (which inits inactive ``point_vec`` slots to the above-ground
+    sentinel ``(0,1,0)``), the rough integrator zeroes ``point_vec`` for inactive
+    slots, so a ``point_vec.y <= col_height`` test would false-trigger on every
+    inactive slot.
+
+    ``contact_feet_mask`` bits correspond to group indices; ``bundle_slot_to_group``
+    maps each contact slot to its group (-1 = slot unused). The mask is always
+    filled (continuing-bundle envs use it to refresh their leg set). A fresh
+    trigger is only raised for envs with ``bundle_active==0``.
+    """
+    tid = wp.tid()
+
+    mask = int(0)
+    any_contact = int(0)
+
+    for f in range(num_contacts):
+        g = bundle_slot_to_group[f]
+        if g < 0:
+            continue
+        if c_body_vec[tid * num_contacts + f] >= 0:
+            mask = mask | (1 << g)
+            any_contact = 1
+
+    contact_feet_mask[tid] = mask
+
+    if bundle_active[tid] > 0:
+        bundle_trigger[tid] = 0
+    else:
+        bundle_trigger[tid] = any_contact
+
+
+@wp.kernel
+def detect_bundle_branch_contacts_rough(
+    # inputs
+    point_vec: wp.array(dtype=wp.vec3),
+    col_height: float,
+    num_contacts: int,
+    bundle_slot_to_group: wp.array(dtype=int),
+    # outputs
+    branch_contact_mask: wp.array(dtype=int),
+):
+    """Detect foot-ground contacts for bundle branch envs (rough).
+
+    Runs on ``bundle_model.articulation_count``. Reads ``point_vec`` as written
+    by ``get_foot_states_rough`` on the branch OUTPUT state -- that kernel
+    initializes inactive slots to ``(0,1,0)`` (above ground) and overwrites only
+    contacting slots with the surface point, so the ``p.y <= col_height`` test is
+    valid here (matching the active Moreau branch detection). Layout is
+    ``tid*num_contacts+slot``; bits are group indices.
+    """
+    tid = wp.tid()
+
+    mask = int(0)
+    for f in range(num_contacts):
+        g = bundle_slot_to_group[f]
+        if g < 0:
+            continue
+        p = point_vec[tid * num_contacts + f]
+        if p[1] <= col_height:
+            mask = mask | (1 << g)
+
+    branch_contact_mask[tid] = mask
+
+
+@wp.kernel
+def merge_foot_states(
+    # inputs
+    do_average: wp.array(dtype=int),
+    num_bundle_samples: int,
+    num_envs: int,
+    num_contacts: int,
+    bundle_point_vec: wp.array(dtype=wp.vec3),   # chain_out (samples-major)
+    bundle_foot_vel: wp.array(dtype=wp.vec3),
+    fk_point_vec: wp.array(dtype=wp.vec3),       # FK-tail foot (main-env layout)
+    fk_foot_vel: wp.array(dtype=wp.vec3),
+    # outputs
+    out_point_vec: wp.array(dtype=wp.vec3),
+    out_foot_vel: wp.array(dtype=wp.vec3),
+):
+    """Per-env merge of foot states -- SOLE writer of state_out.point_vec/foot_vel.
+
+    Foot states are a reporting output. For a COMMITTED bundled env
+    (``do_average==1``) the FK-tail foot (computed from the merged joint state
+    with the held trigger-time main contacts) differs slightly from the soft
+    baseline, which uses advancing contacts. The inner rollout already computed
+    the foot on the bundle model with the correct (main-replicated, advancing)
+    contacts, so committed envs take the sample-averaged bundle foot -- bit-
+    identical to soft for the zero-noise single sample. All other envs take the
+    FK-tail value. A single write per env keeps the tape free of foot
+    double-writes (which would inflate the action adjoint). Bundle layout is
+    samples-major (slot = s*num_envs + env).
+    """
+    tid = wp.tid()
+    if do_average[tid] == 1:
+        inv_n = 1.0 / float(num_bundle_samples)
+        for c in range(num_contacts):
+            pv = wp.vec3(0.0, 0.0, 0.0)
+            fv = wp.vec3(0.0, 0.0, 0.0)
+            for s in range(num_bundle_samples):
+                slot = s * num_envs + tid
+                pv = pv + bundle_point_vec[slot * num_contacts + c]
+                fv = fv + bundle_foot_vel[slot * num_contacts + c]
+            out_point_vec[tid * num_contacts + c] = pv * inv_n
+            out_foot_vel[tid * num_contacts + c] = fv * inv_n
+    else:
+        for c in range(num_contacts):
+            out_point_vec[tid * num_contacts + c] = fk_point_vec[tid * num_contacts + c]
+            out_foot_vel[tid * num_contacts + c] = fk_foot_vel[tid * num_contacts + c]
+
+
+############################# Bundle-mode contact detection (rough)   END   #########################
 
 
 class MoreauRoughIntegrator(Integrator):
@@ -4139,8 +4298,8 @@ class MoreauRoughIntegrator(Integrator):
             update_mass_matrix_every (int, optional): How often to update the mass matrix (every n-th time the :meth:`simulate` function gets called). Defaults to 1.
             friction_smoothing (float, optional): The delta value for the Huber norm (see :func:`warp.math.norm_huber`) used for the friction velocity normalization. Defaults to 1.0.
             num_contacts (int, optional): Number of contact slots per articulation.
-                Supported values are ``4`` (ANYmal-style: 1 sphere per foot × 4 feet)
-                and ``8`` (G1-style: 4 spheres per foot × 2 feet). When ``None``
+                Supported values are ``4`` (ANYmal-style: 1 sphere per foot x 4 feet)
+                and ``8`` (G1-style: 4 spheres per foot x 2 feet). When ``None``
                 (the default), reads ``model.num_contacts_per_env`` if present and
                 falls back to ``4``.
         """
@@ -4164,6 +4323,25 @@ class MoreauRoughIntegrator(Integrator):
 
         self._step = 0
 
+        # ---- Bundle-mode state (lazily allocated on first bundle simulate) ----
+        # See _lazy_init_bundle. Mirrors MoreauIntegrator's bundle config.
+        self._bundle_initialized = False
+        self._bundle_integrator = None  # second integrator sized for bundle_model
+        self.debug_print_bundle_inner = False
+        self.debug_current_outer_call = 0
+        self.debug_head_values = 6
+        # Dedicated CPU RNG so bundle perturbation sampling never advances the
+        # global torch RNG -- keeps soft and zero-noise bundle trajectories
+        # identical.
+        self._bundle_rng = torch.Generator(device="cpu")
+        # Perturbation settings (see _init_bundle_branches). Set from cfg in the
+        # diffsimrl wrapper when mode == "bundle".
+        self._bundle_perturbation_mode = "jacobian"
+        self._bundle_perturbation_n_iter = 5
+        self._bundle_perturbation_tol = 1e-5
+        self._bundle_perturbation_clamp_q = 0.1
+        self._bundle_perturbation_clamp_qd = 0.5
+
         self.compute_articulation_indices(model)
         self.allocate_model_aux_vars(model)
 
@@ -4181,6 +4359,629 @@ class MoreauRoughIntegrator(Integrator):
             # ensure matrix is reloaded since otherwise an unload can happen during graph capture
             # todo: should not be necessary?
             wp.load_module(device=wp.get_device())
+
+    # ================================================================== #
+    #  Bundle mode                                                        #
+    # ================================================================== #
+    #
+    #  Port of MoreauIntegrator's extended-horizon bundling to the rough /
+    #  generalized-contact integrator. The orchestration (``_simulate_bundle``)
+    #  and the layout-generic kernels are shared with the active integrator;
+    #  the rough-specific differences are:
+    #
+    #    * 3-state pipeline (in/mid/out) instead of 4 (no state_out_pred slot in
+    #      the public API) -- the normal candidate is computed into an internally
+    #      allocated state.
+    #    * Integrator-attached matrices (self.M/J/.../Jc) sized per-model -- the
+    #      inner per-sample rollout therefore runs on a SECOND integrator
+    #      (``self._bundle_integrator``) sized for ``bundle_model``.
+    #    * Contacts are SDF/terrain-derived and refreshed by wp.sim.collide every
+    #      substep on BOTH the main model (in the wrapper) and the bundle model
+    #      (here, in Phase C).
+    #    * num_contacts in {4, 8} dispatch and c_body_vec-based trigger detection.
+
+    def alloc_matrix_buffers(self, model, requires_grad=True):
+        """Allocate a fresh per-substep set of integrator-owned matrix buffers.
+
+        Mirrors ``utils.wp_torch_interface._make_rough_matrix_buffers`` but lives
+        on the integrator so the bundle integrator can refresh its own buffers
+        each inner substep (the rough analogue of the active integrator's
+        per-substep ``bundle_model.alloc_mass_matrix``). Warp tapes retain array
+        OBJECTS, so every substep recorded into one tape needs its own set to
+        avoid cross-substep gradient aliasing.
+        """
+        return [
+            wp.zeros((self.M_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.J_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.H_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.Jc_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros((self.G_size,), dtype=wp.float32, device=model.device, requires_grad=requires_grad),
+            wp.zeros(
+                (model.articulation_count, self.num_contacts, self.num_contacts),
+                dtype=wp.mat33, device=model.device, requires_grad=requires_grad,
+            ),
+            wp.zeros((model.articulation_count * self.num_contacts,), dtype=wp.int32, device=model.device),
+            wp.empty_like(model.rigid_contact_shape0),
+            wp.empty_like(model.rigid_contact_shape1),
+        ]
+
+    def set_matrix_buffers(self, buffers):
+        """Install a matrix-buffer set previously produced by alloc_matrix_buffers."""
+        (
+            self.M, self.J, self.P, self.H, self.L, self.Jc, self.G, self.G_mat,
+            self.c_body_vec, self.rigid_contact_body0, self.rigid_contact_body1,
+        ) = buffers
+
+    def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps, requires_grad=False):
+        """Allocate persistent bundle bookkeeping (owned by the MAIN integrator).
+
+        Also constructs the second integrator (``self._bundle_integrator``) sized
+        for ``bundle_model`` and an FK scratch for the perturbation Jacobian.
+        The bundle integrator NEVER owns bundle bookkeeping and is never run in
+        ``mode=="bundle"`` -- it only executes plain inner substeps.
+        """
+        device = model.device
+        num_envs = model.articulation_count
+        dof_per_env = int(model.joint_dof_count / num_envs)
+
+        if not hasattr(self, "_root_q_dim"):
+            jqs = wp.to_torch(model.joint_q_start)
+            jqds = wp.to_torch(model.joint_qd_start)
+            self._root_q_dim = int(jqs[1].item() - jqs[0].item())
+            self._root_qd_dim = int(jqds[1].item() - jqds[0].item())
+        leg_dof_count = max(dof_per_env - self._root_qd_dim, 1)
+
+        # Grad-enable the bundle cross-step bridge arrays.
+        if requires_grad and not getattr(self, "_bundle_model_state_grad_enabled", False):
+            if not bundle_model.joint_q.requires_grad:
+                bundle_model.joint_q = wp.zeros(
+                    bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=True,
+                )
+            if not bundle_model.joint_qd.requires_grad:
+                bundle_model.joint_qd = wp.zeros(
+                    bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=True,
+                )
+            self._bundle_model_state_grad_enabled = True
+
+        # Second integrator for the inner per-sample rollout. Sized for the
+        # bundle model (num_envs * num_samples articulations). Created once.
+        if self._bundle_integrator is None:
+            self._bundle_integrator = MoreauRoughIntegrator(
+                bundle_model, num_contacts=self.num_contacts,
+            )
+            self._bundle_integrator.col_height = float(getattr(self, "col_height", 0.0))
+            self._bundle_fk_scratch = bundle_model.state(requires_grad=False)
+
+        if (
+            self._bundle_initialized
+            and getattr(self, "_bundle_num_envs", -1) == num_envs
+            and getattr(self, "_bundle_num_samples", -1) == num_bundle_samples
+        ):
+            return
+
+        total_slots = num_envs * num_bundle_samples
+        self._delta_q_buf = wp.zeros((total_slots, leg_dof_count), dtype=float, device=device)
+        self._delta_qd_buf = wp.zeros((total_slots, leg_dof_count), dtype=float, device=device)
+
+        self._pending_bundle_q = wp.zeros(
+            model.joint_coord_count, dtype=float, device=device, requires_grad=True
+        )
+        self._pending_bundle_qd = wp.zeros(
+            model.joint_dof_count, dtype=float, device=device, requires_grad=True
+        )
+
+        self._pending_has_result = wp.zeros(num_envs, dtype=int, device=device)
+        self._pending_target_substep = wp.zeros(num_envs, dtype=int, device=device)
+        self._bundle_active = wp.zeros(num_envs, dtype=int, device=device)
+        self._cache_horizon_remaining = wp.zeros(num_envs, dtype=int, device=device)
+        self._cache_is_continuation = wp.zeros(num_envs, dtype=int, device=device)
+
+        self._bundle_num_envs = num_envs
+        self._bundle_num_samples = num_bundle_samples
+        self._bundle_horizon_substeps = bundle_horizon_substeps
+
+        # FK scratch (MAIN model) for the perturbation Jacobian. Needs both the
+        # default body transforms (from model.state) and the rough contact
+        # buffers (point_vec/foot_vel from allocate_state_aux_vars).
+        self._fk_scratch_state = model.state(requires_grad=False)
+        self.allocate_state_aux_vars(model, self._fk_scratch_state, False)
+        self._fk_scratch_state.body_v_s.zero_()
+        self._fk_scratch_joint_q = wp.zeros(model.joint_coord_count, dtype=float, device=device)
+        self._fk_scratch_joint_qd = wp.zeros(model.joint_dof_count, dtype=float, device=device)
+
+        self._bundle_initialized = True
+
+    def reset_bundle(self):
+        """Clear all pending bundle bookkeeping (episode boundary / reset_grad)."""
+        if not self._bundle_initialized:
+            return
+        self._pending_has_result.zero_()
+        self._pending_target_substep.zero_()
+        self._bundle_active.zero_()
+        self._cache_horizon_remaining.zero_()
+        self._cache_is_continuation.zero_()
+        self._pending_bundle_q.zero_()
+        self._pending_bundle_qd.zero_()
+
+    def reset_bundle_envs(self, done_ids):
+        """Clear bundle bookkeeping for terminated envs only."""
+        if not self._bundle_initialized or done_ids is None:
+            return
+        n_done = int(done_ids.numel())
+        if n_done == 0:
+            return
+        device = self._bundle_active.device
+        torch_device = wp.device_to_torch(device)
+        done_ids_wp = wp.from_torch(done_ids.to(torch_device).to(torch.int32).contiguous())
+        coord_per_env = int(self._pending_bundle_q.shape[0] / self._bundle_num_envs)
+        dof_per_env = int(self._pending_bundle_qd.shape[0] / self._bundle_num_envs)
+        wp.launch(
+            kernel=reset_bundle_envs_kernel,
+            dim=n_done,
+            inputs=[done_ids_wp, n_done, coord_per_env, dof_per_env],
+            outputs=[
+                self._bundle_active,
+                self._pending_has_result,
+                self._pending_target_substep,
+                self._cache_horizon_remaining,
+                self._cache_is_continuation,
+                self._pending_bundle_q,
+                self._pending_bundle_qd,
+            ],
+            device=device,
+            record_tape=False,
+        )
+
+    def _run_fk_foot_pos(self, model):
+        """Evaluate FK at ``self._fk_scratch_joint_q`` and return group-center foot
+        positions, shape ``(num_envs, n_groups, 3)``, detached (no tape).
+
+        Rough adaptation of the active integrator's ``_run_fk_foot_pos``: uses the
+        active FK kernel (writes body_X_sc) + ``get_foot_states_rough`` (which
+        initializes inactive slots to the above-ground sentinel), then groups the
+        per-slot points via ``model.bundle_group_sphere_slots``.
+        """
+        state = self._fk_scratch_state
+        device = model.device
+        wp.launch(
+            _active_eval_rigid_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_q_start,
+                model.joint_qd_start,
+                self._fk_scratch_joint_q,
+                model.joint_X_p,
+                model.joint_X_cm,
+                model.joint_axis,
+            ],
+            outputs=[state.body_X_sc, state.body_X_sm],
+            device=device,
+            record_tape=False,
+        )
+        wp.launch(
+            kernel=get_foot_states_rough,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_count,
+                model.articulation_count,
+                self.num_contacts,
+                state.body_X_sc,
+                state.body_v_s,
+                self.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                model.contact_local_x_sign,
+                model.contact_local_y_sign,
+            ],
+            outputs=[state.point_vec, state.foot_vel],
+            device=device,
+            record_tape=False,
+        )
+        wp.synchronize_device()
+        all_pts = wp.to_torch(state.point_vec).reshape(model.articulation_count, self.num_contacts, 3)
+        group_slots = getattr(model, "bundle_group_sphere_slots", [[0], [1], [2], [3]])
+        group_centers = torch.stack(
+            [all_pts[:, slots, :].mean(dim=1) for slots in group_slots], dim=1
+        )
+        return group_centers.clone()
+
+    def _compute_fd_leg_jacobians_batched(
+        self, model, triggered_env_ids, active_groups_per_env,
+        main_jq_snap, root_q_dim, coord_per_env, n_groups, max_perturb_dof, epsilon=1e-4,
+    ):
+        """Central-FD FK Jacobian for all triggered envs in 2*max_perturb_dof FK calls.
+
+        Returns dict[int, Tensor] mapping env_id -> J_fd (n_active_groups*3, max_perturb_dof).
+        Identical in structure to the active integrator; relies on the rough
+        ``_run_fk_foot_pos`` above.
+        """
+        torch_device = wp.device_to_torch(model.device)
+        num_envs = model.articulation_count
+
+        fk_jq_t = wp.to_torch(self._fk_scratch_joint_q)
+        e_tensor = torch.tensor(triggered_env_ids, device=torch_device, dtype=torch.long)
+        dof_base = e_tensor * coord_per_env + root_q_dim
+
+        J_fd_full = torch.zeros(num_envs, n_groups * 3, max_perturb_dof, dtype=torch.float32, device=torch_device)
+
+        for i in range(max_perturb_dof):
+            dof_indices = dof_base + i
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+            fp_plus = self._run_fk_foot_pos(model).clone()
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+            fp_minus = self._run_fk_foot_pos(model)
+            fk_jq_t[dof_indices] = main_jq_snap[dof_indices]
+            J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
+
+        J_fd_dict = {}
+        for e in triggered_env_ids:
+            active_groups = active_groups_per_env.get(e, [])
+            if not active_groups:
+                continue
+            active_rows = [3 * g + xyz for g in active_groups for xyz in range(3)]
+            J_fd_dict[e] = J_fd_full[e][active_rows, :]
+        return J_fd_dict
+
+    def _init_bundle_branches(
+        self, model, state_in, bundle_model, bundle_state_in, should_bundle,
+        contact_feet_mask, num_bundle_samples, bundle_sigma_pos, bundle_sigma_vel,
+        delta_q_buf, delta_qd_buf, root_q_dim, root_qd_dim, requires_grad, damping=1e-4,
+    ):
+        """Initialize the perturbed bundle branches (rough).
+
+        Same algorithm as the active integrator (jacobian / iterative /
+        joint_space modes, per-group for G1 vs combined for ANYmal), reusing the
+        rough FK Jacobian. The only integrator-specific change is that the
+        ``init_bundle_state_with_perturbation`` launch reads the MAIN integrator's
+        ``self.articulation_coord_start`` / ``self.articulation_dof_start`` (the
+        rough integrator owns those arrays).
+        """
+        del bundle_model
+        device = model.device
+        torch_device = wp.device_to_torch(device)
+        num_envs = model.articulation_count
+        coord_per_env = int(model.joint_coord_count / num_envs)
+        dof_per_env = int(model.joint_dof_count / num_envs)
+        leg_dof_count = dof_per_env - root_qd_dim
+
+        n_groups = getattr(model, "bundle_n_groups", 4)
+        group_dof_start = getattr(model, "bundle_group_dof_start", None)
+        group_dof_end = getattr(model, "bundle_group_dof_end", None)
+        max_perturb_dof = getattr(model, "bundle_max_perturb_dof", leg_dof_count)
+        per_group_solve = group_dof_start is not None
+
+        perturbation_mode = getattr(self, "_bundle_perturbation_mode", "jacobian")
+        n_iter = getattr(self, "_bundle_perturbation_n_iter", 5)
+        iter_tol = getattr(self, "_bundle_perturbation_tol", 1e-5)
+        clamp_q = getattr(self, "_bundle_perturbation_clamp_q", 0.1)
+        clamp_qd = getattr(self, "_bundle_perturbation_clamp_qd", 0.5)
+        _INF = 1e9
+        dq_clamp = (-clamp_q, clamp_q) if clamp_q > 0 else (-_INF, _INF)
+        dqd_clamp = (-clamp_qd, clamp_qd) if clamp_qd > 0 else (-_INF, _INF)
+
+        with torch.no_grad():
+            should_t = wp.to_torch(should_bundle)
+            triggered_envs = torch.where(should_t > 0)[0]
+
+            delta_q_torch = wp.to_torch(delta_q_buf)
+            delta_qd_torch = wp.to_torch(delta_qd_buf)
+            delta_q_torch.zero_()
+            delta_qd_torch.zero_()
+
+            if len(triggered_envs) > 0:
+                feet_mask_t = wp.to_torch(contact_feet_mask)
+                triggered_list = triggered_envs.cpu().tolist()
+                feet_mask_list = feet_mask_t.cpu().tolist()
+
+                active_groups_per_env = {}
+                valid_triggered = []
+                for e in triggered_list:
+                    mask = int(feet_mask_list[e])
+                    ag = [g for g in range(n_groups) if mask & (1 << g)]
+                    if ag:
+                        active_groups_per_env[e] = ag
+                        valid_triggered.append(e)
+
+                if perturbation_mode in ("jacobian", "iterative"):
+                    fk_jq = wp.to_torch(self._fk_scratch_joint_q)
+                    fk_jqd = wp.to_torch(self._fk_scratch_joint_qd)
+                    fk_jq.copy_(wp.to_torch(state_in.joint_q))
+                    fk_jqd.zero_()
+                    main_foot_pos_all = self._run_fk_foot_pos(model).clone()
+                    main_jq_snap = fk_jq.clone()
+
+                    J_fd_dict = {}
+                    if valid_triggered:
+                        J_fd_dict = self._compute_fd_leg_jacobians_batched(
+                            model, valid_triggered, active_groups_per_env,
+                            main_jq_snap, root_q_dim, coord_per_env, n_groups, max_perturb_dof,
+                        )
+
+                for e in triggered_list:
+                    active_groups = active_groups_per_env.get(e)
+                    if active_groups is None:
+                        continue
+
+                    e_coord_start = e * coord_per_env
+                    bundle_indices = torch.arange(num_bundle_samples, device=torch_device) * num_envs + e
+
+                    if perturbation_mode == "joint_space":
+                        for s in range(num_bundle_samples):
+                            bundle_idx = s * num_envs + e
+                            if per_group_solve:
+                                for g in active_groups:
+                                    ds, de = group_dof_start[g], group_dof_end[g]
+                                    n_dof_g = de - ds
+                                    dq_g = torch.randn(n_dof_g, generator=self._bundle_rng).to(
+                                        device=torch_device, dtype=torch.float32) * bundle_sigma_pos
+                                    dqd_g = torch.randn(n_dof_g, generator=self._bundle_rng).to(
+                                        device=torch_device, dtype=torch.float32) * bundle_sigma_vel
+                                    delta_q_torch[bundle_idx, ds:de] = dq_g.clamp(*dq_clamp)
+                                    delta_qd_torch[bundle_idx, ds:de] = dqd_g.clamp(*dqd_clamp)
+                            else:
+                                delta_q = torch.randn(leg_dof_count, generator=self._bundle_rng).to(
+                                    device=torch_device, dtype=torch.float32) * bundle_sigma_pos
+                                delta_qd = torch.randn(leg_dof_count, generator=self._bundle_rng).to(
+                                    device=torch_device, dtype=torch.float32) * bundle_sigma_vel
+                                delta_q_torch[bundle_idx, :leg_dof_count] = delta_q.clamp(*dq_clamp)
+                                delta_qd_torch[bundle_idx, :leg_dof_count] = delta_qd.clamp(*dqd_clamp)
+                        continue
+
+                    J_fd_full = J_fd_dict.get(e)
+                    if J_fd_full is None:
+                        continue
+
+                    if per_group_solve:
+                        for gi, g in enumerate(active_groups):
+                            ds, de = group_dof_start[g], group_dof_end[g]
+                            J_fd_g = J_fd_full[gi * 3 : (gi + 1) * 3, ds:de]
+                            JJt_g = J_fd_g @ J_fd_g.T + damping * torch.eye(3, device=torch_device, dtype=J_fd_g.dtype)
+
+                            if perturbation_mode == "iterative":
+                                main_pos_g = main_foot_pos_all[e, g : g + 1, :]
+                                e_g_abs_start = e_coord_start + root_q_dim + ds
+                                e_g_abs_end = e_coord_start + root_q_dim + de
+                                for s in range(num_bundle_samples):
+                                    bundle_idx = s * num_envs + e
+                                    delta_x_g = torch.randn(3, generator=self._bundle_rng).to(
+                                        device=torch_device, dtype=J_fd_g.dtype) * bundle_sigma_pos
+                                    delta_v_g = torch.randn(3, generator=self._bundle_rng).to(
+                                        device=torch_device, dtype=J_fd_g.dtype) * bundle_sigma_vel
+                                    alpha_q = torch.linalg.solve(JJt_g, delta_x_g)
+                                    dq_g_iter = (J_fd_g.T @ alpha_q).clamp(*dq_clamp)
+                                    for _ in range(n_iter):
+                                        fk_jq[e_coord_start : e_coord_start + coord_per_env].copy_(
+                                            main_jq_snap[e_coord_start : e_coord_start + coord_per_env])
+                                        fk_jq[e_g_abs_start:e_g_abs_end] += dq_g_iter
+                                        trial_pos = self._run_fk_foot_pos(model)
+                                        actual_dx = (trial_pos[e, g : g + 1, :] - main_pos_g).reshape(-1)
+                                        residual = delta_x_g - actual_dx
+                                        if residual.abs().max().item() < iter_tol:
+                                            break
+                                        alpha_corr = torch.linalg.solve(JJt_g, residual)
+                                        dq_g_iter = (dq_g_iter + 0.5 * J_fd_g.T @ alpha_corr).clamp(*dq_clamp)
+                                    alpha_qd = torch.linalg.solve(JJt_g, delta_v_g)
+                                    delta_q_torch[bundle_idx, ds:de] = dq_g_iter
+                                    delta_qd_torch[bundle_idx, ds:de] = (J_fd_g.T @ alpha_qd).clamp(*dqd_clamp)
+                            else:
+                                dx_cpu = torch.randn(3, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_pos
+                                dv_cpu = torch.randn(3, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_vel
+                                dx_gpu = dx_cpu.to(device=torch_device, dtype=J_fd_g.dtype)
+                                dv_gpu = dv_cpu.to(device=torch_device, dtype=J_fd_g.dtype)
+                                alpha_q = torch.linalg.solve(JJt_g, dx_gpu)
+                                alpha_qd = torch.linalg.solve(JJt_g, dv_gpu)
+                                dq_g_all = (J_fd_g.T @ alpha_q).clamp(*dq_clamp)
+                                dqd_g_all = (J_fd_g.T @ alpha_qd).clamp(*dqd_clamp)
+                                delta_q_torch[bundle_indices, ds:de] = dq_g_all.T
+                                delta_qd_torch[bundle_indices, ds:de] = dqd_g_all.T
+                    else:
+                        task_dim = 3 * len(active_groups)
+                        J_fd = J_fd_full
+                        main_foot_pos_e = main_foot_pos_all[e, active_groups, :]
+                        e_leg_slice = slice(e_coord_start + root_q_dim, e_coord_start + coord_per_env)
+                        JJt_fd = J_fd @ J_fd.T + damping * torch.eye(task_dim, device=torch_device, dtype=J_fd.dtype)
+
+                        if perturbation_mode == "iterative":
+                            for s in range(num_bundle_samples):
+                                bundle_idx = s * num_envs + e
+                                delta_x = torch.randn(task_dim, generator=self._bundle_rng).to(
+                                    device=torch_device, dtype=J_fd.dtype) * bundle_sigma_pos
+                                delta_v = torch.randn(task_dim, generator=self._bundle_rng).to(
+                                    device=torch_device, dtype=J_fd.dtype) * bundle_sigma_vel
+                                alpha_q = torch.linalg.solve(JJt_fd, delta_x)
+                                delta_q_iter = (J_fd.T @ alpha_q).clamp(*dq_clamp)
+                                for _ in range(n_iter):
+                                    fk_jq[e_coord_start : e_coord_start + coord_per_env].copy_(
+                                        main_jq_snap[e_coord_start : e_coord_start + coord_per_env])
+                                    fk_jq[e_leg_slice] += delta_q_iter
+                                    trial_foot_pos = self._run_fk_foot_pos(model)
+                                    trial_foot_pos_e = trial_foot_pos[e, active_groups, :]
+                                    actual_delta_x = (trial_foot_pos_e - main_foot_pos_e).reshape(-1)
+                                    residual = delta_x - actual_delta_x
+                                    if residual.abs().max().item() < iter_tol:
+                                        break
+                                    alpha_corr = torch.linalg.solve(JJt_fd, residual)
+                                    delta_q_iter = (delta_q_iter + 0.5 * (J_fd.T @ alpha_corr)).clamp(*dq_clamp)
+                                alpha_qd = torch.linalg.solve(JJt_fd, delta_v)
+                                delta_q_torch[bundle_idx, :leg_dof_count] = delta_q_iter
+                                delta_qd_torch[bundle_idx, :leg_dof_count] = (J_fd.T @ alpha_qd).clamp(*dqd_clamp)
+                        else:
+                            dx_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_pos
+                            dv_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_vel
+                            dx_gpu = dx_cpu.to(device=torch_device, dtype=J_fd.dtype)
+                            dv_gpu = dv_cpu.to(device=torch_device, dtype=J_fd.dtype)
+                            alpha_q = torch.linalg.solve(JJt_fd, dx_gpu)
+                            alpha_qd = torch.linalg.solve(JJt_fd, dv_gpu)
+                            delta_q_all = (J_fd.T @ alpha_q).clamp(*dq_clamp)
+                            delta_qd_all = (J_fd.T @ alpha_qd).clamp(*dqd_clamp)
+                            delta_q_torch[bundle_indices, :max_perturb_dof] = delta_q_all.T
+                            delta_qd_torch[bundle_indices, :max_perturb_dof] = delta_qd_all.T
+
+            wp.launch(
+                kernel=init_bundle_state_with_perturbation,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    should_bundle,
+                    num_envs,
+                    self.articulation_coord_start,
+                    self.articulation_dof_start,
+                    coord_per_env,
+                    dof_per_env,
+                    root_q_dim,
+                    root_qd_dim,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    delta_q_buf,
+                    delta_qd_buf,
+                ],
+                outputs=[bundle_state_in.joint_q, bundle_state_in.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+
+    def _detect_and_perturb_new_contacts(
+        self, bundle_model, bundle_state_out, contact_feet_mask, reperturb_mask,
+        num_bundle_samples, main_model, main_state_in, bundle_sigma_pos, bundle_sigma_vel,
+        delta_q_buf, delta_qd_buf, root_q_dim, root_qd_dim, requires_grad, damping=1e-4,
+    ):
+        """Detect feet that newly contact mid-rollout and stage perturbations.
+
+        Rough adaptation: branch contact detection uses the output-state
+        ``point_vec`` (above-ground sentinel for inactive slots, written by
+        ``get_foot_states_rough``). Unlike the active integrator -- which uses each
+        sample's own contact Jacobian out of ``bundle_model.Jc`` (a per-row layout
+        that differs in the rough integrator) -- we map the task-space noise to
+        joint deltas via the FD FK Jacobian at the (held) main config. The main
+        state is held constant across an env's bundle horizon, so this Jacobian is
+        a valid linearisation; it avoids the rough Jc layout entirely.
+        """
+        device = bundle_model.device
+        torch_device = wp.device_to_torch(device)
+        num_envs = main_model.articulation_count
+        coord_per_env = int(main_model.joint_coord_count / num_envs)
+        dof_per_env = int(main_model.joint_dof_count / num_envs)
+        leg_dof_count = dof_per_env - root_qd_dim
+        clamp_q = getattr(self, "_bundle_perturbation_clamp_q", 0.1)
+        clamp_qd = getattr(self, "_bundle_perturbation_clamp_qd", 0.5)
+        _INF = 1e9
+        dq_clamp = (-clamp_q, clamp_q) if clamp_q > 0 else (-_INF, _INF)
+        dqd_clamp = (-clamp_qd, clamp_qd) if clamp_qd > 0 else (-_INF, _INF)
+
+        n_groups = getattr(main_model, "bundle_n_groups", 4)
+        group_dof_start = getattr(main_model, "bundle_group_dof_start", None)
+        group_dof_end = getattr(main_model, "bundle_group_dof_end", None)
+        max_perturb_dof = getattr(main_model, "bundle_max_perturb_dof", leg_dof_count)
+        per_group_solve = group_dof_start is not None
+
+        branch_contact_mask = wp.zeros(bundle_model.articulation_count, dtype=int, device=device)
+        wp.launch(
+            kernel=detect_bundle_branch_contacts_rough,
+            dim=bundle_model.articulation_count,
+            inputs=[bundle_state_out.point_vec, main_model.col_height, self.num_contacts, bundle_model.bundle_slot_to_group],
+            outputs=[branch_contact_mask],
+            device=device,
+            record_tape=False,
+        )
+
+        apply_mask_host = torch.zeros(num_envs, dtype=torch.int32)
+        new_groups_per_env = {}
+
+        with torch.no_grad():
+            delta_q_torch = wp.to_torch(delta_q_buf)
+            delta_qd_torch = wp.to_torch(delta_qd_buf)
+            delta_q_torch.zero_()
+            delta_qd_torch.zero_()
+
+            reperturb_t = wp.to_torch(reperturb_mask)
+            branch_mask_t = wp.to_torch(branch_contact_mask)
+            feet_mask_t = wp.to_torch(contact_feet_mask)
+
+            for e in range(num_envs):
+                if int(reperturb_t[e].item()) == 0:
+                    continue
+                union_mask = 0
+                for s in range(num_bundle_samples):
+                    union_mask |= int(branch_mask_t[s * num_envs + e].item())
+                prev_mask = int(feet_mask_t[e].item())
+                newly_contacting = union_mask & ~prev_mask
+                if newly_contacting == 0:
+                    continue
+                feet_mask_t[e] = prev_mask | newly_contacting
+                apply_mask_host[e] = 1
+                new_groups_per_env[e] = [g for g in range(n_groups) if newly_contacting & (1 << g)]
+
+            if not new_groups_per_env:
+                return
+
+            # FD FK Jacobian at the held main config.
+            fk_jq = wp.to_torch(self._fk_scratch_joint_q)
+            fk_jq.copy_(wp.to_torch(main_state_in.joint_q))
+            wp.to_torch(self._fk_scratch_joint_qd).zero_()
+            main_jq_snap = fk_jq.clone()
+            valid = list(new_groups_per_env.keys())
+            J_fd_dict = self._compute_fd_leg_jacobians_batched(
+                main_model, valid, new_groups_per_env,
+                main_jq_snap, root_q_dim, coord_per_env, n_groups, max_perturb_dof,
+            )
+
+            for e in valid:
+                new_groups = new_groups_per_env[e]
+                J_fd_full = J_fd_dict.get(e)
+                if J_fd_full is None:
+                    continue
+                bundle_indices = torch.arange(num_bundle_samples, device=torch_device) * num_envs + e
+                if per_group_solve:
+                    for gi, g in enumerate(new_groups):
+                        ds, de = group_dof_start[g], group_dof_end[g]
+                        J_fd_g = J_fd_full[gi * 3 : (gi + 1) * 3, ds:de]
+                        JJt_g = J_fd_g @ J_fd_g.T + damping * torch.eye(3, device=torch_device, dtype=J_fd_g.dtype)
+                        dx_cpu = torch.randn(3, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_pos
+                        dv_cpu = torch.randn(3, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_vel
+                        dx_gpu = dx_cpu.to(device=torch_device, dtype=J_fd_g.dtype)
+                        dv_gpu = dv_cpu.to(device=torch_device, dtype=J_fd_g.dtype)
+                        alpha_q = torch.linalg.solve(JJt_g, dx_gpu)
+                        alpha_qd = torch.linalg.solve(JJt_g, dv_gpu)
+                        delta_q_torch[bundle_indices, ds:de] = (J_fd_g.T @ alpha_q).clamp(*dq_clamp).T
+                        delta_qd_torch[bundle_indices, ds:de] = (J_fd_g.T @ alpha_qd).clamp(*dqd_clamp).T
+                else:
+                    task_dim = 3 * len(new_groups)
+                    J_fd = J_fd_full
+                    JJt_fd = J_fd @ J_fd.T + damping * torch.eye(task_dim, device=torch_device, dtype=J_fd.dtype)
+                    dx_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_pos
+                    dv_cpu = torch.randn(task_dim, num_bundle_samples, generator=self._bundle_rng) * bundle_sigma_vel
+                    dx_gpu = dx_cpu.to(device=torch_device, dtype=J_fd.dtype)
+                    dv_gpu = dv_cpu.to(device=torch_device, dtype=J_fd.dtype)
+                    alpha_q = torch.linalg.solve(JJt_fd, dx_gpu)
+                    alpha_qd = torch.linalg.solve(JJt_fd, dv_gpu)
+                    delta_q_torch[bundle_indices, :max_perturb_dof] = (J_fd.T @ alpha_q).clamp(*dq_clamp).T
+                    delta_qd_torch[bundle_indices, :max_perturb_dof] = (J_fd.T @ alpha_qd).clamp(*dqd_clamp).T
+
+        apply_mask = wp.from_torch(apply_mask_host.to(torch_device))
+        wp.launch(
+            kernel=apply_perturbation_to_bundle_slots,
+            dim=bundle_model.articulation_count,
+            inputs=[
+                apply_mask,
+                num_envs,
+                coord_per_env,
+                dof_per_env,
+                root_q_dim,
+                root_qd_dim,
+                delta_q_buf,
+                delta_qd_buf,
+            ],
+            outputs=[bundle_state_out.joint_q, bundle_state_out.joint_qd],
+            device=device,
+            record_tape=requires_grad,
+        )
 
     def compute_articulation_indices(self, model):
         # calculate total size and offsets of Jacobian and mass matrices for entire system
@@ -4439,7 +5240,7 @@ class MoreauRoughIntegrator(Integrator):
             target.ground_point_vec = wp.zeros(model.articulation_count * n_c, dtype=wp.vec3, requires_grad=True)
             # Compat: the diffsimrl dispatcher reads state.foot_vel for the env's
             # foot-contact features. The rough pipeline doesn't write it
-            # explicitly (foot velocity is recoverable via Jc * qd) — allocate a
+            # explicitly (foot velocity is recoverable via Jc * qd) -- allocate a
             # zeroed buffer so consumers don't crash.
             target.foot_vel = wp.zeros(model.articulation_count * n_c, dtype=wp.vec3, requires_grad=True)
 
@@ -4551,13 +5352,547 @@ class MoreauRoughIntegrator(Integrator):
 
             target._featherstone_augmented = True
 
-    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, prox_iter: int = 20, mu: float = 0.8, zero_sparse_buffers: bool = False):
-        # Active warp's State doesn't expose `requires_grad` directly — derive
+    def _collide_main_at(self, model, joint_q, joint_qd):
+        """Run eval_fk + collide on the MAIN model at the given (detached) joint
+        config, populating model.rigid_contact_*. Uses the FK scratch state so
+        nothing on the gradient tape is touched."""
+        wp.copy(self._fk_scratch_joint_q, joint_q)
+        wp.copy(self._fk_scratch_joint_qd, joint_qd)
+        eval_fk(model, self._fk_scratch_joint_q, self._fk_scratch_joint_qd, None, self._fk_scratch_state)
+        collide(model, self._fk_scratch_state)
+
+    def _refresh_bundle_contacts(self, model, bundle_model, b_in, num_bundle_samples):
+        """Populate ``bundle_model.rigid_contact_*`` from the MAIN model's collision.
+
+        The bundle model's own broadphase produces a DIFFERENT contact set than
+        the main model for the same config (different collision-pair setup from
+        ``finalize_bundle``), which breaks zero-noise equivalence. Instead we
+        collide the MAIN model at each sample's current config (``b_in``) and
+        replicate the resulting contacts into the bundle model with per-sample
+        body/shape index offsets. For the zero-noise single sample this makes the
+        bundle branch see EXACTLY the main soft substep's contacts.
+
+        Clobbers ``model.rigid_contact_*`` (the caller restores it via
+        ``_collide_main_at`` before the foot-state tail).
+        """
+        num_envs = model.articulation_count
+        main_coord = model.joint_coord_count
+        main_dof = model.joint_dof_count
+        bc = model.body_count
+        sc = model.shape_count
+
+        b_in_q = wp.to_torch(b_in.joint_q)
+        b_in_qd = wp.to_torch(b_in.joint_qd)
+        sjq = wp.to_torch(self._fk_scratch_joint_q)
+        sjqd = wp.to_torch(self._fk_scratch_joint_qd)
+
+        bb0 = wp.to_torch(bundle_model.rigid_contact_body0)
+        bb1 = wp.to_torch(bundle_model.rigid_contact_body1)
+        bp0 = wp.to_torch(bundle_model.rigid_contact_point0)
+        bp1 = wp.to_torch(bundle_model.rigid_contact_point1)
+        bn = wp.to_torch(bundle_model.rigid_contact_normal)
+        bs0 = wp.to_torch(bundle_model.rigid_contact_shape0)
+        bs1 = wp.to_torch(bundle_model.rigid_contact_shape1)
+        bpid = wp.to_torch(bundle_model.rigid_contact_point_id)
+        cap = int(bb0.shape[0])
+
+        offset = 0
+        with torch.no_grad():
+            for s in range(num_bundle_samples):
+                sjq.copy_(b_in_q[s * main_coord:(s + 1) * main_coord])
+                sjqd.copy_(b_in_qd[s * main_dof:(s + 1) * main_dof])
+                eval_fk(model, self._fk_scratch_joint_q, self._fk_scratch_joint_qd, None, self._fk_scratch_state)
+                collide(model, self._fk_scratch_state)
+                mc = int(wp.to_torch(model.rigid_contact_count).item())
+                if mc == 0:
+                    continue
+                if offset + mc > cap:
+                    raise RuntimeError(
+                        f"bundle rigid_contact buffer too small: need {offset + mc}, have {cap}"
+                    )
+                dst = slice(offset, offset + mc)
+                mb0 = wp.to_torch(model.rigid_contact_body0)[:mc]
+                mb1 = wp.to_torch(model.rigid_contact_body1)[:mc].clone()
+                ms0 = wp.to_torch(model.rigid_contact_shape0)[:mc]
+                ms1 = wp.to_torch(model.rigid_contact_shape1)[:mc].clone()
+                bb0[dst] = mb0 + s * bc
+                mb1[mb1 >= 0] += s * bc
+                bb1[dst] = mb1
+                bs0[dst] = ms0 + s * sc
+                ms1[ms1 >= 0] += s * sc
+                bs1[dst] = ms1
+                bp0[dst] = wp.to_torch(model.rigid_contact_point0)[:mc]
+                bp1[dst] = wp.to_torch(model.rigid_contact_point1)[:mc]
+                bn[dst] = wp.to_torch(model.rigid_contact_normal)[:mc]
+                bpid[dst] = wp.to_torch(model.rigid_contact_point_id)[:mc]
+                offset += mc
+        wp.to_torch(bundle_model.rigid_contact_count).fill_(offset)
+
+    def _simulate_bundle(
+        self, model, state_in, state_mid, state_out, dt,
+        requires_grad, prox_iter, max_torque, mu,
+        substep, num_substeps, bundle_model,
+        num_bundle_samples, bundle_horizon_substeps,
+        bundle_sigma_pos, bundle_sigma_vel, bundle_inner_mode,
+    ):
+        """Bundle-mode simulate for the rough integrator (3-state pipeline).
+
+        Mirrors ``MoreauIntegrator._simulate_bundle`` phase-for-phase; see that
+        method for the full semantics. Rough-specific differences:
+
+          * Phase A's normal candidate is computed into an internally-allocated
+            ``state_out_pred`` by recursively calling this integrator's normal
+            ``simulate`` (mode=inner_mode). That call also leaves
+            ``self.c_body_vec`` holding the midpoint contact activation used for
+            trigger detection.
+          * Phase C runs the inner per-sample substep on the SECOND integrator
+            (``self._bundle_integrator``) sized for ``bundle_model``, with a fresh
+            matrix set and fresh ``b_mid`` State per substep (tape lifetime), and
+            refreshes the bundle contacts via wp.sim.collide on a detached scratch.
+          * The final FK/ID/foot tail is run on the merged ``state_out``.
+        """
+        device = model.device
+        inner_mode = bundle_inner_mode or "soft"
+        num_envs = model.articulation_count
+        coord_per_env = int(model.joint_coord_count / num_envs)
+        dof_per_env = int(model.joint_dof_count / num_envs)
+
+        self._lazy_init_bundle(
+            model, bundle_model, num_bundle_samples, bundle_horizon_substeps,
+            requires_grad=requires_grad,
+        )
+        root_q_dim = self._root_q_dim
+        root_qd_dim = self._root_qd_dim
+
+        # Keep the bundle integrator's contact-smoothing config in sync.
+        wp.copy(self._bundle_integrator.sigmoid_scale, self.sigmoid_scale)
+        self._bundle_integrator.col_height = float(getattr(self, "col_height", 0.0))
+
+        # state_out is not touched by Phase A; make sure it carries the rough
+        # aux vars so the final FK/ID/foot tail can write into it.
+        if not getattr(state_out, "_featherstone_augmented", False):
+            self.allocate_state_aux_vars(model, state_out, requires_grad)
+
+        # Refresh the MAIN model's contacts at the current input config. The
+        # rough integrator's normal simulate (called for Phase A below) does NOT
+        # collide internally -- the caller normally does it per substep. In the
+        # bundle path the whole env-step runs inside one tape, so we refresh here
+        # on a detached scratch (off the gradient path: contacts are constants
+        # for the substep's differentiation, matching the non-bundle wrapper).
+        self._collide_main_at(model, state_in.joint_q, state_in.joint_qd)
+
+        bundle_active = self._bundle_active
+        pending_has_result = self._pending_has_result
+        pending_target_substep = self._pending_target_substep
+
+        # ============================================================
+        # Phase A: NORMAL CANDIDATE -> internal state_out_pred.
+        # ============================================================
+        state_out_pred = model.state(requires_grad=requires_grad)
+        self.simulate(
+            model, state_in, state_mid, state_out_pred, dt,
+            mode=inner_mode, control=None, max_torque=max_torque,
+            prox_iter=prox_iter, mu=mu,
+        )
+
+        # ============================================================
+        # Phase B-pre: action refresh for continuation envs (substep 0).
+        # ============================================================
+        if substep == 0:
+            any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
+            if any_continuation:
+                continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
+                wp.launch(
+                    kernel=copy_int_array,
+                    dim=num_envs,
+                    inputs=[self._cache_is_continuation],
+                    outputs=[continuation_mask],
+                    device=device,
+                    record_tape=False,
+                )
+                bundle_model.joint_act = wp.zeros(
+                    bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+                )
+                bundle_model.joint_target = wp.zeros(
+                    bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+                )
+                wp.launch(
+                    kernel=copy_joint_actions_to_bundle,
+                    dim=num_envs * num_bundle_samples,
+                    inputs=[
+                        continuation_mask, num_envs,
+                        self.articulation_coord_start, self.articulation_dof_start,
+                        model.joint_act, model.joint_target, dof_per_env, coord_per_env,
+                    ],
+                    outputs=[bundle_model.joint_act, bundle_model.joint_target],
+                    device=device,
+                    record_tape=requires_grad,
+                )
+                wp.launch(
+                    kernel=clear_continuation_flags,
+                    dim=num_envs,
+                    inputs=[],
+                    outputs=[self._cache_is_continuation],
+                    device=device,
+                    record_tape=False,
+                )
+
+        # ============================================================
+        # Phase B: contact detection -> new-trigger mask. Uses the midpoint
+        # contact activation (self.c_body_vec) written by Phase A's
+        # eval_contact_quantities -- robust for the rough integrator.
+        # ============================================================
+        bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
+        contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=detect_bundle_contacts_rough,
+            dim=num_envs,
+            inputs=[self.c_body_vec, self.num_contacts, bundle_active, model.bundle_slot_to_group],
+            outputs=[bundle_trigger, contact_feet_mask],
+            device=device,
+            record_tape=False,
+        )
+
+        # ============================================================
+        # Phase B': trigger processing.
+        # ============================================================
+        chain = self._bundle_state_chain
+        chain_in = chain[substep]
+        chain_out = chain[substep + 1]
+        init_state = bundle_model.state(requires_grad=requires_grad)
+
+        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
+        if any_triggered:
+            bundle_model.joint_act = wp.zeros(
+                bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+            )
+            bundle_model.joint_target = wp.zeros(
+                bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+            )
+            wp.launch(
+                kernel=copy_joint_actions_to_bundle,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    bundle_trigger, num_envs,
+                    self.articulation_coord_start, self.articulation_dof_start,
+                    model.joint_act, model.joint_target, dof_per_env, coord_per_env,
+                ],
+                outputs=[bundle_model.joint_act, bundle_model.joint_target],
+                device=device,
+                record_tape=requires_grad,
+            )
+            self._init_bundle_branches(
+                model, state_in, bundle_model, init_state,
+                bundle_trigger, contact_feet_mask,
+                num_bundle_samples, bundle_sigma_pos, bundle_sigma_vel,
+                self._delta_q_buf, self._delta_qd_buf,
+                root_q_dim, root_qd_dim, requires_grad,
+            )
+            wp.launch(
+                kernel=stage_bundle_trigger,
+                dim=num_envs,
+                inputs=[bundle_trigger, bundle_horizon_substeps],
+                outputs=[bundle_active, self._cache_horizon_remaining],
+                device=device,
+                record_tape=False,
+            )
+
+        # ============================================================
+        # Phase C: one inner substep for every cache-active env.
+        # ============================================================
+        bundle_active_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=copy_int_array,
+            dim=num_envs,
+            inputs=[bundle_active],
+            outputs=[bundle_active_snapshot],
+            device=device,
+            record_tape=False,
+        )
+
+        any_active = bool(wp.to_torch(bundle_active).any().item())
+        if any_active:
+            b_in = bundle_model.state(requires_grad=requires_grad)
+            wp.launch(
+                kernel=merge_bundle_input_state,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    init_state.joint_q, init_state.joint_qd,
+                    chain_in.joint_q, chain_in.joint_qd,
+                    bundle_trigger, bundle_active_snapshot,
+                    num_envs, coord_per_env, dof_per_env,
+                ],
+                outputs=[b_in.joint_q, b_in.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+
+            b_mid = bundle_model.state(requires_grad=requires_grad)
+
+            # Refresh bundle-model contacts at the b_in config by colliding the
+            # MAIN model at each sample's config and replicating into the bundle
+            # model (the bundle model's own broadphase differs from main's, which
+            # would break equivalence). This clobbers model.rigid_contact_*; we
+            # restore it at state_in before the foot-state tail below.
+            self._refresh_bundle_contacts(model, bundle_model, b_in, num_bundle_samples)
+
+            # Fresh matrix buffers for the bundle integrator (tape lifetime).
+            self._bundle_integrator.set_matrix_buffers(
+                self._bundle_integrator.alloc_matrix_buffers(bundle_model, requires_grad)
+            )
+
+            self._bundle_integrator.simulate(
+                bundle_model, b_in, b_mid, chain_out, dt,
+                mode=inner_mode, control=None, max_torque=max_torque,
+                prox_iter=prox_iter, mu=mu,
+            )
+
+            if self.debug_print_bundle_inner:
+                _print_bundle_inner_debug(
+                    self.debug_current_outer_call, substep, num_substeps, 0, 1,
+                    self.debug_head_values,
+                    wp.to_torch(b_in.joint_q).clone(),
+                    wp.to_torch(b_in.joint_qd).clone(),
+                    wp.to_torch(chain_out.joint_q).clone(),
+                    wp.to_torch(chain_out.joint_qd).clone(),
+                    wp.to_torch(chain_out.point_vec).view(num_envs * num_bundle_samples, self.num_contacts, 3).clone(),
+                    wp.to_torch(chain_out.foot_vel).view(num_envs * num_bundle_samples, self.num_contacts, 3).clone(),
+                )
+
+            # Mid-rollout reperturbation (skip at the final inner substep).
+            # Skipped entirely when there is no perturbation noise: at sigma==0
+            # the staged deltas are zero, so the in-place apply_perturbation pass
+            # is a numerical no-op AND avoids a tape double-write of chain_out
+            # (which would otherwise inflate the action adjoint on envs whose
+            # feet make/break contact mid-rollout, e.g. G1 on rough terrain).
+            cache_rem_torch = wp.to_torch(self._cache_horizon_remaining)
+            active_torch = wp.to_torch(bundle_active)
+            reperturb_mask_torch = ((cache_rem_torch > 1) & (active_torch == 1)).to(torch.int32)
+            sigma_on = (bundle_sigma_pos > 0.0) or (bundle_sigma_vel > 0.0)
+            if sigma_on and bool(reperturb_mask_torch.any().item()):
+                reperturb_mask = wp.from_torch(reperturb_mask_torch.contiguous())
+                self._detect_and_perturb_new_contacts(
+                    bundle_model, chain_out, contact_feet_mask, reperturb_mask,
+                    num_bundle_samples, model, state_in,
+                    bundle_sigma_pos, bundle_sigma_vel,
+                    self._delta_q_buf, self._delta_qd_buf,
+                    root_q_dim, root_qd_dim, requires_grad,
+                )
+
+            wp.launch(
+                kernel=decrement_cache_horizon,
+                dim=num_envs,
+                inputs=[bundle_active],
+                outputs=[self._cache_horizon_remaining],
+                device=device,
+                record_tape=False,
+            )
+
+        # ============================================================
+        # Phase D: averaging (horizon end OR end-of-outer-step).
+        # ============================================================
+        do_average = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=compute_do_average,
+            dim=num_envs,
+            inputs=[bundle_active, self._cache_horizon_remaining, substep, num_substeps],
+            outputs=[do_average],
+            device=device,
+            record_tape=False,
+        )
+
+        pending_bundle_q_slot = wp.zeros(
+            model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+        )
+        pending_bundle_qd_slot = wp.zeros(
+            model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+        )
+        any_avg = bool(wp.to_torch(do_average).any().item())
+        if any_avg:
+            wp.launch(
+                kernel=average_bundle_into_buffer,
+                dim=num_envs,
+                inputs=[
+                    do_average, num_bundle_samples, num_envs,
+                    chain_out.joint_q, chain_out.joint_qd,
+                    self.articulation_coord_start, self.articulation_dof_start,
+                    coord_per_env, dof_per_env, root_q_dim,
+                ],
+                outputs=[pending_bundle_q_slot, pending_bundle_qd_slot],
+                device=device,
+            )
+            wp.launch(
+                kernel=set_pending_after_average,
+                dim=num_envs,
+                inputs=[do_average, substep],
+                outputs=[pending_has_result, pending_target_substep],
+                device=device,
+                record_tape=False,
+            )
+
+        # ============================================================
+        # Phase E: per-env merge into state_out.joint_q / joint_qd.
+        # ============================================================
+        pending_has_result_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        pending_target_substep_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        wp.launch(
+            kernel=copy_int_array, dim=num_envs,
+            inputs=[pending_has_result], outputs=[pending_has_result_snapshot],
+            device=device, record_tape=False,
+        )
+        wp.launch(
+            kernel=copy_int_array, dim=num_envs,
+            inputs=[pending_target_substep], outputs=[pending_target_substep_snapshot],
+            device=device, record_tape=False,
+        )
+        wp.launch(
+            kernel=merge_state_transitions,
+            dim=num_envs,
+            inputs=[
+                substep,
+                bundle_active_snapshot,
+                pending_has_result_snapshot,
+                pending_target_substep_snapshot,
+                pending_bundle_q_slot,
+                pending_bundle_qd_slot,
+                self.articulation_coord_start,
+                self.articulation_dof_start,
+                coord_per_env,
+                dof_per_env,
+                state_in.joint_q,
+                state_in.joint_qd,
+                state_out_pred.joint_q,
+                state_out_pred.joint_qd,
+            ],
+            outputs=[state_out.joint_q, state_out.joint_qd],
+            device=device,
+        )
+
+        # ============================================================
+        # Phase F: bookkeeping update.
+        # ============================================================
+        wp.launch(
+            kernel=update_bundle_bookkeeping,
+            dim=num_envs,
+            inputs=[substep],
+            outputs=[
+                bundle_active,
+                pending_has_result,
+                pending_target_substep,
+                self._cache_horizon_remaining,
+                self._cache_is_continuation,
+            ],
+            device=device,
+            record_tape=False,
+        )
+
+        # ============================================================
+        # Phase F: final FK / ID / inertial / foot states on merged state_out.
+        # (Replicates the tail of the rough normal simulate pipeline.)
+        # ============================================================
+        # Restore model.rigid_contact_* (clobbered by _refresh_bundle_contacts in
+        # Phase C) to the state_in config so the foot-state tail is consistent
+        # with self.rigid_contact_body0 computed during Phase A. Foot states are a
+        # reporting output (they don't feed dynamics), so the held-state contacts
+        # are an acceptable basis here.
+        if any_active:
+            self._collide_main_at(model, state_in.joint_q, state_in.joint_qd)
+        wp.launch(
+            _active_eval_rigid_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start, model.joint_type, model.joint_parent,
+                model.joint_q_start, model.joint_qd_start, state_out.joint_q,
+                model.joint_X_p, model.joint_X_cm, model.joint_axis,
+            ],
+            outputs=[state_out.body_X_sc, state_out.body_X_sm],
+            device=model.device,
+        )
+        wp.launch(
+            _active_eval_rigid_id,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start, model.joint_type, model.joint_parent,
+                model.joint_q_start, model.joint_qd_start,
+                state_out.joint_q, state_out.joint_qd,
+                model.joint_axis, model.joint_target_ke, model.joint_target_kd,
+                model.body_I_m, state_out.body_X_sc, state_out.body_X_sm,
+                model.joint_X_p, model.gravity,
+            ],
+            outputs=[
+                state_out.joint_S_s, state_out.body_I_s, state_out.body_v_s,
+                state_out.body_f_s, state_out.body_a_s,
+            ],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=_active_inertial_body_pos_vel,
+            dim=model.articulation_count,
+            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
+            outputs=[state_out.body_q, state_out.body_qd],
+            device=model.device,
+        )
+        # FK-tail foot states -> a fresh scratch buffer (NOT state_out directly).
+        # merge_foot_states below is the sole writer of state_out.point_vec /
+        # foot_vel, so the tape sees a single write (no double-write inflation of
+        # the action adjoint). For committed bundled envs it substitutes the
+        # bundle rollout's foot (correct advancing contacts); all other envs take
+        # this FK-tail value.
+        fk_point_vec = wp.zeros_like(state_out.point_vec, requires_grad=requires_grad)
+        fk_foot_vel = wp.zeros_like(state_out.foot_vel, requires_grad=requires_grad)
+        wp.launch(
+            kernel=get_foot_states_rough,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_count, model.articulation_count, self.num_contacts,
+                state_out.body_X_sc, state_out.body_v_s,
+                self.rigid_contact_body0, model.rigid_contact_point0,
+                model.rigid_contact_shape0, model.shape_geo,
+                model.contact_body_offsets, model.bodies_per_env,
+                model.contact_local_x_sign, model.contact_local_y_sign,
+            ],
+            outputs=[fk_point_vec, fk_foot_vel],
+            device=model.device,
+        )
+        wp.launch(
+            kernel=merge_foot_states,
+            dim=num_envs,
+            inputs=[
+                do_average, num_bundle_samples, num_envs, self.num_contacts,
+                chain_out.point_vec, chain_out.foot_vel,
+                fk_point_vec, fk_foot_vel,
+            ],
+            outputs=[state_out.point_vec, state_out.foot_vel],
+            device=device,
+            record_tape=requires_grad,
+        )
+
+        self._step += 1
+        return state_out
+
+    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, prox_iter: int = 20, mu: float = 0.8, zero_sparse_buffers: bool = False,
+                 # Bundle-mode parameters (keyword-only, defaulted so existing
+                 # positional/keyword callers are unaffected). Active only when
+                 # mode == "bundle"; see _simulate_bundle.
+                 substep: int = 0, num_substeps: int = 1, bundle_model = None,
+                 num_bundle_samples: int = 8, bundle_horizon_substeps: int = 4,
+                 bundle_sigma_pos: float = 0.01, bundle_sigma_vel: float = 0.01,
+                 bundle_inner_mode = None):
+        # Active warp's State doesn't expose `requires_grad` directly -- derive
         # it from a representative array. joint_q is always allocated.
         if hasattr(state_in, "requires_grad"):
             requires_grad = state_in.requires_grad
         else:
             requires_grad = bool(getattr(state_in.joint_q, "requires_grad", False))
+
+        if mode == "bundle":
+            return self._simulate_bundle(
+                model, state_in, state_mid, state_out, dt,
+                requires_grad, prox_iter, max_torque, mu,
+                substep, num_substeps, bundle_model,
+                num_bundle_samples, bundle_horizon_substeps,
+                bundle_sigma_pos, bundle_sigma_vel, bundle_inner_mode,
+            )
 
         # PPO ping-pong support: when True, zero the sparse-written matrices
         # before the substep runs. SHAC allocates a fresh matrix set per
@@ -4608,7 +5943,7 @@ class MoreauRoughIntegrator(Integrator):
             ############################ Moreau Specific Additions  END  ############################
 
             # Cloth / particle / triangle / FEM / muscle force evaluations from
-            # warp-new are skipped — the rough integrator targets articulated
+            # warp-new are skipped -- the rough integrator targets articulated
             # rigid bodies on rough terrain. Active warp's force kernels have
             # different signatures, so this section would need a per-helper
             # adaptation that's outside the scope of the moreau_rough port.
@@ -4657,7 +5992,7 @@ class MoreauRoughIntegrator(Integrator):
                 )
 
                 # Active warp's eval_rigid_id. Match active moreau by not
-                # pre-zeroing body_f_s — eval_rigid_id is the sole writer at
+                # pre-zeroing body_f_s -- eval_rigid_id is the sole writer at
                 # this point, and the explicit zero adds a redundant tape op.
                 wp.launch(
                     _active_eval_rigid_id,
@@ -4713,7 +6048,7 @@ class MoreauRoughIntegrator(Integrator):
                     # eval_tau (pre-contact): h(tau) before contact forces are added
                     # (active warp's signature: separate joint_act + joint_target,
                     # joint_static_friction / joint_dynamic_friction, single
-                    # joint_axis vec3 array, no axis_mode). No pre-zeroing —
+                    # joint_axis vec3 array, no axis_mode). No pre-zeroing --
                     # active moreau doesn't zero state_mid.body_ft_s here either.
                     wp.launch(
                         _active_eval_rigid_tau,
@@ -4760,9 +6095,9 @@ class MoreauRoughIntegrator(Integrator):
                     # Recompute tau now that contact forces have been applied to
                     # body_f_s. Write the post-contact tau into state_OUT (not
                     # state_mid) so we don't overwrite state_mid.joint_tau in
-                    # place — overwriting would force warp's tape to snapshot
+                    # place -- overwriting would force warp's tape to snapshot
                     # the pre-contact tau for the prox-loop adjoint, which
-                    # inflated action-side adjoints by ~2× compared to active
+                    # inflated action-side adjoints by ~2x compared to active
                     # moreau. Active warp uses a dedicated state_out.joint_tau
                     # for exactly this reason (its `state_out_pred` slot).
                     wp.launch(
@@ -4819,7 +6154,7 @@ class MoreauRoughIntegrator(Integrator):
                         device=model.device,
                     )
 
-            # integrate bodies (active warp's per-joint kernel — joint_qd
+            # integrate bodies (active warp's per-joint kernel -- joint_qd
             # update via jcalc_integrate, which handles free joints correctly).
             if model.joint_count:
                 wp.launch(
@@ -4842,9 +6177,9 @@ class MoreauRoughIntegrator(Integrator):
                 # body_X_sm / body_v_s for downstream consumers. body_q /
                 # body_qd themselves are written by _active_inertial_body_pos_vel
                 # below, so there is no need to call the high-level eval_fk
-                # here — doing so used to double-write state_out.body_q,
+                # here -- doing so used to double-write state_out.body_q,
                 # adding a redundant tape op that inflated action adjoints
-                # by ~4× compared to active moreau on identical forward output.
+                # by ~4x compared to active moreau on identical forward output.
                 wp.launch(
                     _active_eval_rigid_fk,
                     dim=model.articulation_count,
@@ -4935,7 +6270,7 @@ class MoreauRoughIntegrator(Integrator):
                 )
 
             # warp-new's `Integrator.integrate_particles(...)` lifts particle
-            # state forward — not relevant for the rigid-body articulation use
+            # state forward -- not relevant for the rigid-body articulation use
             # case the rough integrator targets, and it pulls in helpers that
             # don't exist on active warp's Integrator base. Skip.
 
@@ -5021,7 +6356,7 @@ class MoreauRoughIntegrator(Integrator):
 
         else:
             # Use active warp's matmul_batched (which launches with
-            # 256*batch_count threads — the dense_gemm_batched C++ kernel
+            # 256*batch_count threads -- the dense_gemm_batched C++ kernel
             # uses tid()/256 for batch indexing and one thread per output
             # element, so a single-thread launch only fills H[0,0]).
             _active_matmul_batched(
@@ -5105,7 +6440,7 @@ class MoreauRoughIntegrator(Integrator):
         )
 
         # Construct the contact Jacobian Jc (differentiable). Use the FK-computed
-        # body world transforms (body_X_sc) — state.body_q is never written by
+        # body world transforms (body_X_sc) -- state.body_q is never written by
         # the rough simulate pipeline, so passing it here yields identity transforms
         # and causes contact points to be evaluated in the wrong frame.
         wp.launch(
@@ -5141,7 +6476,7 @@ class MoreauRoughIntegrator(Integrator):
             device=model.device,
         )
 
-        # solve for X^T (X = H^-1*Jc^T) — split Jc into per-row vectors,
+        # solve for X^T (X = H^-1*Jc^T) -- split Jc into per-row vectors,
         # solve H * x_row = Jc_row for each, then re-stack into Inv_M_times_Jc_t.
         # The 4-contact path uses 12 rows; the 8-contact path uses 24 rows.
         self._solve_split_jc(model, state_mid)
@@ -5393,7 +6728,7 @@ class MoreauRoughIntegrator(Integrator):
         """Split Jc into per-row vectors, solve H * x = Jc_row for each row,
         then re-stack into Inv_M_times_Jc_t. Dispatched by ``self.num_contacts``.
 
-        4-contact path: 12 rows (4 contacts × 3 spatial dims). 8-contact path:
+        4-contact path: 12 rows (4 contacts x 3 spatial dims). 8-contact path:
         24 rows. Each path goes through ``_active_eval_dense_solve_batched``,
         which uses the cached Cholesky factor ``self.L`` from ``eval_mass_matrix``.
         """

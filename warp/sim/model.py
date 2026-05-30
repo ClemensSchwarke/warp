@@ -3964,7 +3964,14 @@ class ModelBuilder:
 
             # plain (deep-copied) extends
             for attr in plain_attrs:
-                getattr(bundle_builder, attr).extend(copy.deepcopy(getattr(self, attr)))
+                if attr == "shape_geo_src":
+                    # Collision-geometry sources (mesh / SDF Volume) hold ctypes
+                    # pointers that cannot be deep-copied, and are read-only
+                    # shared geometry (e.g. the rough-terrain SDF Volume). Share
+                    # the references across bundle samples instead of copying.
+                    getattr(bundle_builder, attr).extend(list(getattr(self, attr)))
+                else:
+                    getattr(bundle_builder, attr).extend(copy.deepcopy(getattr(self, attr)))
 
             # counters
             bundle_builder.joint_dof_count += self.joint_dof_count
