@@ -68,6 +68,7 @@ from .integrator_moreau import (
     clear_continuation_flags,
     reset_bundle_envs_kernel,
     copy_int_array,
+    copy_float_array_1d,
     _print_bundle_inner_debug,
 )
 
@@ -83,6 +84,127 @@ from .integrator_moreau import (
 # behavior on the moreau_rough integrator.
 MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(0)
 # MOREAU_ROUGH_FORCE_FLAT_NORMAL = wp.constant(1)
+
+
+# ----------------------------------------------------------------------------
+# Env-local recentering of the contact-solve pipeline.
+#
+# The rigid-body dynamics run in WORLD-ORIGIN spatial coordinates, so every
+# intermediate that the contact gradient flows through (the body Jacobian J from
+# joint_S_s, the contact Jacobian Jc = J_trans - skew(p_world)*J_rot, body
+# spatial velocities/forces) scales with the robot's ABSOLUTE world position.
+# The forward is offset-invariant (those |p| factors cancel in the contact
+# solve) but the reverse-mode gradient through the |p|-inflated intermediates is
+# amplified by |p|. On tiled rough terrain the curriculum + border place the
+# robot at world ~50-100, so per-substep gradients inflate ~100x and compound
+# exponentially over the SHAC horizon; flat terrain sits at the origin and is
+# immune. Fix: shift each articulation's base to the origin by a DETACHED
+# horizontal reference before the FK/dynamics/contact solve, so those are
+# evaluated in a well-conditioned env-local frame. The shift is a constant
+# (zero adjoint), so the gradient w.r.t. joint_q is the exact same physical
+# gradient, only computed without the |p| blow-up. Position integration and the
+# state_out FK keep the world joint_q, so outputs stay in world coordinates.
+@wp.kernel
+def compute_root_xz_ref(
+    joint_q: wp.array(dtype=float),
+    coord_per_env: int,
+    p_ref: wp.array(dtype=wp.vec3),
+):
+    art = wp.tid()
+    base = art * coord_per_env
+    # Only the horizontal (x,z) offsets are large; keep y (height ~0.5).
+    p_ref[art] = wp.vec3(joint_q[base + 0], 0.0, joint_q[base + 2])
+
+
+@wp.kernel
+def recenter_joint_q_xz(
+    joint_q: wp.array(dtype=float),
+    p_ref: wp.array(dtype=wp.vec3),
+    coord_per_env: int,
+    joint_q_out: wp.array(dtype=float),
+):
+    i = wp.tid()
+    art = i / coord_per_env
+    local = i - art * coord_per_env
+    v = joint_q[i]
+    if local == 0:
+        v = v - p_ref[art][0]
+    if local == 2:
+        v = v - p_ref[art][2]
+    joint_q_out[i] = v
+
+
+@wp.kernel
+def shift_joint_q_to_world(
+    joint_q_local: wp.array(dtype=float),
+    p_ref: wp.array(dtype=wp.vec3),
+    coord_per_env: int,
+    joint_q_world: wp.array(dtype=float),
+):
+    # Single non-in-place write (distinct src/dst) so the +constant adjoint is
+    # the identity. (An in-place `q[i] += c` re-reads the same array element in
+    # the reverse pass and DOUBLES the gradient every substep -> blow-up.)
+    i = wp.tid()
+    art = i / coord_per_env
+    local = i - art * coord_per_env
+    v = joint_q_local[i]
+    if local == 0:
+        v = v + p_ref[art][0]
+    if local == 2:
+        v = v + p_ref[art][2]
+    joint_q_world[i] = v
+
+
+@wp.kernel
+def shift_body_q_to_world(
+    body_q_local: wp.array(dtype=wp.transform),
+    p_ref: wp.array(dtype=wp.vec3),
+    bodies_per_env: int,
+    body_q_world: wp.array(dtype=wp.transform),
+):
+    b = wp.tid()
+    art = b / bodies_per_env
+    t = body_q_local[b]
+    pos = wp.transform_get_translation(t) + wp.vec3(p_ref[art][0], 0.0, p_ref[art][2])
+    body_q_world[b] = wp.transform(pos, wp.transform_get_rotation(t))
+
+
+@wp.kernel
+def shift_point_vec_to_world(
+    point_vec_local: wp.array(dtype=wp.vec3),
+    p_ref: wp.array(dtype=wp.vec3),
+    num_contacts: int,
+    point_vec_world: wp.array(dtype=wp.vec3),
+):
+    i = wp.tid()
+    art = i / num_contacts
+    point_vec_world[i] = point_vec_local[i] + wp.vec3(p_ref[art][0], 0.0, p_ref[art][2])
+
+
+@wp.kernel
+def recenter_ground_points(
+    rigid_contact_count: wp.array(dtype=int),
+    rigid_contact_body0: wp.array(dtype=int),
+    rigid_contact_body1: wp.array(dtype=int),
+    rigid_contact_point1: wp.array(dtype=wp.vec3),
+    body_articulation: wp.array(dtype=int),
+    body_count: int,
+    p_ref: wp.array(dtype=wp.vec3),
+    point1_out: wp.array(dtype=wp.vec3),
+):
+    c = wp.tid()
+    point1_out[c] = rigid_contact_point1[c]
+    if c >= rigid_contact_count[0]:
+        return
+    b0 = rigid_contact_body0[c]
+    b1 = rigid_contact_body1[c]
+    art = int(-1)
+    if b0 >= 0 and b0 < body_count:
+        art = body_articulation[b0]
+    elif b1 >= 0 and b1 < body_count:
+        art = body_articulation[b1]
+    if art >= 0:
+        point1_out[c] = rigid_contact_point1[c] - p_ref[art]
 
 
 @wp.func
@@ -5797,12 +5919,30 @@ class MoreauRoughIntegrator(Integrator):
         # are an acceptable basis here.
         if any_active:
             self._collide_main_at(model, state_in.joint_q, state_in.joint_qd)
+        # Env-local recentering of the FK-tail (mirrors the normal simulate
+        # output path) so the reported body_qd / foot states match the soft
+        # path bit-for-bit -- otherwise the world offset inflates body_qd here
+        # while the soft path computes it locally, breaking zero-noise
+        # bundle==soft. p_ref is derived from the merged world joint_q.
+        coord_per_env = int(len(state_out.joint_q) // max(model.articulation_count, 1))
+        p_ref = wp.zeros(model.articulation_count, dtype=wp.vec3, device=model.device)
+        wp.launch(
+            kernel=compute_root_xz_ref, dim=model.articulation_count,
+            inputs=[state_out.joint_q, coord_per_env], outputs=[p_ref],
+            device=model.device, record_tape=False,
+        )
+        joint_q_local = wp.zeros_like(state_out.joint_q)
+        wp.launch(
+            kernel=recenter_joint_q_xz, dim=len(state_out.joint_q),
+            inputs=[state_out.joint_q, p_ref, coord_per_env], outputs=[joint_q_local],
+            device=model.device,
+        )
         wp.launch(
             _active_eval_rigid_fk,
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start, model.joint_type, model.joint_parent,
-                model.joint_q_start, model.joint_qd_start, state_out.joint_q,
+                model.joint_q_start, model.joint_qd_start, joint_q_local,
                 model.joint_X_p, model.joint_X_cm, model.joint_axis,
             ],
             outputs=[state_out.body_X_sc, state_out.body_X_sm],
@@ -5814,7 +5954,7 @@ class MoreauRoughIntegrator(Integrator):
             inputs=[
                 model.articulation_start, model.joint_type, model.joint_parent,
                 model.joint_q_start, model.joint_qd_start,
-                state_out.joint_q, state_out.joint_qd,
+                joint_q_local, state_out.joint_qd,
                 model.joint_axis, model.joint_target_ke, model.joint_target_kd,
                 model.body_I_m, state_out.body_X_sc, state_out.body_X_sm,
                 model.joint_X_p, model.gravity,
@@ -5825,20 +5965,27 @@ class MoreauRoughIntegrator(Integrator):
             ],
             device=model.device,
         )
+        body_q_local = wp.zeros_like(state_out.body_q)
         wp.launch(
             kernel=_active_inertial_body_pos_vel,
             dim=model.articulation_count,
             inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
-            outputs=[state_out.body_q, state_out.body_qd],
+            outputs=[body_q_local, state_out.body_qd],
             device=model.device,
+        )
+        wp.launch(
+            kernel=shift_body_q_to_world, dim=len(state_out.body_q),
+            inputs=[body_q_local, p_ref, model.bodies_per_env],
+            outputs=[state_out.body_q], device=model.device,
         )
         # FK-tail foot states -> a fresh scratch buffer (NOT state_out directly).
         # merge_foot_states below is the sole writer of state_out.point_vec /
         # foot_vel, so the tape sees a single write (no double-write inflation of
         # the action adjoint). For committed bundled envs it substitutes the
         # bundle rollout's foot (correct advancing contacts); all other envs take
-        # this FK-tail value.
-        fk_point_vec = wp.zeros_like(state_out.point_vec, requires_grad=requires_grad)
+        # this FK-tail value. Foot points come out env-local (body_X_sc is local)
+        # and are shifted to world before the merge so they match chain_out.
+        fk_point_vec_local = wp.zeros_like(state_out.point_vec, requires_grad=requires_grad)
         fk_foot_vel = wp.zeros_like(state_out.foot_vel, requires_grad=requires_grad)
         wp.launch(
             kernel=get_foot_states_rough,
@@ -5851,8 +5998,14 @@ class MoreauRoughIntegrator(Integrator):
                 model.contact_body_offsets, model.bodies_per_env,
                 model.contact_local_x_sign, model.contact_local_y_sign,
             ],
-            outputs=[fk_point_vec, fk_foot_vel],
+            outputs=[fk_point_vec_local, fk_foot_vel],
             device=model.device,
+        )
+        fk_point_vec = wp.zeros_like(state_out.point_vec, requires_grad=requires_grad)
+        wp.launch(
+            kernel=shift_point_vec_to_world, dim=len(state_out.point_vec),
+            inputs=[fk_point_vec_local, p_ref, self.num_contacts],
+            outputs=[fk_point_vec], device=model.device,
         )
         wp.launch(
             kernel=merge_foot_states,
@@ -5884,6 +6037,11 @@ class MoreauRoughIntegrator(Integrator):
             requires_grad = state_in.requires_grad
         else:
             requires_grad = bool(getattr(state_in.joint_q, "requires_grad", False))
+
+        # Cleared so a stale env-local reference never leaks into a later call
+        # (e.g. the bundle path, which keeps world coordinates). The non-bundle
+        # branch sets it just before eval_contact_quantities.
+        self._recenter_p_ref = None
 
         if mode == "bundle":
             return self._simulate_bundle(
@@ -5954,8 +6112,46 @@ class MoreauRoughIntegrator(Integrator):
 
 
             if model.joint_count:
+                # --- Env-local recentering (see compute_root_xz_ref above) ---
+                # Build a recentered copy of the input joint_q whose per-
+                # articulation base x,z are shifted to ~0 by a DETACHED reference,
+                # and a matching copy of the world ground points. The whole
+                # contact-solve pipeline (FK -> eval_rigid_id -> Jc -> prox)
+                # then runs in the well-conditioned env-local frame, while the
+                # position integration / state_out FK below keep the world
+                # joint_q so outputs stay in world coordinates.
+                art_count = model.articulation_count
+                coord_per_env = int(len(state_in.joint_q) // max(art_count, 1))
+                p_ref = wp.zeros(art_count, dtype=wp.vec3, device=model.device)
+                wp.launch(
+                    kernel=compute_root_xz_ref,
+                    dim=art_count,
+                    inputs=[state_in.joint_q, coord_per_env],
+                    outputs=[p_ref],
+                    device=model.device,
+                    record_tape=False,
+                )
+                q_local = wp.zeros(
+                    len(state_in.joint_q), dtype=float, device=model.device,
+                    requires_grad=requires_grad,
+                )
+                wp.launch(
+                    kernel=recenter_joint_q_xz,
+                    dim=len(state_in.joint_q),
+                    inputs=[state_in.joint_q, p_ref, coord_per_env],
+                    outputs=[q_local],
+                    device=model.device,
+                )
+                # Stash for eval_contact_quantities, which recenters the world
+                # ground points by the same reference (it runs after
+                # map_shape_contacts_to_body_contacts, so the contact->body
+                # mapping is valid by then).
+                self._recenter_p_ref = p_ref
+
                 if use_midpoint:
-                    # Active warp's `integrate_q_halfstep` (no joint_axis_dim arg)
+                    # Active warp's `integrate_q_halfstep` (no joint_axis_dim arg).
+                    # Use the recentered q_local so the FK below produces
+                    # env-local body transforms.
                     wp.launch(
                         kernel=_active_integrate_q_halfstep,
                         dim=model.joint_count,
@@ -5963,7 +6159,7 @@ class MoreauRoughIntegrator(Integrator):
                             model.joint_type,
                             model.joint_q_start,
                             model.joint_qd_start,
-                            state_in.joint_q,
+                            q_local,
                             state_in.joint_qd,
                             dt,
                         ],
@@ -5971,7 +6167,7 @@ class MoreauRoughIntegrator(Integrator):
                         device=model.device,
                     )
                 else:
-                    state_mid.joint_q.assign(state_in.joint_q)
+                    state_mid.joint_q.assign(q_local)
                 # Active warp's eval_rigid_fk: writes state.body_X_sc / body_X_sm.
                 wp.launch(
                     _active_eval_rigid_fk,
@@ -6157,6 +6353,15 @@ class MoreauRoughIntegrator(Integrator):
             # integrate bodies (active warp's per-joint kernel -- joint_qd
             # update via jcalc_integrate, which handles free joints correctly).
             if model.joint_count:
+                # Integrate in the same env-local frame as the contact solve
+                # (q_local), because the Featherstone free-joint qdd is the
+                # origin-referenced spatial acceleration -- mixing a world
+                # joint_q with a local qdd corrupts the base update. The new
+                # position lands in a scratch (joint_q_local); shift_joint_q_to_world
+                # then writes the world state_out.joint_q in a single
+                # non-in-place pass, so the output FK below runs in world coords
+                # and body_q / point_vec come out world directly.
+                joint_q_local = wp.zeros_like(state_out.joint_q)
                 wp.launch(
                     kernel=_active_eval_rigid_integrate,
                     dim=model.joint_count,
@@ -6164,22 +6369,40 @@ class MoreauRoughIntegrator(Integrator):
                         model.joint_type,
                         model.joint_q_start,
                         model.joint_qd_start,
-                        state_in.joint_q,
+                        q_local,
                         state_in.joint_qd,
                         state_out.joint_qdd,
                         dt,
                     ],
-                    outputs=[state_out.joint_q, state_out.joint_qd],
+                    outputs=[joint_q_local, state_out.joint_qd],
                     device=model.device,
                 )
+                if self._recenter_p_ref is not None:
+                    coord_per_env = int(len(state_out.joint_q) // max(model.articulation_count, 1))
+                    wp.launch(
+                        kernel=shift_joint_q_to_world,
+                        dim=len(state_out.joint_q),
+                        inputs=[joint_q_local, self._recenter_p_ref, coord_per_env],
+                        outputs=[state_out.joint_q],
+                        device=model.device,
+                    )
+                else:
+                    wp.launch(
+                        kernel=copy_float_array_1d,
+                        dim=len(state_out.joint_q),
+                        inputs=[joint_q_local],
+                        outputs=[state_out.joint_q],
+                        device=model.device,
+                    )
 
-                # Run the FK pipeline on state_out to populate body_X_sc /
-                # body_X_sm / body_v_s for downstream consumers. body_q /
-                # body_qd themselves are written by _active_inertial_body_pos_vel
-                # below, so there is no need to call the high-level eval_fk
-                # here -- doing so used to double-write state_out.body_q,
-                # adding a redundant tape op that inflated action adjoints
-                # by ~4x compared to active moreau on identical forward output.
+                # Output kinematics run on the env-LOCAL joint_q_local so the
+                # output spatial velocities (-> body_qd, base velocity) are NOT
+                # inflated by the world offset. body_X_sc stays local; the
+                # POSITION outputs (body_q, point_vec) are shifted to world
+                # afterwards, while the velocity outputs (body_qd, foot_vel) are
+                # frame-invariant and used as-is. (state_out.joint_q already
+                # holds the world value from shift_joint_q_to_world above.)
+                p_ref = self._recenter_p_ref
                 wp.launch(
                     _active_eval_rigid_fk,
                     dim=model.articulation_count,
@@ -6189,7 +6412,7 @@ class MoreauRoughIntegrator(Integrator):
                         model.joint_parent,
                         model.joint_q_start,
                         model.joint_qd_start,
-                        state_out.joint_q,
+                        joint_q_local if p_ref is not None else state_out.joint_q,
                         model.joint_X_p,
                         model.joint_X_cm,
                         model.joint_axis,
@@ -6211,7 +6434,7 @@ class MoreauRoughIntegrator(Integrator):
                         model.joint_parent,
                         model.joint_q_start,
                         model.joint_qd_start,
-                        state_out.joint_q,
+                        joint_q_local if p_ref is not None else state_out.joint_q,
                         state_out.joint_qd,
                         model.joint_axis,
                         model.joint_target_ke,
@@ -6234,7 +6457,11 @@ class MoreauRoughIntegrator(Integrator):
 
                 # Convert spatial velocities to inertial-frame body twists for
                 # the env's body_qd output (matches active moreau's CLEMENS
-                # convention conversion).
+                # convention conversion). Position lands in a local scratch,
+                # then is shifted to world; the velocity is frame-invariant.
+                out_body_q = state_out.body_q
+                if p_ref is not None:
+                    out_body_q = wp.zeros_like(state_out.body_q)
                 wp.launch(
                     kernel=_active_inertial_body_pos_vel,
                     dim=model.articulation_count,
@@ -6243,10 +6470,13 @@ class MoreauRoughIntegrator(Integrator):
                         state_out.body_X_sc,
                         state_out.body_v_s,
                     ],
-                    outputs=[state_out.body_q, state_out.body_qd],
+                    outputs=[out_body_q, state_out.body_qd],
                     device=model.device,
                 )
 
+                out_point_vec = state_out.point_vec
+                if p_ref is not None:
+                    out_point_vec = wp.zeros_like(state_out.point_vec)
                 wp.launch(
                     kernel=get_foot_states_rough,
                     dim=model.articulation_count,
@@ -6265,9 +6495,25 @@ class MoreauRoughIntegrator(Integrator):
                         model.contact_local_x_sign,
                         model.contact_local_y_sign,
                     ],
-                    outputs=[state_out.point_vec, state_out.foot_vel],
+                    outputs=[out_point_vec, state_out.foot_vel],
                     device=model.device,
                 )
+
+                if p_ref is not None:
+                    wp.launch(
+                        kernel=shift_body_q_to_world,
+                        dim=len(state_out.body_q),
+                        inputs=[out_body_q, p_ref, model.bodies_per_env],
+                        outputs=[state_out.body_q],
+                        device=model.device,
+                    )
+                    wp.launch(
+                        kernel=shift_point_vec_to_world,
+                        dim=len(state_out.point_vec),
+                        inputs=[out_point_vec, p_ref, self.num_contacts],
+                        outputs=[state_out.point_vec],
+                        device=model.device,
+                    )
 
             # warp-new's `Integrator.integrate_particles(...)` lifts particle
             # state forward -- not relevant for the rigid-body articulation use
@@ -6412,6 +6658,33 @@ class MoreauRoughIntegrator(Integrator):
         state_mid.articulation_contact_counters.zero_()
         state_mid.body_contact_counters.zero_()
 
+        # Env-local recentering: state_mid.body_X_sc is in the env-local frame
+        # (the halfstep ran on the recentered q_local), so the world ground
+        # points must be shifted by the same per-articulation reference to keep
+        # the contact gap / Jacobian consistent. The shift carries no gradient
+        # (ground points feed only the stop-grad gap), so this is off-tape.
+        p_ref = getattr(self, "_recenter_p_ref", None)
+        if p_ref is not None:
+            point1_local = wp.zeros_like(model.rigid_contact_point1)
+            wp.launch(
+                kernel=recenter_ground_points,
+                dim=model.rigid_contact_point1.shape[0],
+                inputs=[
+                    model.rigid_contact_count,
+                    self.rigid_contact_body0,
+                    self.rigid_contact_body1,
+                    model.rigid_contact_point1,
+                    self.body_articulation,
+                    len(model.body_q),
+                    p_ref,
+                ],
+                outputs=[point1_local],
+                device=model.device,
+                record_tape=False,
+            )
+        else:
+            point1_local = model.rigid_contact_point1
+
         # Schedule active contacts per articulation (no gradient recorded).
         # Dispatch the 4-slot or 8-slot scheduler based on integrator config.
         sched_kernel = schedule_contacts if self.num_contacts == 4 else schedule_contacts_8
@@ -6423,7 +6696,7 @@ class MoreauRoughIntegrator(Integrator):
                 self.rigid_contact_body0,
                 self.rigid_contact_body1,
                 model.rigid_contact_point0,
-                model.rigid_contact_point1,
+                point1_local,
                 model.rigid_contact_normal,
                 model.rigid_contact_shape0,
                 model.rigid_contact_shape1,
@@ -6464,7 +6737,7 @@ class MoreauRoughIntegrator(Integrator):
                 self.rigid_contact_body0,
                 model.rigid_contact_point0,
                 self.rigid_contact_body1,
-                model.rigid_contact_point1,
+                point1_local,
                 model.rigid_contact_normal,
                 model.rigid_contact_shape0,
                 model.rigid_contact_shape1,
