@@ -34,7 +34,10 @@ Usage:
     centers, half_extents, rots = out["primitives"]  # cached for rebake
 """
 
+import hashlib
+import json
 import math
+import os
 
 import numpy as np
 import warp as wp
@@ -45,6 +48,12 @@ LEGACY_TERRAIN_WIDTH = 3.0
 LEGACY_TERRAIN_LENGTH = 3.0
 VOXEL_SIZE = 0.04
 MESH_RESOLUTION_PER_TILE = 80  # mesh extraction density per tile axis
+
+# Bump this whenever the geometry/bake code below changes in a way that would
+# make a previously-cached volume incorrect (new sub-terrain recipes, changed
+# primitive layout, kernel changes, etc.). Bumping it invalidates every cache
+# entry on disk, forcing a fresh bake.
+TERRAIN_CACHE_VERSION = 1
 
 
 # ----------------------------------------------------------------------------
@@ -701,6 +710,154 @@ def _extract_mesh(volume, footprint, max_y, device, resolution_per_tile, tile_si
 
 
 # ----------------------------------------------------------------------------
+# Disk cache
+#
+# Baking the tiled SDF is expensive (the kernel is O(num_voxels * num_boxes),
+# and for the default 10x20 grid that is billions of voxel-box evaluations,
+# taking minutes). The geometry is a pure function of the generation params, so
+# we memoise the baked volume + extracted mesh to disk keyed on those params.
+# A run with previously-seen params reloads in seconds instead of re-baking;
+# new params (or a bumped TERRAIN_CACHE_VERSION) trigger a fresh bake that is
+# then written back to the cache.
+# ----------------------------------------------------------------------------
+
+
+def _default_cache_dir():
+    env = os.environ.get("DIFFSIM_TERRAIN_CACHE_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".cache", "diffsim_terrain")
+
+
+def _cache_params(tile_size, num_rows, num_cols, border_width, sub_terrain_mix,
+                  softmin_k, seed, voxel_size):
+    """Canonical dict of every parameter that affects the baked geometry.
+
+    Used both as the cache identity (hashed -> filename) and stored verbatim in
+    the metadata so a hash collision can be detected and rejected.
+    """
+    # Normalise the mix so equivalent proportions (e.g. {a:1,b:1} vs {a:0.5,b:0.5})
+    # share a cache entry, and round to avoid float-repr churn in the key.
+    norm_mix = {k: round(float(v), 6) for k, v in sorted(_normalize_mix(sub_terrain_mix).items())}
+    return {
+        "version": TERRAIN_CACHE_VERSION,
+        "tile_size": round(float(tile_size), 6),
+        "num_rows": int(num_rows),
+        "num_cols": int(num_cols),
+        "border_width": round(float(border_width), 6),
+        "sub_terrain_mix": norm_mix,
+        "softmin_k": round(float(softmin_k), 6),
+        "seed": int(seed),
+        "voxel_size": round(float(voxel_size), 6),
+    }
+
+
+def _cache_key(params):
+    blob = json.dumps(params, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(blob).hexdigest()[:16]
+
+
+def _cache_paths(cache_dir, key):
+    return (
+        os.path.join(cache_dir, f"terrain_{key}.json"),
+        os.path.join(cache_dir, f"terrain_{key}.npz"),
+    )
+
+
+def _load_terrain_cache(cache_dir, params, device):
+    """Return a state dict reconstructed from disk, or None on any miss/error.
+
+    Never raises: a corrupt or partial cache entry simply falls back to a fresh
+    bake by returning None.
+    """
+    key = _cache_key(params)
+    meta_path, data_path = _cache_paths(cache_dir, key)
+    if not (os.path.exists(meta_path) and os.path.exists(data_path)):
+        return None
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        # Guard against a (vanishingly unlikely) hash collision.
+        if meta.get("params") != params:
+            return None
+        with np.load(data_path) as z:
+            volume_buf = z["volume_buf"]
+            centers_np = z["centers"]
+            halfs_np = z["half_extents"]
+            rots_np = z["rots"]
+            vertices = z["vertices"]
+            indices = z["indices"]
+            env_origins = z["env_origins"]
+
+        volume = wp.Volume(wp.array(volume_buf, dtype=wp.uint8, device=device))
+        return {
+            "volume": volume,
+            "vertices": vertices,
+            "indices": indices,
+            "env_origins_grid": env_origins,
+            "centers": wp.array(centers_np, dtype=wp.vec3, device=device),
+            "half_extents": wp.array(halfs_np, dtype=wp.vec3, device=device),
+            "rots": wp.array(rots_np, dtype=wp.quat, device=device),
+            "num_boxes": int(meta["num_boxes"]),
+            "volume_origin": tuple(meta["volume_origin"]),
+            "volume_dims": tuple(int(d) for d in meta["volume_dims"]),
+            "voxel_size": float(meta["voxel_size"]),
+            "tile_size": float(meta["tile_size"]),
+            "num_rows": int(meta["num_rows"]),
+            "num_cols": int(meta["num_cols"]),
+            "footprint": tuple(meta["footprint"]),
+            "softmin_k": float(meta["softmin_k"]),
+        }
+    except Exception as e:
+        print(f"[generate_terrain] ignoring unreadable terrain cache ({e}); re-baking.")
+        return None
+
+
+def _save_terrain_cache(cache_dir, params, state, centers_np, halfs_np, rots_np):
+    """Write a baked state to the cache. Never raises (a failed write just
+    means the next run re-bakes)."""
+    key = _cache_key(params)
+    meta_path, data_path = _cache_paths(cache_dir, key)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        meta = {
+            "params": params,
+            "num_boxes": int(state["num_boxes"]),
+            "volume_origin": [float(v) for v in state["volume_origin"]],
+            "volume_dims": [int(v) for v in state["volume_dims"]],
+            "voxel_size": float(state["voxel_size"]),
+            "tile_size": float(state["tile_size"]),
+            "num_rows": int(state["num_rows"]),
+            "num_cols": int(state["num_cols"]),
+            "footprint": [float(v) for v in state["footprint"]],
+            "softmin_k": float(state["softmin_k"]),
+        }
+        volume_buf = state["volume"].array().numpy()
+        # Write to temp files then atomically rename so a crash mid-write never
+        # leaves a half-written entry that a later run would trust.
+        tmp_data = data_path + ".tmp"
+        tmp_meta = meta_path + ".tmp"
+        np.savez_compressed(
+            tmp_data,
+            volume_buf=volume_buf,
+            centers=centers_np,
+            half_extents=halfs_np,
+            rots=rots_np,
+            vertices=state["vertices"],
+            indices=state["indices"],
+            env_origins=state["env_origins_grid"],
+        )
+        # np.savez_compressed appends .npz to the path it is given.
+        os.replace(tmp_data + ".npz", data_path)
+        with open(tmp_meta, "w") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp_meta, meta_path)
+        print(f"[generate_terrain] cached baked terrain to {data_path}")
+    except Exception as e:
+        print(f"[generate_terrain] could not write terrain cache ({e}); continuing.")
+
+
+# ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
 
@@ -722,6 +879,8 @@ def generate_terrain(
     voxel_size=VOXEL_SIZE,
     device="cuda",
     return_dict=False,
+    use_cache=True,
+    cache_dir=None,
 ):
     """Bake a tiled rough-terrain SDF into a wp.Volume.
 
@@ -741,6 +900,14 @@ def generate_terrain(
         voxel_size: SDF grid resolution (meters).
         device: warp device.
         return_dict: if True, return a dict with all metadata for re-baking.
+        use_cache: if True (default), memoise the baked volume + mesh to disk
+            keyed on the generation params. A subsequent call with the same
+            params reloads from disk (seconds) instead of re-baking (minutes).
+            Changing any geometry param, or bumping TERRAIN_CACHE_VERSION,
+            forces a fresh bake that is then cached. Only applies to the tiled
+            (non-legacy) path.
+        cache_dir: directory for the disk cache. Defaults to
+            $DIFFSIM_TERRAIN_CACHE_DIR or ~/.cache/diffsim_terrain.
 
     Returns:
         (volume, vertices, indices) if return_dict=False, else a dict with keys:
@@ -771,6 +938,22 @@ def generate_terrain(
             "pyramid_slope_inv": 0.1,
         }
 
+    # --- Disk cache lookup -------------------------------------------------
+    # The bake is a pure function of these params; a hit reloads in seconds.
+    cache_dir = cache_dir if cache_dir is not None else _default_cache_dir()
+    cache_params = _cache_params(
+        tile_size, num_rows, num_cols, border_width, sub_terrain_mix,
+        softmin_k, seed, voxel_size,
+    )
+    if use_cache:
+        cached = _load_terrain_cache(cache_dir, cache_params, device)
+        if cached is not None:
+            print(f"[generate_terrain] loaded baked terrain from cache "
+                  f"({_cache_key(cache_params)}); skipping bake.")
+            return cached if return_dict else (
+                cached["volume"], cached["vertices"], cached["indices"]
+            )
+
     (
         centers_np, halfs_np, rots_np, env_origins, max_top_y, min_top_y, footprint
     ) = _build_tiled_primitives(tile_size, num_rows, num_cols, border_width, sub_terrain_mix, seed)
@@ -791,25 +974,30 @@ def generate_terrain(
         volume, footprint, max_top_y, device, MESH_RESOLUTION_PER_TILE, tile_size
     )
 
+    state = {
+        "volume": volume,
+        "vertices": vertices,
+        "indices": indices,
+        "env_origins_grid": env_origins,
+        "centers": centers_wp,
+        "half_extents": halfs_wp,
+        "rots": rots_wp,
+        "num_boxes": int(centers_np.shape[0]),
+        "volume_origin": volume_origin,
+        "volume_dims": volume_dims,
+        "voxel_size": voxel_size,
+        "tile_size": tile_size,
+        "num_rows": num_rows,
+        "num_cols": num_cols,
+        "footprint": footprint,
+        "softmin_k": softmin_k,
+    }
+
+    if use_cache:
+        _save_terrain_cache(cache_dir, cache_params, state, centers_np, halfs_np, rots_np)
+
     if return_dict:
-        return {
-            "volume": volume,
-            "vertices": vertices,
-            "indices": indices,
-            "env_origins_grid": env_origins,
-            "centers": centers_wp,
-            "half_extents": halfs_wp,
-            "rots": rots_wp,
-            "num_boxes": int(centers_np.shape[0]),
-            "volume_origin": volume_origin,
-            "volume_dims": volume_dims,
-            "voxel_size": voxel_size,
-            "tile_size": tile_size,
-            "num_rows": num_rows,
-            "num_cols": num_cols,
-            "footprint": footprint,
-            "softmin_k": softmin_k,
-        }
+        return state
 
     return volume, vertices, indices
 

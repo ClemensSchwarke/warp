@@ -2552,6 +2552,276 @@ def schedule_contacts_8(
         contact_schedule[bi_7] = 7
 
 
+@wp.func
+def _foot_slot_id(
+    body_offset: int,
+    c_point_local: wp.vec3,
+    contact_body_offsets: wp.array(dtype=int),
+    contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
+    num_contacts: int,
+):
+    # Map a contact on a designated foot body to its FIXED contact slot.
+    # Non-foot bodies (hip / knee / base) return -1 so they NEVER enter the
+    # foot-contact solve -- on rough terrain those body parts would otherwise
+    # steal the limited contact slots from feet (feet sink) and receive
+    # spurious normal impulses (the base flies up). For multi-sphere feet
+    # (e.g. G1) several slots share the same body offset and are disambiguated
+    # by the local-point quadrant via contact_local_x_sign/contact_local_y_sign
+    # (0 = no filtering). This mirrors the foot dispatch in get_foot_states_rough
+    # and the flat MoreauIntegrator's construct_contact_jacobian.
+    foot_id = int(-1)
+    for s in range(num_contacts):
+        if body_offset == contact_body_offsets[s]:
+            xs = contact_local_x_sign[s]
+            ys = contact_local_y_sign[s]
+            x_ok = xs == 0 or (xs > 0 and c_point_local[0] >= 0.0) or (xs < 0 and c_point_local[0] < 0.0)
+            y_ok = ys == 0 or (ys > 0 and c_point_local[1] >= 0.0) or (ys < 0 and c_point_local[1] < 0.0)
+            if x_ok and y_ok:
+                foot_id = s
+    return foot_id
+
+
+@wp.kernel
+def schedule_contacts_foot_only(
+    rigid_contact_count: wp.array(dtype=int),
+    rigid_contact_body0: wp.array(dtype=int),
+    rigid_contact_body1: wp.array(dtype=int),
+    rigid_contact_point0: wp.array(dtype=wp.vec3),
+    rigid_contact_point1: wp.array(dtype=wp.vec3),
+    rigid_contact_normal: wp.array(dtype=wp.vec3),
+    rigid_contact_shape0: wp.array(dtype=int),
+    rigid_contact_shape1: wp.array(dtype=int),
+    body_articulation: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    shape_thickness: wp.array(dtype=float),
+    body_count: int,
+    shape_count: int,
+    max_contacts: int,
+    # Foot-body restriction (see _foot_slot_id).
+    contact_body_offsets: wp.array(dtype=int),
+    contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
+    bodies_per_env: int,
+    num_contacts: int,
+    # Outputs
+    contact_schedule: wp.array(dtype=int),
+):
+    # One thread per Articulation
+    tid = wp.tid()
+
+    total_contacts = rigid_contact_count[0]
+    limit = wp.min(total_contacts, max_contacts)
+
+    # Each foot maps to a FIXED slot (slot k == foot k). Keep only the deepest
+    # candidate point per foot. Non-foot contacts are filtered out entirely so
+    # they can never evict a foot from its slot.
+    bi_0 = int(-1); bi_1 = int(-1); bi_2 = int(-1); bi_3 = int(-1)
+    bd_0 = float(1.0e6); bd_1 = float(1.0e6); bd_2 = float(1.0e6); bd_3 = float(1.0e6)
+
+    for i in range(limit):
+
+        # 1. Check Ownership
+        body_0 = rigid_contact_body0[i]
+        body_1 = rigid_contact_body1[i]
+
+        is_match_0 = (body_0 >= 0) and (body_0 < body_count) and (body_articulation[body_0] == tid)
+        is_match_1 = (body_1 >= 0) and (body_1 < body_count) and (body_articulation[body_1] == tid)
+
+        if is_match_0 or is_match_1:
+            # 2. Calculate Penetration Distance & Identify Shape
+            target_body = body_0
+            c_point_local = rigid_contact_point0[i]
+            c_point_local_other = rigid_contact_point1[i]
+            c_normal = rigid_contact_normal[i]
+
+            shape_id = rigid_contact_shape0[i]
+            shape_id_other = rigid_contact_shape1[i]
+            c_body_other = body_1
+
+            if is_match_1 and not is_match_0:
+                target_body = body_1
+                c_point_local = rigid_contact_point1[i]
+                c_point_local_other = rigid_contact_point0[i]
+                if is_match_0 == False: c_normal = -rigid_contact_normal[i]
+                shape_id = rigid_contact_shape1[i]
+                shape_id_other = rigid_contact_shape0[i]
+                c_body_other = body_0
+
+            c_normal = _rough_contact_normal(c_normal)
+            normal_ok = wp.dot(c_normal, c_normal) > 1.0e-6 and c_normal[1] > 0.0
+            shape_ok = shape_id >= 0 and shape_id < shape_count
+
+            is_static_contact = (c_body_other < 0) or (c_body_other >= body_count)
+
+            # Restrict to designated foot bodies + map to a fixed slot.
+            body_offset = target_body - tid * bodies_per_env
+            foot_id = _foot_slot_id(
+                body_offset, c_point_local, contact_body_offsets,
+                contact_local_x_sign, contact_local_y_sign, num_contacts,
+            )
+
+            if is_static_contact and normal_ok and shape_ok and foot_id >= 0:
+                safe_shape_id = shape_id
+
+                X_s = body_q[target_body]
+                p_world = wp.transform_point(X_s, c_point_local)
+                p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
+
+                p_world_other = c_point_local_other
+                safe_shape_id_other = 0
+                if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
+
+                p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
+                dist = wp.dot(c_normal, p_surface - p_surface_other)
+
+                # Keep the deepest candidate per (fixed) foot slot.
+                if foot_id == 0 and dist < bd_0:
+                    bd_0 = dist; bi_0 = i
+                if foot_id == 1 and dist < bd_1:
+                    bd_1 = dist; bi_1 = i
+                if foot_id == 2 and dist < bd_2:
+                    bd_2 = dist; bi_2 = i
+                if foot_id == 3 and dist < bd_3:
+                    bd_3 = dist; bi_3 = i
+
+    if bi_0 != -1: contact_schedule[bi_0] = 0
+    if bi_1 != -1: contact_schedule[bi_1] = 1
+    if bi_2 != -1: contact_schedule[bi_2] = 2
+    if bi_3 != -1: contact_schedule[bi_3] = 3
+
+
+@wp.kernel
+def schedule_contacts_foot_only_8(
+    rigid_contact_count: wp.array(dtype=int),
+    rigid_contact_body0: wp.array(dtype=int),
+    rigid_contact_body1: wp.array(dtype=int),
+    rigid_contact_point0: wp.array(dtype=wp.vec3),
+    rigid_contact_point1: wp.array(dtype=wp.vec3),
+    rigid_contact_normal: wp.array(dtype=wp.vec3),
+    rigid_contact_shape0: wp.array(dtype=int),
+    rigid_contact_shape1: wp.array(dtype=int),
+    body_articulation: wp.array(dtype=int),
+    body_q: wp.array(dtype=wp.transform),
+    shape_thickness: wp.array(dtype=float),
+    body_count: int,
+    shape_count: int,
+    max_contacts: int,
+    # Foot-body restriction (see _foot_slot_id).
+    contact_body_offsets: wp.array(dtype=int),
+    contact_local_x_sign: wp.array(dtype=int),
+    contact_local_y_sign: wp.array(dtype=int),
+    bodies_per_env: int,
+    num_contacts: int,
+    # Outputs
+    contact_schedule: wp.array(dtype=int),
+):
+    # 8-slot variant. Each foot sphere maps to a FIXED slot via _foot_slot_id
+    # (body offset + local quadrant). Non-foot contacts (shin / thigh / pelvis)
+    # are filtered out so they can never steal a foot sphere's slot.
+    tid = wp.tid()
+
+    total_contacts = rigid_contact_count[0]
+    limit = wp.min(total_contacts, max_contacts)
+
+    # Per-thread "best 8" buffer (initialized empty / +inf). Wrapped with
+    # int()/float() so Warp's codegen treats them as mutable locals rather
+    # than constants (required because they're mutated inside the for loop).
+    bi_0 = int(-1); bi_1 = int(-1); bi_2 = int(-1); bi_3 = int(-1)
+    bi_4 = int(-1); bi_5 = int(-1); bi_6 = int(-1); bi_7 = int(-1)
+
+    bd_0 = float(1.0e6); bd_1 = float(1.0e6); bd_2 = float(1.0e6); bd_3 = float(1.0e6)
+    bd_4 = float(1.0e6); bd_5 = float(1.0e6); bd_6 = float(1.0e6); bd_7 = float(1.0e6)
+
+    for i in range(limit):
+        body_0 = rigid_contact_body0[i]
+        body_1 = rigid_contact_body1[i]
+
+        is_match_0 = (body_0 >= 0) and (body_0 < body_count) and (body_articulation[body_0] == tid)
+        is_match_1 = (body_1 >= 0) and (body_1 < body_count) and (body_articulation[body_1] == tid)
+
+        if is_match_0 or is_match_1:
+            target_body = body_0
+            c_point_local = rigid_contact_point0[i]
+            c_point_local_other = rigid_contact_point1[i]
+            c_normal = rigid_contact_normal[i]
+
+            shape_id = rigid_contact_shape0[i]
+            shape_id_other = rigid_contact_shape1[i]
+            c_body_other = body_1
+
+            if is_match_1 and not is_match_0:
+                target_body = body_1
+                c_point_local = rigid_contact_point1[i]
+                c_point_local_other = rigid_contact_point0[i]
+                if is_match_0 == False: c_normal = -rigid_contact_normal[i]
+                shape_id = rigid_contact_shape1[i]
+                shape_id_other = rigid_contact_shape0[i]
+                c_body_other = body_0
+
+            c_normal = _rough_contact_normal(c_normal)
+            normal_ok = wp.dot(c_normal, c_normal) > 1.0e-6 and c_normal[1] > 0.0
+            shape_ok = shape_id >= 0 and shape_id < shape_count
+
+            is_static_contact = (c_body_other < 0) or (c_body_other >= body_count)
+
+            # Restrict to designated foot bodies + map to a fixed slot.
+            body_offset = target_body - tid * bodies_per_env
+            foot_id = _foot_slot_id(
+                body_offset, c_point_local, contact_body_offsets,
+                contact_local_x_sign, contact_local_y_sign, num_contacts,
+            )
+
+            if is_static_contact and normal_ok and shape_ok and foot_id >= 0:
+                safe_shape_id = shape_id
+
+                X_s = body_q[target_body]
+                p_world = wp.transform_point(X_s, c_point_local)
+                p_surface = p_world - c_normal * shape_thickness[safe_shape_id]
+
+                p_world_other = c_point_local_other
+                safe_shape_id_other = 0
+                if shape_id_other >= 0 and shape_id_other < shape_count: safe_shape_id_other = shape_id_other
+
+                p_surface_other = p_world_other + c_normal * shape_thickness[safe_shape_id_other]
+                dist = wp.dot(c_normal, p_surface - p_surface_other)
+
+                # Keep the deepest candidate per (fixed) foot slot.
+                if foot_id == 0 and dist < bd_0:
+                    bd_0 = dist; bi_0 = i
+                if foot_id == 1 and dist < bd_1:
+                    bd_1 = dist; bi_1 = i
+                if foot_id == 2 and dist < bd_2:
+                    bd_2 = dist; bi_2 = i
+                if foot_id == 3 and dist < bd_3:
+                    bd_3 = dist; bi_3 = i
+                if foot_id == 4 and dist < bd_4:
+                    bd_4 = dist; bi_4 = i
+                if foot_id == 5 and dist < bd_5:
+                    bd_5 = dist; bi_5 = i
+                if foot_id == 6 and dist < bd_6:
+                    bd_6 = dist; bi_6 = i
+                if foot_id == 7 and dist < bd_7:
+                    bd_7 = dist; bi_7 = i
+
+    if bi_0 != -1:
+        contact_schedule[bi_0] = 0
+    if bi_1 != -1:
+        contact_schedule[bi_1] = 1
+    if bi_2 != -1:
+        contact_schedule[bi_2] = 2
+    if bi_3 != -1:
+        contact_schedule[bi_3] = 3
+    if bi_4 != -1:
+        contact_schedule[bi_4] = 4
+    if bi_5 != -1:
+        contact_schedule[bi_5] = 5
+    if bi_6 != -1:
+        contact_schedule[bi_6] = 6
+    if bi_7 != -1:
+        contact_schedule[bi_7] = 7
+
+
 @wp.kernel
 def get_foot_states_rough(
     rigid_contact_count: wp.array(dtype=int),
@@ -4443,6 +4713,16 @@ class MoreauRoughIntegrator(Integrator):
             )
         self.num_contacts = int(num_contacts)
 
+        # Contact-selection policy:
+        #   False (default) -> GENERALIZED contacts: resolve the num_contacts
+        #     deepest static contacts of ANY body (morphology-agnostic). This is
+        #     what makes moreau_rough a generalized rough-terrain integrator.
+        #   True -> FOOT-ONLY contacts: restrict the solve to the designated foot
+        #     bodies (model.contact_body_offsets) with a fixed slot mapping, so
+        #     hip/knee/base contacts never steal a foot's slot. Opt-in per env via
+        #     cfg.sim.foot_only_contacts.
+        self.foot_only_contacts = False
+
         self._step = 0
 
         # ---- Bundle-mode state (lazily allocated on first bundle simulate) ----
@@ -4574,6 +4854,8 @@ class MoreauRoughIntegrator(Integrator):
                 bundle_model, num_contacts=self.num_contacts,
             )
             self._bundle_integrator.col_height = float(getattr(self, "col_height", 0.0))
+            # Inner bundle rollout must use the same contact-selection policy.
+            self._bundle_integrator.foot_only_contacts = self.foot_only_contacts
             self._bundle_fk_scratch = bundle_model.state(requires_grad=False)
 
         if (
@@ -6686,27 +6968,46 @@ class MoreauRoughIntegrator(Integrator):
             point1_local = model.rigid_contact_point1
 
         # Schedule active contacts per articulation (no gradient recorded).
-        # Dispatch the 4-slot or 8-slot scheduler based on integrator config.
-        sched_kernel = schedule_contacts if self.num_contacts == 4 else schedule_contacts_8
+        # Two selection policies (see __init__.foot_only_contacts):
+        #   False (default) -> GENERALIZED: the num_contacts deepest static
+        #     contacts of ANY body (morphology-agnostic rough contacts).
+        #   True            -> FOOT-ONLY: restrict to the designated foot bodies
+        #     with a fixed slot mapping so hip/knee/base contacts can never evict
+        #     a foot. The foot-only kernels need the foot-body metadata.
+        sched_inputs = [
+            model.rigid_contact_count,
+            self.rigid_contact_body0,
+            self.rigid_contact_body1,
+            model.rigid_contact_point0,
+            point1_local,
+            model.rigid_contact_normal,
+            model.rigid_contact_shape0,
+            model.rigid_contact_shape1,
+            self.body_articulation,
+            state_mid.body_X_sc,
+            model.shape_geo.thickness,
+            len(model.body_q),
+            model.shape_count,
+            model.rigid_contact_point0.shape[0],
+        ]
+        if self.foot_only_contacts:
+            sched_kernel = (
+                schedule_contacts_foot_only if self.num_contacts == 4
+                else schedule_contacts_foot_only_8
+            )
+            sched_inputs = sched_inputs + [
+                model.contact_body_offsets,
+                model.contact_local_x_sign,
+                model.contact_local_y_sign,
+                model.bodies_per_env,
+                self.num_contacts,
+            ]
+        else:
+            sched_kernel = schedule_contacts if self.num_contacts == 4 else schedule_contacts_8
         wp.launch(
             kernel=sched_kernel,
             dim=model.articulation_count,
-            inputs=[
-                model.rigid_contact_count,
-                self.rigid_contact_body0,
-                self.rigid_contact_body1,
-                model.rigid_contact_point0,
-                point1_local,
-                model.rigid_contact_normal,
-                model.rigid_contact_shape0,
-                model.rigid_contact_shape1,
-                self.body_articulation,
-                state_mid.body_X_sc,
-                model.shape_geo.thickness,
-                len(model.body_q),
-                model.shape_count,
-                model.rigid_contact_point0.shape[0],
-            ],
+            inputs=sched_inputs,
             outputs=[state_mid.contact_schedule],
             device=model.device,
             record_tape=False,
