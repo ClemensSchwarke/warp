@@ -1019,6 +1019,38 @@ def integrate_q_halfstep(
 
 
 @wp.kernel
+def bin_contacts_by_env(
+    # inputs
+    contact_body: wp.array(dtype=int),
+    bodies_per_env: int,
+    max_contacts_per_env: int,
+    # outputs
+    env_contact_count: wp.array(dtype=int),
+    env_contact_ids: wp.array(dtype=int),
+):
+    """Bucket every active contact slot under its owning articulation.
+
+    One thread per contact slot. Replaces the O(num_envs^2) per-env full-table
+    scan in construct_contact_jacobian / get_foot_states: instead of each of
+    the N articulation threads walking all ~N*k contacts, this single
+    O(num_contacts) pass groups the (few) contacts each env owns into a compact
+    per-env list so the consumer kernels iterate only their own ~k contacts.
+
+    The consumer kernels reduce over their bucket with an order-independent
+    min-over-world-Y, so the arbitrary intra-bucket order produced by the
+    atomic_add here does not change the selected (minimum-depth) contact value.
+    """
+    cid = wp.tid()
+    c_body = contact_body[cid]
+    if c_body < 0:
+        return
+    env = c_body / bodies_per_env
+    slot = wp.atomic_add(env_contact_count, env, 1)
+    if slot < max_contacts_per_env:
+        env_contact_ids[env * max_contacts_per_env + slot] = cid
+
+
+@wp.kernel
 def construct_contact_jacobian(
     J: wp.array(dtype=float),
     J_start: wp.array(dtype=int),
@@ -1036,6 +1068,9 @@ def construct_contact_jacobian(
     bodies_per_env: int,
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
+    env_contact_ids: wp.array(dtype=int),
+    env_contact_count: wp.array(dtype=int),
+    max_contacts_per_env: int,
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
@@ -1055,11 +1090,13 @@ def construct_contact_jacobian(
     point_vec[tid * 8 + 7] = above_ground
 
     # Broadphase contact pairs are NOT laid out in contiguous per-env blocks
-    # (self-collision pairs interleave foot-ground pairs across envs), so the
-    # old `contact_id = tid * contacts_per_articulation + i` indexing made each
-    # articulation read the wrong slice.  Scan the full contact table and
-    # dispatch each record to its owning articulation by integer-dividing the
-    # body index by `bodies_per_env` (bodies are laid out env-blocked).
+    # (self-collision pairs interleave foot-ground pairs across envs).  Rather
+    # than have every articulation scan the full rigid_contact_max table
+    # (O(num_envs^2) total), bin_contacts_by_env precomputes a compact per-env
+    # list of the contact slots this articulation owns; iterate only those.
+    n_c = env_contact_count[tid]
+    if n_c > max_contacts_per_env:
+        n_c = max_contacts_per_env
 
     # Track the deepest (minimum world-Y) below-ground contact per slot.
     best_y_0 = float(col_height)
@@ -1071,12 +1108,9 @@ def construct_contact_jacobian(
     best_y_6 = float(col_height)
     best_y_7 = float(col_height)
 
-    for contact_id in range(rigid_contact_max):
+    for k in range(n_c):
+        contact_id = env_contact_ids[tid * max_contacts_per_env + k]
         c_body = contact_body[contact_id]
-        if c_body < 0:
-            continue
-        if c_body / bodies_per_env != tid:
-            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
@@ -2476,6 +2510,9 @@ def get_foot_states(
     bodies_per_env: int,
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
+    env_contact_ids: wp.array(dtype=int),
+    env_contact_count: wp.array(dtype=int),
+    max_contacts_per_env: int,
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
@@ -2517,16 +2554,15 @@ def get_foot_states(
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
 
-    # See note in construct_contact_jacobian: scan the full contact table and
-    # filter by `c_body / bodies_per_env == tid`. The previous env-blocked
-    # indexing was incorrect for G1 (self-collision pairs interleave records
-    # across envs).
-    for contact_id in range(rigid_contact_max):
+    # See construct_contact_jacobian: iterate only this env's compact contact
+    # bucket (precomputed by bin_contacts_by_env) instead of scanning the full
+    # rigid_contact_max table per articulation (which was O(num_envs^2)).
+    n_c = env_contact_count[tid]
+    if n_c > max_contacts_per_env:
+        n_c = max_contacts_per_env
+    for k in range(n_c):
+        contact_id = env_contact_ids[tid * max_contacts_per_env + k]
         c_body = contact_body[contact_id]
-        if c_body < 0:
-            continue
-        if c_body / bodies_per_env != tid:
-            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
@@ -3635,6 +3671,7 @@ class MoreauIntegrator:
             device=device,
             record_tape=False,
         )
+        self._ensure_contact_bins(model)
         wp.launch(
             kernel=get_foot_states,
             dim=model.articulation_count,
@@ -3651,6 +3688,9 @@ class MoreauIntegrator:
                 model.bodies_per_env,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                model.env_contact_ids,
+                model.env_contact_count,
+                model.max_contacts_per_env,
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
@@ -4577,6 +4617,9 @@ class MoreauIntegrator:
                 model.bodies_per_env,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                model.env_contact_ids,
+                model.env_contact_count,
+                model.max_contacts_per_env,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -5326,6 +5369,7 @@ class MoreauIntegrator:
         )
 
         # get_foot_states (kernel -2)
+        self._ensure_contact_bins(model)
         wp.launch(
             kernel=get_foot_states,
             dim=num_envs,
@@ -5342,6 +5386,9 @@ class MoreauIntegrator:
                 model.bodies_per_env,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                model.env_contact_ids,
+                model.env_contact_count,
+                model.max_contacts_per_env,
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -5427,7 +5474,42 @@ class MoreauIntegrator:
             device=model.device,
         )
 
+    def _ensure_contact_bins(self, model):
+        """Lazily allocate and (re)populate the per-env contact buckets.
+
+        Replaces the O(num_envs^2) full-table contact scan that
+        construct_contact_jacobian / get_foot_states used to do: one
+        O(num_contacts) binning pass groups each env's contacts so those
+        kernels iterate only their own handful of slots. Buffers live on the
+        passed-in model so this works for both the main model and bundle_model.
+        """
+        nart = model.articulation_count
+        rcm = model.rigid_contact_max
+        # Per-env contact capacity: all envs are identical, so the total table
+        # capacity divides evenly; round up for safety.
+        maxc = (rcm + nart - 1) // nart
+        if (not hasattr(model, "env_contact_ids")
+                or model.env_contact_ids.shape[0] != nart * maxc):
+            model.env_contact_ids = wp.zeros(nart * maxc, dtype=wp.int32, device=model.device)
+            model.env_contact_count = wp.zeros(nart, dtype=wp.int32, device=model.device)
+            model.max_contacts_per_env = int(maxc)
+        model.env_contact_count.zero_()
+        wp.launch(
+            kernel=bin_contacts_by_env,
+            dim=rcm,
+            inputs=[
+                model.rigid_contact_body0,
+                model.bodies_per_env,
+                model.max_contacts_per_env,
+            ],
+            outputs=[model.env_contact_count, model.env_contact_ids],
+            device=model.device,
+            record_tape=False,
+        )
+
     def eval_contact_quantities(self, model, state_in, state_mid, dt):
+        # Bucket contacts per env so the contact kernels skip the O(N^2) scan.
+        self._ensure_contact_bins(model)
         # construct J_c
         # kernel 16
         wp.launch(
@@ -5450,6 +5532,9 @@ class MoreauIntegrator:
                 model.bodies_per_env,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                model.env_contact_ids,
+                model.env_contact_count,
+                model.max_contacts_per_env,
             ],
             outputs=[model.Jc, model.c_body_vec, state_mid.point_vec],
             device=model.device,
