@@ -167,19 +167,31 @@ class ViewerGL(ViewerBase):
         # cos-shading variation instead of saturating to white on flat tops.
         self._patch_sun_direction(_SUN_DIRECTION)
 
-        # Optionally hide collision shapes by scaling them to near-zero so the
-        # visual meshes don't fight with them for pixels. Disabled by default
-        # to keep behaviour explicit.
-        if hide_collision_shapes:
-            self._hide_collision_shapes()
-
         # Re-color the ground plane with Newton-like darker tiles (the base
         # renderer's render_ground bakes in light grey 200/150 tones).
         self._recolor_ground(_GROUND_TILE_A, _GROUND_TILE_B)
 
         # Load and register URDF visual meshes.
+        num_visuals = 0
         if urdf_path is not None:
-            self._register_urdf_visuals(urdf_path, urdf_scale)
+            num_visuals = self._register_urdf_visuals(urdf_path, urdf_scale)
+
+        # Optionally hide collision shapes by scaling them to near-zero so the
+        # visual meshes don't fight with them for pixels. Only do this when
+        # visual meshes actually loaded: if they didn't (e.g. trimesh missing
+        # on a headless cluster, or the mesh files are absent), hiding the
+        # collision proxies would leave the robot completely invisible. In that
+        # case keep the collision primitives so the robot is still shown.
+        if hide_collision_shapes:
+            if num_visuals > 0:
+                self._hide_collision_shapes()
+            else:
+                print(
+                    "[ViewerGL] No URDF visual meshes were loaded from "
+                    f"{urdf_path!r}; keeping collision shapes visible so the "
+                    "robot is not invisible. Install 'trimesh' and ensure the "
+                    "URDF's mesh files exist to render the visual meshes."
+                )
 
         # Persistent device buffers for the filtered ground-contact pipeline.
         # Sized to rigid_contact_max so we can launch one thread per broadphase
@@ -240,10 +252,12 @@ class ViewerGL(ViewerBase):
     # ------------------------------------------------------------------
     # URDF visuals
     # ------------------------------------------------------------------
-    def _register_urdf_visuals(self, urdf_path: str, urdf_scale: float) -> None:
+    def _register_urdf_visuals(self, urdf_path: str, urdf_scale: float) -> int:
+        """Register URDF ``<visual>`` meshes as instances. Returns the number of
+        visual mesh instances actually registered (0 if none loaded)."""
         body_names = list(getattr(self.model, "body_name", []))
         if not body_names:
-            return
+            return 0
         # The body_name list on `model` repeats across envs (one set of names
         # per env). `SimRenderer.populate` namespaces body names with index
         # prefixes so they collide-free across envs. To attach visuals only to
@@ -254,7 +268,7 @@ class ViewerGL(ViewerBase):
 
         entries = load_urdf_visuals(urdf_path, first_env_body_names, scale=urdf_scale)
         if not entries:
-            return
+            return 0
 
         # SimRenderer.populate names bodies as f"body_{b}_{model.body_name[b]}".
         # Look up that prefixed name so `add_shape_instance`'s body resolution
@@ -273,6 +287,7 @@ class ViewerGL(ViewerBase):
                 uvs=entry.get("uvs"),
                 texture=entry.get("texture"),
             )
+        return len(entries)
 
     def _add_visual_mesh(
         self,

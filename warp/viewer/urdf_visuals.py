@@ -29,6 +29,11 @@ import warp as wp
 
 _DEFAULT_VISUAL_COLOR = (0.75, 0.75, 0.75)
 
+# Warn at most once if trimesh is unavailable, so a headless/cluster run where
+# the dependency is missing surfaces a clear message instead of silently
+# rendering no visual meshes.
+_TRIMESH_WARNED = False
+
 
 def _parse_xyz(node: Optional[ET.Element], attr: str, default=(0.0, 0.0, 0.0)):
     if node is None:
@@ -115,6 +120,15 @@ def _load_mesh_with_trimesh(path: str, mesh_scale: np.ndarray):
     try:
         import trimesh
     except ImportError:
+        global _TRIMESH_WARNED
+        if not _TRIMESH_WARNED:
+            print(
+                "[urdf_visuals] 'trimesh' is not installed, so URDF <visual> "
+                "meshes cannot be loaded and the robot will render only its "
+                "(possibly hidden) collision shapes. Install it with "
+                "'pip install trimesh' to show the visual meshes."
+            )
+            _TRIMESH_WARNED = True
         return []
     try:
         m = trimesh.load_mesh(path)
