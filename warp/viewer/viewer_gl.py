@@ -569,13 +569,17 @@ class ViewerGL(ViewerBase):
         moving them to a near-zero scale. Useful when URDF visuals fully cover
         the collision proxies and we want to avoid z-fighting.
 
-        The "ground" instance is always preserved so the floor stays visible.
+        The "ground" instance is always preserved so the floor stays visible,
+        and the URDF visual meshes (registered as ``visual_*`` instances) are
+        preserved too — they are exactly what we want to keep showing when the
+        collision proxies are hidden. (This method may run after the visuals are
+        registered, so it must not scale them away.)
         """
         renderer = self._sim_renderer
         for name, (instance_id, body, shape, transform, scale, c1, c2) in list(
             renderer._instances.items()
         ):
-            if name == "ground" or name.startswith("terrain"):
+            if name == "ground" or name.startswith("terrain") or name.startswith("visual_"):
                 continue
             renderer._instances[name] = (
                 instance_id,
