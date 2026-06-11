@@ -3272,8 +3272,13 @@ def merge_bundle_input_state(
     src_trigger_qd: wp.array(dtype=float),
     src_continue_q: wp.array(dtype=float),    # chain[s] (previous substep's chain output)
     src_continue_qd: wp.array(dtype=float),
+    src_avg_q: wp.array(dtype=float),         # state_in (main-env layout): committed averaged state
+    src_avg_qd: wp.array(dtype=float),
+    main_coord_start: wp.array(dtype=int),
+    main_dof_start: wp.array(dtype=int),
     trigger_mask: wp.array(dtype=int),        # per-env: 1 iff this env was newly triggered this substep
     cache_active_mask: wp.array(dtype=int),   # per-env: 1 iff cache-active (continuing OR triggered)
+    continuation_mask: wp.array(dtype=int),   # per-env: 1 iff bundle continued across the step() boundary (substep 0 only)
     num_envs: int,
     coord_count: int,
     dof_count: int,
@@ -3281,21 +3286,34 @@ def merge_bundle_input_state(
     dst_q: wp.array(dtype=float),
     dst_qd: wp.array(dtype=float),
 ):
-    """Per-slot merge of two bundle joint arrays into a single fresh state.
+    """Per-slot merge of bundle joint arrays into a single fresh state.
 
-    Each bundle slot's joint values come from one of two sources, selected by
+    Each bundle slot's joint values come from one of three sources, selected by
     the per-env masks (env_id = slot_id % num_envs in samples-major layout):
       * trigger_mask[env]==1      → dst = src_trigger (perturbed init)
-      * cache_active_mask[env]==1 → dst = src_continue (previous chain output)
+      * cache_active_mask[env]==1 → sample 0 of envs with continuation_mask==1
+                                    reads src_avg (the averaged bundle state
+                                    committed into state_out at the previous
+                                    step()'s last substep, arriving here as
+                                    this substep's state_in); all other slots
+                                    read src_continue (previous chain output)
       * else                      → dst = 0 (slot unused — kept tidy so the
                                               inner simulate has well-defined inputs)
 
+    The avg re-seed of sample 0 is what closes the cross-step gradient loop:
+    the averaged state is consumed by the reward/observation at the step
+    boundary AND re-enters the continuing rollout here, so reward gradients
+    propagate backward through the simulation chain instead of dying at a
+    leaf. At zero noise the average equals every sample's chain state
+    bit-for-bit, so forward equivalence with soft mode is preserved.
+
     Single-write semantics: dst_q / dst_qd are written exactly once per slot,
     so the Warp tape records a single output for ``dst``. Adjoint correctly
-    routes each slot's gradient back to exactly one of the two sources.
+    routes each slot's gradient back to exactly one of the sources.
     """
     tid = wp.tid()
     env_id = tid % num_envs
+    sample_id = tid // num_envs
     q_base = tid * coord_count
     qd_base = tid * dof_count
 
@@ -3305,10 +3323,18 @@ def merge_bundle_input_state(
         for j in range(dof_count):
             dst_qd[qd_base + j] = src_trigger_qd[qd_base + j]
     elif cache_active_mask[env_id] == 1:
-        for i in range(coord_count):
-            dst_q[q_base + i] = src_continue_q[q_base + i]
-        for j in range(dof_count):
-            dst_qd[qd_base + j] = src_continue_qd[qd_base + j]
+        if continuation_mask[env_id] == 1 and sample_id == 0:
+            main_q_base = main_coord_start[env_id]
+            main_qd_base = main_dof_start[env_id]
+            for i in range(coord_count):
+                dst_q[q_base + i] = src_avg_q[main_q_base + i]
+            for j in range(dof_count):
+                dst_qd[qd_base + j] = src_avg_qd[main_qd_base + j]
+        else:
+            for i in range(coord_count):
+                dst_q[q_base + i] = src_continue_q[q_base + i]
+            for j in range(dof_count):
+                dst_qd[qd_base + j] = src_continue_qd[qd_base + j]
     else:
         for i in range(coord_count):
             dst_q[q_base + i] = 0.0
@@ -4902,6 +4928,14 @@ class MoreauIntegrator:
         # an all-zero mask) so the Warp tape sees no multi-write on
         # bundle_model.joint_act / joint_target when no envs need refreshing.
         # ============================================================
+        # Per-substep continuation snapshot. Zero at substeps > 0 and when no
+        # env continued a bundle across the step() boundary; populated below at
+        # substep 0. Consumed by BOTH the action-refresh kernel and the Phase C
+        # merge_bundle_input_state (which re-seeds sample 0 of continuation
+        # envs from the committed averaged state in state_in). A fresh
+        # allocation per substep keeps the tape adjoint reading the values
+        # this substep actually saw.
+        continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
         if substep == 0:
             any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
             if any_continuation:
@@ -4911,7 +4945,6 @@ class MoreauIntegrator:
                 # otherwise re-read a zeroed mask and skip the gradient
                 # propagation from bundle_model.joint_target back to
                 # model.joint_target for continuation envs.
-                continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
                 wp.launch(
                     kernel=copy_int_array,
                     dim=num_envs,
@@ -5091,8 +5124,13 @@ class MoreauIntegrator:
                     init_state.joint_qd,
                     chain_in.joint_q,
                     chain_in.joint_qd,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
                     bundle_trigger,
                     bundle_active_snapshot,
+                    continuation_mask,
                     num_envs,
                     coord_per_env,
                     dof_per_env,

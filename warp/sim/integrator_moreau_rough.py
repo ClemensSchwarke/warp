@@ -5990,10 +5990,14 @@ class MoreauRoughIntegrator(Integrator):
         # ============================================================
         # Phase B-pre: action refresh for continuation envs (substep 0).
         # ============================================================
+        # Per-substep continuation snapshot (see MoreauIntegrator._simulate_bundle):
+        # populated at substep 0 only; consumed by the action-refresh kernel and
+        # by merge_bundle_input_state, which re-seeds sample 0 of continuation
+        # envs from the committed averaged state in state_in.
+        continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
         if substep == 0:
             any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
             if any_continuation:
-                continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
                 wp.launch(
                     kernel=copy_int_array,
                     dim=num_envs,
@@ -6111,7 +6115,9 @@ class MoreauRoughIntegrator(Integrator):
                 inputs=[
                     init_state.joint_q, init_state.joint_qd,
                     chain_in.joint_q, chain_in.joint_qd,
-                    bundle_trigger, bundle_active_snapshot,
+                    state_in.joint_q, state_in.joint_qd,
+                    self.articulation_coord_start, self.articulation_dof_start,
+                    bundle_trigger, bundle_active_snapshot, continuation_mask,
                     num_envs, coord_per_env, dof_per_env,
                 ],
                 outputs=[b_in.joint_q, b_in.joint_qd],
