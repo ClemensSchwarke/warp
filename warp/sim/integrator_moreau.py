@@ -2812,6 +2812,58 @@ def copy_joint_actions_to_bundle(
 
 
 @wp.kernel
+def refresh_joint_actions_to_bundle(
+    # inputs
+    refresh_mask_a: wp.array(dtype=int),  # per-env (e.g. continuation mask)
+    refresh_mask_b: wp.array(dtype=int),  # per-env (e.g. new-trigger mask)
+    num_envs: int,
+    articulation_coord_start: wp.array(dtype=int),
+    articulation_dof_start: wp.array(dtype=int),
+    joint_act_main: wp.array(dtype=float),
+    joint_target_main: wp.array(dtype=float),
+    joint_act_old: wp.array(dtype=float),     # previous bundle action buffer
+    joint_target_old: wp.array(dtype=float),  # previous bundle target buffer
+    dof_count: int,
+    coord_count: int,
+    # outputs
+    joint_act_bundle: wp.array(dtype=float),
+    joint_target_bundle: wp.array(dtype=float),
+):
+    """Rebuild the bundle action buffers, refreshing some envs and carrying
+    the rest forward.
+
+    Every slot of the (freshly allocated) output buffers is written exactly
+    once: envs with refresh_mask_a OR refresh_mask_b set read the CURRENT main
+    model actions; all other envs carry their values forward from the previous
+    bundle action buffers.
+
+    This replaces the old pattern of allocating a fresh zeroed buffer and
+    masked-filling ONLY the refreshed envs' slots: that silently zeroed the
+    PD targets of every other env with an in-flight bundle whenever any env
+    (re-)triggered at the same substep — e.g. after a partial reset, or with
+    staggered horizons — sending those envs' inner rollouts toward the zero
+    pose and corrupting both the committed averages and their gradients.
+    """
+    tid = wp.tid()
+    env_id = tid % num_envs
+    main_coord_start = articulation_coord_start[env_id]
+    main_dof_start = articulation_dof_start[env_id]
+    bundle_coord_start = tid * coord_count
+    bundle_dof_start = tid * dof_count
+
+    if refresh_mask_a[env_id] == 1 or refresh_mask_b[env_id] == 1:
+        for d in range(dof_count):
+            joint_act_bundle[bundle_dof_start + d] = joint_act_main[main_dof_start + d]
+        for c in range(coord_count):
+            joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
+    else:
+        for d in range(dof_count):
+            joint_act_bundle[bundle_dof_start + d] = joint_act_old[bundle_dof_start + d]
+        for c in range(coord_count):
+            joint_target_bundle[bundle_coord_start + c] = joint_target_old[bundle_coord_start + c]
+
+
+@wp.kernel
 def average_bundle_into_buffer(
     # inputs
     bundle_trigger: wp.array(dtype=int),
@@ -3029,6 +3081,16 @@ def apply_perturbation_to_bundle_slots(
     Thread tid is the flat bundle slot index. Skips envs whose apply_mask entry is 0.
     Used for mid-rollout re-perturbation when newly contacting feet appear during
     the bundle horizon.
+
+    MUST use wp.atomic_add, not the read-modify-write form
+    ``x[i] = x[i] + d``: this kernel is recorded on the tape and reads/writes
+    the same array, and Warp's adjoint of the read-modify-write form DOUBLES
+    the incoming adjoint of x (store adjoint feeds adj_x[i] into the rhs, then
+    the load adjoint adds it back on top of the still-live adj_x[i]).
+    atomic_add's adjoint is the correct accumulation rule: adj stays on x
+    untouched and adj_d += adj_x. The doubling silently corrupted every
+    bundle gradient whenever a branch picked up a new contact mid-horizon
+    (i.e. constantly, in any walking/running gait).
     """
     tid = wp.tid()
     env_id = tid % num_envs
@@ -3041,15 +3103,11 @@ def apply_perturbation_to_bundle_slots(
 
     leg_coord_count = coord_count - root_q_dim
     for li in range(leg_coord_count):
-        bundle_joint_q[bundle_q_start + root_q_dim + li] = (
-            bundle_joint_q[bundle_q_start + root_q_dim + li] + delta_q_buf[tid, li]
-        )
+        wp.atomic_add(bundle_joint_q, bundle_q_start + root_q_dim + li, delta_q_buf[tid, li])
 
     leg_dof_count = dof_count - root_qd_dim
     for li in range(leg_dof_count):
-        bundle_joint_qd[bundle_qd_start + root_qd_dim + li] = (
-            bundle_joint_qd[bundle_qd_start + root_qd_dim + li] + delta_qd_buf[tid, li]
-        )
+        wp.atomic_add(bundle_joint_qd, bundle_qd_start + root_qd_dim + li, delta_qd_buf[tid, li])
 
 
 @wp.kernel
@@ -4303,6 +4361,12 @@ class MoreauIntegrator:
         if not any_new:
             return
 
+        # Diagnostics: count how many env-level reperturbation events fired
+        # (read by probe scripts; not used by the simulation itself).
+        self.reperturb_event_count = (
+            getattr(self, "reperturb_event_count", 0) + int(apply_mask_host.sum().item())
+        )
+
         # 3) upload apply_mask and launch the in-place perturbation kernel
         apply_mask = wp.from_torch(apply_mask_host.to(torch_device))
         wp.launch(
@@ -4936,6 +5000,7 @@ class MoreauIntegrator:
         # allocation per substep keeps the tape adjoint reading the values
         # this substep actually saw.
         continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
+        any_continuation = False
         if substep == 0:
             any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
             if any_continuation:
@@ -4953,38 +5018,6 @@ class MoreauIntegrator:
                     device=device,
                     record_tape=False,
                 )
-                # Allocate fresh per-substep bundle action arrays. Re-binding
-                # bundle_model.joint_target/joint_act keeps every copy_jt
-                # → inner_sim chain free of multi-write aliasing on the tape:
-                # Warp's adjoint for a write kernel ACCUMULATES (does not zero)
-                # the output .grad, so reusing one shared buffer across
-                # substeps that each fire a copy_jt over-counts gradients by
-                # the number of write-then-read passes.
-                bundle_model.joint_act = wp.zeros(
-                    bundle_model.joint_dof_count, dtype=float, device=device,
-                    requires_grad=requires_grad,
-                )
-                bundle_model.joint_target = wp.zeros(
-                    bundle_model.joint_coord_count, dtype=float, device=device,
-                    requires_grad=requires_grad,
-                )
-                wp.launch(
-                    kernel=copy_joint_actions_to_bundle,
-                    dim=num_envs * num_bundle_samples,
-                    inputs=[
-                        continuation_mask,
-                        num_envs,
-                        model.articulation_coord_start,
-                        model.articulation_dof_start,
-                        model.joint_act,
-                        model.joint_target,
-                        dof_per_env,
-                        coord_per_env,
-                    ],
-                    outputs=[bundle_model.joint_act, bundle_model.joint_target],
-                    device=device,
-                    record_tape=requires_grad,
-                )
                 wp.launch(
                     kernel=clear_continuation_flags,
                     dim=num_envs,
@@ -4993,6 +5026,10 @@ class MoreauIntegrator:
                     device=device,
                     record_tape=False,
                 )
+                # The actual action refresh is performed by the COMBINED
+                # refresh launch after Phase B' (one single-write rebuild of
+                # the bundle action buffers covering continuation AND trigger
+                # envs while carrying every other env's actions forward).
 
         # ============================================================
         # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
@@ -5036,40 +5073,7 @@ class MoreauIntegrator:
 
         any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
         if any_triggered:
-            # 1) Freeze current-substep actions into bundle slots of
-            #    newly-triggered envs (per-env masked write). Allocate fresh
-            #    per-substep target/act buffers — see continuation refresh
-            #    above for the rationale (avoids multi-write aliasing on the
-            #    tape when copy_jt fires at multiple substeps within a step,
-            #    e.g. small bundle_horizon_substeps that lets the cache
-            #    expire and re-trigger inside one step()).
-            bundle_model.joint_act = wp.zeros(
-                bundle_model.joint_dof_count, dtype=float, device=device,
-                requires_grad=requires_grad,
-            )
-            bundle_model.joint_target = wp.zeros(
-                bundle_model.joint_coord_count, dtype=float, device=device,
-                requires_grad=requires_grad,
-            )
-            wp.launch(
-                kernel=copy_joint_actions_to_bundle,
-                dim=num_envs * num_bundle_samples,
-                inputs=[
-                    bundle_trigger,
-                    num_envs,
-                    model.articulation_coord_start,
-                    model.articulation_dof_start,
-                    model.joint_act,
-                    model.joint_target,
-                    dof_per_env,
-                    coord_per_env,
-                ],
-                outputs=[bundle_model.joint_act, bundle_model.joint_target],
-                device=device,
-                record_tape=requires_grad,
-            )
-
-            # 2) Initialize perturbed branches into init_state (fresh
+            # 1) Initialize perturbed branches into init_state (fresh
             #    per-substep) for triggered envs only.
             self._init_bundle_branches(
                 model, state_in, bundle_model, init_state,
@@ -5079,7 +5083,7 @@ class MoreauIntegrator:
                 root_q_dim, root_qd_dim, requires_grad,
             )
 
-            # 3) Stage trigger flags: bundle_active=1, horizon=H.
+            # 2) Stage trigger flags: bundle_active=1, horizon=H.
             wp.launch(
                 kernel=stage_bundle_trigger,
                 dim=num_envs,
@@ -5087,6 +5091,50 @@ class MoreauIntegrator:
                 outputs=[bundle_active, self._cache_horizon_remaining],
                 device=device,
                 record_tape=False,
+            )
+
+        # ============================================================
+        # Phase B'': COMBINED ACTION REFRESH (continuation + new triggers)
+        # One single-write rebuild of the bundle action buffers per substep
+        # that needs it. Envs in continuation_mask (substep 0) or
+        # bundle_trigger get the CURRENT main actions; every other env's
+        # slots are carried forward from the previous buffers. Allocating
+        # fresh buffers per refresh keeps every copy → inner_sim chain free
+        # of multi-write aliasing on the tape; carrying non-refreshed envs
+        # forward (instead of leaving them zero, the old behavior) is what
+        # keeps mid-horizon envs' PD targets intact when an unrelated env
+        # (re-)triggers at the same substep.
+        # ============================================================
+        if any_continuation or any_triggered:
+            joint_act_old = bundle_model.joint_act
+            joint_target_old = bundle_model.joint_target
+            bundle_model.joint_act = wp.zeros(
+                bundle_model.joint_dof_count, dtype=float, device=device,
+                requires_grad=requires_grad,
+            )
+            bundle_model.joint_target = wp.zeros(
+                bundle_model.joint_coord_count, dtype=float, device=device,
+                requires_grad=requires_grad,
+            )
+            wp.launch(
+                kernel=refresh_joint_actions_to_bundle,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    continuation_mask,
+                    bundle_trigger,
+                    num_envs,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
+                    model.joint_act,
+                    model.joint_target,
+                    joint_act_old,
+                    joint_target_old,
+                    dof_per_env,
+                    coord_per_env,
+                ],
+                outputs=[bundle_model.joint_act, bundle_model.joint_target],
+                device=device,
+                record_tape=requires_grad,
             )
 
         # ============================================================

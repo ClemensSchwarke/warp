@@ -55,6 +55,7 @@ from .integrator_moreau import (
 # ``detect_bundle_contacts_rough`` / ``detect_bundle_branch_contacts_rough``.
 from .integrator_moreau import (
     copy_joint_actions_to_bundle,
+    refresh_joint_actions_to_bundle,
     average_bundle_into_buffer,
     init_bundle_state_with_perturbation,
     apply_perturbation_to_bundle_slots,
@@ -5413,6 +5414,11 @@ class MoreauRoughIntegrator(Integrator):
             if not new_groups_per_env:
                 return
 
+            # Diagnostics: count env-level reperturbation events (probe use only).
+            self.reperturb_event_count = (
+                getattr(self, "reperturb_event_count", 0) + len(new_groups_per_env)
+            )
+
             # FD FK Jacobian at the held main config.
             fk_jq = wp.to_torch(self._fk_scratch_joint_q)
             fk_jq.copy_(wp.to_torch(main_state_in.joint_q))
@@ -5995,6 +6001,7 @@ class MoreauRoughIntegrator(Integrator):
         # by merge_bundle_input_state, which re-seeds sample 0 of continuation
         # envs from the committed averaged state in state_in.
         continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
+        any_continuation = False
         if substep == 0:
             any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
             if any_continuation:
@@ -6006,24 +6013,6 @@ class MoreauRoughIntegrator(Integrator):
                     device=device,
                     record_tape=False,
                 )
-                bundle_model.joint_act = wp.zeros(
-                    bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
-                )
-                bundle_model.joint_target = wp.zeros(
-                    bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
-                )
-                wp.launch(
-                    kernel=copy_joint_actions_to_bundle,
-                    dim=num_envs * num_bundle_samples,
-                    inputs=[
-                        continuation_mask, num_envs,
-                        self.articulation_coord_start, self.articulation_dof_start,
-                        model.joint_act, model.joint_target, dof_per_env, coord_per_env,
-                    ],
-                    outputs=[bundle_model.joint_act, bundle_model.joint_target],
-                    device=device,
-                    record_tape=requires_grad,
-                )
                 wp.launch(
                     kernel=clear_continuation_flags,
                     dim=num_envs,
@@ -6032,6 +6021,8 @@ class MoreauRoughIntegrator(Integrator):
                     device=device,
                     record_tape=False,
                 )
+                # Action refresh happens in the COMBINED launch after Phase B'
+                # (see MoreauIntegrator._simulate_bundle for the rationale).
 
         # ============================================================
         # Phase B: contact detection -> new-trigger mask. Uses the midpoint
@@ -6059,24 +6050,6 @@ class MoreauRoughIntegrator(Integrator):
 
         any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
         if any_triggered:
-            bundle_model.joint_act = wp.zeros(
-                bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
-            )
-            bundle_model.joint_target = wp.zeros(
-                bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
-            )
-            wp.launch(
-                kernel=copy_joint_actions_to_bundle,
-                dim=num_envs * num_bundle_samples,
-                inputs=[
-                    bundle_trigger, num_envs,
-                    self.articulation_coord_start, self.articulation_dof_start,
-                    model.joint_act, model.joint_target, dof_per_env, coord_per_env,
-                ],
-                outputs=[bundle_model.joint_act, bundle_model.joint_target],
-                device=device,
-                record_tape=requires_grad,
-            )
             self._init_bundle_branches(
                 model, state_in, bundle_model, init_state,
                 bundle_trigger, contact_feet_mask,
@@ -6091,6 +6064,37 @@ class MoreauRoughIntegrator(Integrator):
                 outputs=[bundle_active, self._cache_horizon_remaining],
                 device=device,
                 record_tape=False,
+            )
+
+        # ============================================================
+        # Phase B'': COMBINED ACTION REFRESH (continuation + new triggers).
+        # Single-write rebuild of the bundle action buffers: refreshed envs
+        # read the current main actions, all other envs carry forward from
+        # the previous buffers (the old masked-fill left them ZERO, wiping
+        # mid-horizon envs' PD targets whenever another env triggered).
+        # ============================================================
+        if any_continuation or any_triggered:
+            joint_act_old = bundle_model.joint_act
+            joint_target_old = bundle_model.joint_target
+            bundle_model.joint_act = wp.zeros(
+                bundle_model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+            )
+            bundle_model.joint_target = wp.zeros(
+                bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+            )
+            wp.launch(
+                kernel=refresh_joint_actions_to_bundle,
+                dim=num_envs * num_bundle_samples,
+                inputs=[
+                    continuation_mask, bundle_trigger, num_envs,
+                    self.articulation_coord_start, self.articulation_dof_start,
+                    model.joint_act, model.joint_target,
+                    joint_act_old, joint_target_old,
+                    dof_per_env, coord_per_env,
+                ],
+                outputs=[bundle_model.joint_act, bundle_model.joint_target],
+                device=device,
+                record_tape=requires_grad,
             )
 
         # ============================================================
