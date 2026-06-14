@@ -1039,6 +1039,16 @@ def bin_contacts_by_env(
     The consumer kernels reduce over their bucket with an order-independent
     min-over-world-Y, so the arbitrary intra-bucket order produced by the
     atomic_add here does not change the selected (minimum-depth) contact value.
+
+    NOTE: the atomic_add assigns bucket SLOTS in nondeterministic (race) order.
+    That is fine for the FORWARD (min-over-Y is order-independent), but the
+    consumer kernels are recorded on the autograd tape and their ADJOINT
+    accumulates per-body gradient contributions in bucket order — an
+    order-dependent float reduction. With many contacts (e.g. the bundle
+    model's num_envs*num_samples articulations) the race exposes and makes the
+    GRADIENT nondeterministic run-to-run even though the forward is bit-exact.
+    ``sort_env_contact_bins`` below re-sorts each bucket into ascending-cid
+    (deterministic) order to remove that nondeterminism.
     """
     cid = wp.tid()
     c_body = contact_body[cid]
@@ -1048,6 +1058,40 @@ def bin_contacts_by_env(
     slot = wp.atomic_add(env_contact_count, env, 1)
     if slot < max_contacts_per_env:
         env_contact_ids[env * max_contacts_per_env + slot] = cid
+
+
+@wp.kernel
+def sort_env_contact_bins(
+    # inputs
+    env_contact_count: wp.array(dtype=int),
+    max_contacts_per_env: int,
+    # outputs (in place)
+    env_contact_ids: wp.array(dtype=int),
+):
+    """Insertion-sort each env's contact bucket into ascending contact-id order.
+
+    ``bin_contacts_by_env`` fills each bucket in atomic-arrival (race) order,
+    which is nondeterministic run to run. The consumer kernels' ADJOINT
+    accumulates in bucket order, so a nondeterministic bucket order yields a
+    nondeterministic gradient (the forward stays bit-exact because its
+    reduction is order-independent). Sorting each bucket by the global contact
+    id — itself deterministic — pins the order, making the recorded adjoint
+    bit-reproducible. Buckets are tiny (a handful of contacts per env), so the
+    O(k^2) insertion sort is negligible.
+    """
+    env = wp.tid()
+    n = env_contact_count[env]
+    if n > max_contacts_per_env:
+        n = max_contacts_per_env
+    base = env * max_contacts_per_env
+    # insertion sort env_contact_ids[base : base+n] ascending
+    for i in range(1, n):
+        key = env_contact_ids[base + i]
+        j = i - 1
+        while j >= 0 and env_contact_ids[base + j] > key:
+            env_contact_ids[base + j + 1] = env_contact_ids[base + j]
+            j -= 1
+        env_contact_ids[base + j + 1] = key
 
 
 @wp.kernel
@@ -2690,21 +2734,33 @@ def detect_bundle_contacts(
     # inputs
     point_vec: wp.array(dtype=wp.vec3),
     col_height: float,
+    percussion: wp.array2d(dtype=wp.vec3),
+    force_thresh: float,
     bundle_active: wp.array(dtype=int),
     bundle_slot_to_group: wp.array(dtype=int),
     # outputs
     bundle_trigger: wp.array(dtype=int),
     contact_feet_mask: wp.array(dtype=int),
 ):
-    """Detect which envs have foot-ground contact and should trigger bundling.
+    """Detect which envs have REAL foot-ground contact and should trigger bundling.
 
     For each articulation, checks all 8 contact slots. contact_feet_mask bits
     correspond to group indices (not slot indices); slot_to_group maps each slot
     to its group (-1 = slot unused). contact_feet_mask is ALWAYS filled from the
-    current point_vec (needed by continuing bundle envs to refresh their
-    perturbation Jacobian leg set each substep).
+    current point_vec under the soft activation height ``col_height`` (needed by
+    continuing bundle envs to refresh their perturbation Jacobian leg set each
+    substep) -- this is unchanged from the legacy behavior.
 
-    bundle_trigger is only set for envs with bundle_active==0 — i.e. envs
+    ``bundle_trigger``, by contrast, fires only when a slot carries a normal
+    contact impulse (``percussion.y``) above ``force_thresh`` -- i.e. a leg is
+    REALLY load-bearing. The soft col_height (1.0 m) is intentionally generous
+    so the point-height test above is true for essentially every near-ground
+    foot, which would force bundling on every substep even in full flight; the
+    contact-force gate is robot- and terrain-independent (stance ~1e-1, swing
+    ~1e-22). A non-positive ``force_thresh`` restores the legacy always-on
+    behavior (trigger == any near-ground foot).
+
+    bundle_trigger is only set for envs with bundle_active==0 -- i.e. envs
     already inside a bundle window continue via bookkeeping, not re-triggering.
     """
     tid = wp.tid()
@@ -2719,6 +2775,13 @@ def detect_bundle_contacts(
         p = point_vec[tid * 8 + f]
         if p[1] <= col_height:
             mask = mask | (1 << g)
+        # Real contact for the trigger gate: a load-bearing normal impulse.
+        # ``percussion`` is the nominal (unperturbed) step's contact solution.
+        if force_thresh <= 0.0:
+            # Legacy behavior: any near-ground foot triggers.
+            if p[1] <= col_height:
+                any_contact = 1
+        elif percussion[tid, f][1] > force_thresh:
             any_contact = 1
 
     contact_feet_mask[tid] = mask
@@ -2817,6 +2880,7 @@ def refresh_joint_actions_to_bundle(
     refresh_mask_a: wp.array(dtype=int),  # per-env (e.g. continuation mask)
     refresh_mask_b: wp.array(dtype=int),  # per-env (e.g. new-trigger mask)
     num_envs: int,
+    num_bundle_samples: int,
     articulation_coord_start: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
     joint_act_main: wp.array(dtype=float),
@@ -2844,23 +2908,30 @@ def refresh_joint_actions_to_bundle(
     staggered horizons — sending those envs' inner rollouts toward the zero
     pose and corrupting both the committed averages and their gradients.
     """
-    tid = wp.tid()
-    env_id = tid % num_envs
+    env_id = wp.tid()
     main_coord_start = articulation_coord_start[env_id]
     main_dof_start = articulation_dof_start[env_id]
-    bundle_coord_start = tid * coord_count
-    bundle_dof_start = tid * dof_count
 
-    if refresh_mask_a[env_id] == 1 or refresh_mask_b[env_id] == 1:
-        for d in range(dof_count):
-            joint_act_bundle[bundle_dof_start + d] = joint_act_main[main_dof_start + d]
-        for c in range(coord_count):
-            joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
-    else:
-        for d in range(dof_count):
-            joint_act_bundle[bundle_dof_start + d] = joint_act_old[bundle_dof_start + d]
-        for c in range(coord_count):
-            joint_target_bundle[bundle_coord_start + c] = joint_target_old[bundle_coord_start + c]
+    # Env-major threading (one thread per env, looping the env's samples)
+    # keeps the adjoint deterministic: all samples of a refreshed env read the
+    # same per-env joint_act_main / joint_target_main entries, so a per-slot
+    # launch would accumulate S adjoint contributions through racing float
+    # atomics (bitwise-nondeterministic ordering run to run).
+    for s in range(num_bundle_samples):
+        slot = s * num_envs + env_id
+        bundle_coord_start = slot * coord_count
+        bundle_dof_start = slot * dof_count
+
+        if refresh_mask_a[env_id] == 1 or refresh_mask_b[env_id] == 1:
+            for d in range(dof_count):
+                joint_act_bundle[bundle_dof_start + d] = joint_act_main[main_dof_start + d]
+            for c in range(coord_count):
+                joint_target_bundle[bundle_coord_start + c] = joint_target_main[main_coord_start + c]
+        else:
+            for d in range(dof_count):
+                joint_act_bundle[bundle_dof_start + d] = joint_act_old[bundle_dof_start + d]
+            for c in range(coord_count):
+                joint_target_bundle[bundle_coord_start + c] = joint_target_old[bundle_coord_start + c]
 
 
 @wp.kernel
@@ -3002,6 +3073,7 @@ def init_bundle_state_with_perturbation(
     # inputs
     env_mask: wp.array(dtype=int),
     num_envs: int,
+    num_bundle_samples: int,
     articulation_coord_start: wp.array(dtype=int),
     articulation_dof_start: wp.array(dtype=int),
     coord_count: int,
@@ -3019,45 +3091,53 @@ def init_bundle_state_with_perturbation(
     """Copy main joint state into bundle slots and add precomputed leg-DOF deltas.
 
     Bundle model uses samples-major layout: slot = sample_id * num_envs + env_id.
-    Thread tid is the flat bundle slot index. Skips envs whose env_mask entry is 0.
-    The delta buffers store deltas in DOF space, restricted to leg DOFs (i.e. their
-    width is dof_count - root_qd_dim). The first root_q_dim coords / root_qd_dim dofs
-    of each slot are copied verbatim from the main state (root joint is unperturbed).
+    Thread tid is the ENV index; the kernel loops over the env's samples.
+    Env-major threading (instead of one thread per flat bundle slot) keeps the
+    adjoint deterministic: every sample of an env reads the SAME per-env
+    entries of joint_q_main / joint_qd_main, so a per-slot launch makes the
+    generated adjoint accumulate S gradient contributions into the same
+    adj_joint_*_main entries from S concurrent threads via racing float
+    atomics — bitwise-nondeterministic run to run. With one thread per env
+    the accumulation order is fixed.
+
+    Skips envs whose env_mask entry is 0. The delta buffers store deltas in
+    DOF space, restricted to leg DOFs (i.e. their width is
+    dof_count - root_qd_dim). The first root_q_dim coords / root_qd_dim dofs
+    of each slot are copied verbatim from the main state (root joint is
+    unperturbed).
     """
-    tid = wp.tid()
-    env_id = tid % num_envs
-    sample_id = tid / num_envs
+    env_id = wp.tid()
 
     if env_mask[env_id] == 0:
         return
 
     main_q_start = articulation_coord_start[env_id]
     main_qd_start = articulation_dof_start[env_id]
-    bundle_q_start = tid * coord_count
-    bundle_qd_start = tid * dof_count
-
-    # Root joint coords copied verbatim
-    for qi in range(root_q_dim):
-        bundle_joint_q[bundle_q_start + qi] = joint_q_main[main_q_start + qi]
-    # Leg coords get the delta added
     leg_coord_count = coord_count - root_q_dim
-    for li in range(leg_coord_count):
-        bundle_joint_q[bundle_q_start + root_q_dim + li] = (
-            joint_q_main[main_q_start + root_q_dim + li] + delta_q_buf[tid, li]
-        )
-
-    # Root joint dofs copied verbatim
-    for qdi in range(root_qd_dim):
-        bundle_joint_qd[bundle_qd_start + qdi] = joint_qd_main[main_qd_start + qdi]
-    # Leg dofs get the delta added
     leg_dof_count = dof_count - root_qd_dim
-    for li in range(leg_dof_count):
-        bundle_joint_qd[bundle_qd_start + root_qd_dim + li] = (
-            joint_qd_main[main_qd_start + root_qd_dim + li] + delta_qd_buf[tid, li]
-        )
 
-    # Suppress unused warning
-    _ = sample_id
+    for s in range(num_bundle_samples):
+        slot = s * num_envs + env_id
+        bundle_q_start = slot * coord_count
+        bundle_qd_start = slot * dof_count
+
+        # Root joint coords copied verbatim
+        for qi in range(root_q_dim):
+            bundle_joint_q[bundle_q_start + qi] = joint_q_main[main_q_start + qi]
+        # Leg coords get the delta added
+        for li in range(leg_coord_count):
+            bundle_joint_q[bundle_q_start + root_q_dim + li] = (
+                joint_q_main[main_q_start + root_q_dim + li] + delta_q_buf[slot, li]
+            )
+
+        # Root joint dofs copied verbatim
+        for qdi in range(root_qd_dim):
+            bundle_joint_qd[bundle_qd_start + qdi] = joint_qd_main[main_qd_start + qdi]
+        # Leg dofs get the delta added
+        for li in range(leg_dof_count):
+            bundle_joint_qd[bundle_qd_start + root_qd_dim + li] = (
+                joint_qd_main[main_qd_start + root_qd_dim + li] + delta_qd_buf[slot, li]
+            )
 
 
 @wp.kernel
@@ -3338,6 +3418,7 @@ def merge_bundle_input_state(
     cache_active_mask: wp.array(dtype=int),   # per-env: 1 iff cache-active (continuing OR triggered)
     continuation_mask: wp.array(dtype=int),   # per-env: 1 iff bundle continued across the step() boundary (substep 0 only)
     num_envs: int,
+    num_bundle_samples: int,
     coord_count: int,
     dof_count: int,
     # outputs
@@ -3368,36 +3449,43 @@ def merge_bundle_input_state(
     Single-write semantics: dst_q / dst_qd are written exactly once per slot,
     so the Warp tape records a single output for ``dst``. Adjoint correctly
     routes each slot's gradient back to exactly one of the sources.
-    """
-    tid = wp.tid()
-    env_id = tid % num_envs
-    sample_id = tid // num_envs
-    q_base = tid * coord_count
-    qd_base = tid * dof_count
 
-    if trigger_mask[env_id] == 1:
-        for i in range(coord_count):
-            dst_q[q_base + i] = src_trigger_q[q_base + i]
-        for j in range(dof_count):
-            dst_qd[qd_base + j] = src_trigger_qd[qd_base + j]
-    elif cache_active_mask[env_id] == 1:
-        if continuation_mask[env_id] == 1 and sample_id == 0:
-            main_q_base = main_coord_start[env_id]
-            main_qd_base = main_dof_start[env_id]
+    Env-major threading (one thread per env, looping the env's samples) keeps
+    the adjoint deterministic: every sample of a triggered env reads the same
+    per-env src_avg / shared entries, so a per-slot launch would accumulate
+    S adjoint contributions into the same adjoint entries from S concurrent
+    threads via racing float atomics (bitwise-nondeterministic run to run).
+    """
+    env_id = wp.tid()
+
+    for s in range(num_bundle_samples):
+        slot = s * num_envs + env_id
+        q_base = slot * coord_count
+        qd_base = slot * dof_count
+
+        if trigger_mask[env_id] == 1:
             for i in range(coord_count):
-                dst_q[q_base + i] = src_avg_q[main_q_base + i]
+                dst_q[q_base + i] = src_trigger_q[q_base + i]
             for j in range(dof_count):
-                dst_qd[qd_base + j] = src_avg_qd[main_qd_base + j]
+                dst_qd[qd_base + j] = src_trigger_qd[qd_base + j]
+        elif cache_active_mask[env_id] == 1:
+            if continuation_mask[env_id] == 1 and s == 0:
+                main_q_base = main_coord_start[env_id]
+                main_qd_base = main_dof_start[env_id]
+                for i in range(coord_count):
+                    dst_q[q_base + i] = src_avg_q[main_q_base + i]
+                for j in range(dof_count):
+                    dst_qd[qd_base + j] = src_avg_qd[main_qd_base + j]
+            else:
+                for i in range(coord_count):
+                    dst_q[q_base + i] = src_continue_q[q_base + i]
+                for j in range(dof_count):
+                    dst_qd[qd_base + j] = src_continue_qd[qd_base + j]
         else:
             for i in range(coord_count):
-                dst_q[q_base + i] = src_continue_q[q_base + i]
+                dst_q[q_base + i] = 0.0
             for j in range(dof_count):
-                dst_qd[qd_base + j] = src_continue_qd[qd_base + j]
-    else:
-        for i in range(coord_count):
-            dst_q[q_base + i] = 0.0
-        for j in range(dof_count):
-            dst_qd[qd_base + j] = 0.0
+                dst_qd[qd_base + j] = 0.0
 
 
 @wp.kernel
@@ -4182,12 +4270,16 @@ class MoreauIntegrator:
                             self._bundle_dq_range_max[(0, max_perturb_dof)] = max(_prev_max, _slot_max)
 
         # Launch warp kernel to copy main state into bundle slots and add the deltas.
+        # Env-major launch (dim=num_envs, samples looped inside the kernel) so the
+        # adjoint accumulation into state_in.grad is single-threaded per env and
+        # therefore bitwise-deterministic (see kernel docstring).
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
                     should_bundle,
                     num_envs,
+                    num_bundle_samples,
                     model.articulation_coord_start,
                     model.articulation_dof_start,
                     coord_per_env,
@@ -5034,16 +5126,21 @@ class MoreauIntegrator:
         # ============================================================
         # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
         # detect_bundle_contacts unconditionally fills contact_feet_mask from
-        # the current point_vec, but only sets bundle_trigger=1 for envs with
-        # bundle_active==0 (cache-active envs are suppressed from re-trigger).
+        # the current point_vec (soft col_height), but only sets
+        # bundle_trigger=1 for envs with bundle_active==0 (cache-active envs are
+        # suppressed from re-trigger) AND with a real load-bearing contact
+        # (percussion above force_thresh) — so full-flight envs run the cheap
+        # normal step instead of bundling.
         # ============================================================
+        force_thresh = float(getattr(self, "_bundle_contact_force_thresh", 1e-6))
         bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
         contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
 
         wp.launch(
             kernel=detect_bundle_contacts,
             dim=num_envs,
-            inputs=[state_mid.point_vec, model.col_height, bundle_active, model.bundle_slot_to_group],
+            inputs=[state_mid.point_vec, model.col_height, state_mid.percussion, force_thresh,
+                    bundle_active, model.bundle_slot_to_group],
             outputs=[bundle_trigger, contact_feet_mask],
             device=device,
             record_tape=False,
@@ -5071,7 +5168,13 @@ class MoreauIntegrator:
 
         init_state = bundle_model.state(requires_grad=requires_grad)
 
-        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
+        # Reuse the host sync below to also accumulate a contact-trigger
+        # diagnostic (how many envs opened a bundle window). Off-tape, no extra
+        # device sync vs the original .any() check.
+        _trig_count = int(wp.to_torch(bundle_trigger).sum().item())
+        self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
+        self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
+        any_triggered = _trig_count > 0
         if any_triggered:
             # 1) Initialize perturbed branches into init_state (fresh
             #    per-substep) for triggered envs only.
@@ -5116,13 +5219,16 @@ class MoreauIntegrator:
                 bundle_model.joint_coord_count, dtype=float, device=device,
                 requires_grad=requires_grad,
             )
+            # Env-major launch — keeps the adjoint accumulation into
+            # model.joint_target.grad single-threaded per env (deterministic).
             wp.launch(
                 kernel=refresh_joint_actions_to_bundle,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
                     continuation_mask,
                     bundle_trigger,
                     num_envs,
+                    num_bundle_samples,
                     model.articulation_coord_start,
                     model.articulation_dof_start,
                     model.joint_act,
@@ -5164,9 +5270,11 @@ class MoreauIntegrator:
         any_active = bool(wp.to_torch(bundle_active).any().item())
         if any_active:
             b_in = bundle_model.state(requires_grad=requires_grad)
+            # Env-major launch — keeps the adjoint accumulation into
+            # state_in.grad single-threaded per env (deterministic).
             wp.launch(
                 kernel=merge_bundle_input_state,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
                     init_state.joint_q,
                     init_state.joint_qd,
@@ -5180,6 +5288,7 @@ class MoreauIntegrator:
                     bundle_active_snapshot,
                     continuation_mask,
                     num_envs,
+                    num_bundle_samples,
                     coord_per_env,
                     dof_per_env,
                 ],
@@ -5589,6 +5698,18 @@ class MoreauIntegrator:
                 model.max_contacts_per_env,
             ],
             outputs=[model.env_contact_count, model.env_contact_ids],
+            device=model.device,
+            record_tape=False,
+        )
+        # Pin the intra-bucket order (ascending contact id) so the taped
+        # consumer kernels' adjoint reduces in a deterministic order. Without
+        # this the bundle backward is nondeterministic run-to-run (the atomic
+        # bucket fill races); the forward is unaffected (order-independent).
+        wp.launch(
+            kernel=sort_env_contact_bins,
+            dim=nart,
+            inputs=[model.env_contact_count, model.max_contacts_per_env],
+            outputs=[model.env_contact_ids],
             device=model.device,
             record_tape=False,
         )

@@ -70,6 +70,7 @@ from .integrator_moreau import (
     reset_bundle_envs_kernel,
     copy_int_array,
     copy_float_array_1d,
+    sort_env_contact_bins,
     _print_bundle_inner_debug,
 )
 
@@ -4585,6 +4586,8 @@ def compute_body_qd_inertial(
 def detect_bundle_contacts_rough(
     # inputs
     c_body_vec: wp.array(dtype=int),
+    percussion: wp.array2d(dtype=wp.vec3),
+    force_thresh: float,
     num_contacts: int,
     bundle_active: wp.array(dtype=int),
     bundle_slot_to_group: wp.array(dtype=int),
@@ -4597,16 +4600,22 @@ def detect_bundle_contacts_rough(
     The rough contact solver marks an ``(articulation, slot)`` pair as active by
     writing ``c_body_vec[tid*num_contacts+slot] >= 0`` (the contacting body
     index), and ``-1`` for inactive slots (see ``construct_contact_jacobian``).
-    This activation flag is the robust trigger signal: unlike the active Moreau
-    integrator (which inits inactive ``point_vec`` slots to the above-ground
-    sentinel ``(0,1,0)``), the rough integrator zeroes ``point_vec`` for inactive
-    slots, so a ``point_vec.y <= col_height`` test would false-trigger on every
-    inactive slot.
+    That activation flag (gated by the generous soft ``col_height`` = 1.0 m) is
+    used UNCHANGED to fill ``contact_feet_mask`` (the perturbation leg set that
+    continuing-bundle envs refresh each substep).
+
+    ``bundle_trigger``, by contrast, fires only when a slot carries a normal
+    contact impulse (``percussion.y``) above ``force_thresh`` -- i.e. a leg is
+    REALLY load-bearing -- so an env in full flight runs the cheap normal step
+    instead of bundling. The contact-force gate is robot- and terrain-
+    independent (stance ~1e-1, swing ~1e-22), unlike an absolute foot height
+    which on rough terrain tracks the local ground height. A non-positive
+    ``force_thresh`` restores the legacy always-on behavior (trigger == any
+    active contact slot).
 
     ``contact_feet_mask`` bits correspond to group indices; ``bundle_slot_to_group``
-    maps each contact slot to its group (-1 = slot unused). The mask is always
-    filled (continuing-bundle envs use it to refresh their leg set). A fresh
-    trigger is only raised for envs with ``bundle_active==0``.
+    maps each contact slot to its group (-1 = slot unused). A fresh trigger is
+    only raised for envs with ``bundle_active==0``.
     """
     tid = wp.tid()
 
@@ -4617,8 +4626,15 @@ def detect_bundle_contacts_rough(
         g = bundle_slot_to_group[f]
         if g < 0:
             continue
-        if c_body_vec[tid * num_contacts + f] >= 0:
+        active = c_body_vec[tid * num_contacts + f] >= 0
+        if active:
             mask = mask | (1 << g)
+        # Real contact for the trigger gate: a load-bearing normal impulse from
+        # the nominal (unperturbed) step's contact solve.
+        if force_thresh <= 0.0:
+            if active:
+                any_contact = 1
+        elif percussion[tid, f][1] > force_thresh:
             any_contact = 1
 
     contact_feet_mask[tid] = mask
@@ -5318,12 +5334,16 @@ class MoreauRoughIntegrator(Integrator):
                             delta_q_torch[bundle_indices, :max_perturb_dof] = delta_q_all.T
                             delta_qd_torch[bundle_indices, :max_perturb_dof] = delta_qd_all.T
 
+            # Env-major launch (samples looped inside the kernel) so the adjoint
+            # accumulation into state_in.grad is single-threaded per env and
+            # therefore bitwise-deterministic (see kernel docstring).
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
                     should_bundle,
                     num_envs,
+                    num_bundle_samples,
                     self.articulation_coord_start,
                     self.articulation_dof_start,
                     coord_per_env,
@@ -6025,16 +6045,20 @@ class MoreauRoughIntegrator(Integrator):
                 # (see MoreauIntegrator._simulate_bundle for the rationale).
 
         # ============================================================
-        # Phase B: contact detection -> new-trigger mask. Uses the midpoint
-        # contact activation (self.c_body_vec) written by Phase A's
-        # eval_contact_quantities -- robust for the rough integrator.
+        # Phase B: contact detection -> new-trigger mask. contact_feet_mask uses
+        # the midpoint contact activation (self.c_body_vec) written by Phase A;
+        # bundle_trigger fires only on a real load-bearing contact
+        # (state_mid.percussion above force_thresh) so full-flight envs run the
+        # cheap normal step instead of bundling.
         # ============================================================
+        force_thresh = float(getattr(self, "_bundle_contact_force_thresh", 1e-6))
         bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
         contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
         wp.launch(
             kernel=detect_bundle_contacts_rough,
             dim=num_envs,
-            inputs=[self.c_body_vec, self.num_contacts, bundle_active, model.bundle_slot_to_group],
+            inputs=[self.c_body_vec, state_mid.percussion, force_thresh, self.num_contacts,
+                    bundle_active, model.bundle_slot_to_group],
             outputs=[bundle_trigger, contact_feet_mask],
             device=device,
             record_tape=False,
@@ -6048,7 +6072,13 @@ class MoreauRoughIntegrator(Integrator):
         chain_out = chain[substep + 1]
         init_state = bundle_model.state(requires_grad=requires_grad)
 
-        any_triggered = bool(wp.to_torch(bundle_trigger).any().item())
+        # Reuse the host sync below to also accumulate a contact-trigger
+        # diagnostic (how many envs opened a bundle window). Off-tape, no extra
+        # device sync vs the original .any() check.
+        _trig_count = int(wp.to_torch(bundle_trigger).sum().item())
+        self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
+        self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
+        any_triggered = _trig_count > 0
         if any_triggered:
             self._init_bundle_branches(
                 model, state_in, bundle_model, init_state,
@@ -6082,11 +6112,13 @@ class MoreauRoughIntegrator(Integrator):
             bundle_model.joint_target = wp.zeros(
                 bundle_model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
             )
+            # Env-major launch — keeps the adjoint accumulation into
+            # model.joint_target.grad single-threaded per env (deterministic).
             wp.launch(
                 kernel=refresh_joint_actions_to_bundle,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
-                    continuation_mask, bundle_trigger, num_envs,
+                    continuation_mask, bundle_trigger, num_envs, num_bundle_samples,
                     self.articulation_coord_start, self.articulation_dof_start,
                     model.joint_act, model.joint_target,
                     joint_act_old, joint_target_old,
@@ -6113,16 +6145,18 @@ class MoreauRoughIntegrator(Integrator):
         any_active = bool(wp.to_torch(bundle_active).any().item())
         if any_active:
             b_in = bundle_model.state(requires_grad=requires_grad)
+            # Env-major launch — keeps the adjoint accumulation into
+            # state_in.grad single-threaded per env (deterministic).
             wp.launch(
                 kernel=merge_bundle_input_state,
-                dim=num_envs * num_bundle_samples,
+                dim=num_envs,
                 inputs=[
                     init_state.joint_q, init_state.joint_qd,
                     chain_in.joint_q, chain_in.joint_qd,
                     state_in.joint_q, state_in.joint_qd,
                     self.articulation_coord_start, self.articulation_dof_start,
                     bundle_trigger, bundle_active_snapshot, continuation_mask,
-                    num_envs, coord_per_env, dof_per_env,
+                    num_envs, num_bundle_samples, coord_per_env, dof_per_env,
                 ],
                 outputs=[b_in.joint_q, b_in.joint_qd],
                 device=device,
@@ -7069,6 +7103,19 @@ class MoreauRoughIntegrator(Integrator):
                 self.max_contacts_per_env,
             ],
             outputs=[self.env_contact_count, self.env_contact_ids],
+            device=model.device,
+            record_tape=False,
+        )
+        # Pin the intra-bucket order (ascending contact id) so the taped
+        # consumer kernels' adjoint reduces deterministically. The atomic
+        # bucket fill races, which leaves the FORWARD unchanged (the consumers'
+        # reductions are order-independent) but makes the BACKWARD gradient
+        # nondeterministic run-to-run; the sort removes that.
+        wp.launch(
+            kernel=sort_env_contact_bins,
+            dim=nart,
+            inputs=[self.env_contact_count, self.max_contacts_per_env],
+            outputs=[self.env_contact_ids],
             device=model.device,
             record_tape=False,
         )
