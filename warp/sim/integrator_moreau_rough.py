@@ -5039,7 +5039,7 @@ class MoreauRoughIntegrator(Integrator):
             record_tape=False,
         )
 
-    def _run_fk_foot_pos(self, model):
+    def _run_fk_foot_pos(self, model, sync=True):
         """Evaluate FK at ``self._fk_scratch_joint_q`` and return group-center foot
         positions, shape ``(num_envs, n_groups, 3)``, detached (no tape).
 
@@ -5047,6 +5047,10 @@ class MoreauRoughIntegrator(Integrator):
         active FK kernel (writes body_X_sc) + ``get_foot_states_rough`` (which
         initializes inactive slots to the above-ground sentinel), then groups the
         per-slot points via ``model.bundle_group_sphere_slots``.
+
+        ``sync=False`` skips the full-device sync — safe ONLY when the caller has
+        put Warp on torch's stream (FD-Jacobian loop), so the FK launches and the
+        torch reductions below stay ordered on one stream.
         """
         state = self._fk_scratch_state
         device = model.device
@@ -5094,7 +5098,8 @@ class MoreauRoughIntegrator(Integrator):
             device=device,
             record_tape=False,
         )
-        wp.synchronize_device()
+        if sync:
+            wp.synchronize_device()
         all_pts = wp.to_torch(state.point_vec).reshape(model.articulation_count, self.num_contacts, 3)
         group_slots = getattr(model, "bundle_group_sphere_slots", [[0], [1], [2], [3]])
         group_centers = torch.stack(
@@ -5121,14 +5126,20 @@ class MoreauRoughIntegrator(Integrator):
 
         J_fd_full = torch.zeros(num_envs, n_groups * 3, max_perturb_dof, dtype=torch.float32, device=torch_device)
 
-        for i in range(max_perturb_dof):
-            dof_indices = dof_base + i
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
-            fp_plus = self._run_fk_foot_pos(model).clone()
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-            fp_minus = self._run_fk_foot_pos(model)
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices]
-            J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
+        # Run all FK evaluations on torch's stream so the interleaved torch
+        # writes to fk_jq_t and the Warp FK launches are ordered on ONE stream;
+        # this lets us drop the per-call full-device sync (sync=False) and
+        # pipeline the loop instead of draining the device after every FK.
+        # Bit-identical (same kernels/reads, fewer syncs).
+        with wp.ScopedStream(wp.stream_from_torch()):
+            for i in range(max_perturb_dof):
+                dof_indices = dof_base + i
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+                fp_plus = self._run_fk_foot_pos(model, sync=False).clone()
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+                fp_minus = self._run_fk_foot_pos(model, sync=False)
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices]
+                J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
 
         J_fd_dict = {}
         for e in triggered_env_ids:
@@ -5138,6 +5149,75 @@ class MoreauRoughIntegrator(Integrator):
             active_rows = [3 * g + xyz for g in active_groups for xyz in range(3)]
             J_fd_dict[e] = J_fd_full[e][active_rows, :]
         return J_fd_dict
+
+    def _init_branches_jacobian_batched(
+        self, valid_triggered, active_groups, J_fd_dict,
+        delta_q_torch, delta_qd_torch,
+        num_bundle_samples, num_envs, torch_device,
+        bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+        root_qd_dim, leg_dof_count, max_perturb_dof,
+        per_group_solve, group_dof_start, group_dof_end, damping,
+    ):
+        """Vectorized replacement for the jacobian-mode per-env perturbation loop.
+
+        Requires every env in ``valid_triggered`` to share the SAME
+        ``active_groups`` set (checked by the caller). BIT-IDENTICAL to the
+        per-env loop: same math/clamps AND the noise is drawn in the EXACT same
+        per-(env[,group]) chunk pattern. ``torch.randn`` consumes the generator
+        differently for one big tensor vs many small draws, so we must replicate
+        the scalar loop's chunking (cheap CPU draws); only the solves are batched.
+        """
+        S = num_bundle_samples
+        n = len(valid_triggered)
+        e_t = torch.tensor(valid_triggered, device=torch_device, dtype=torch.long)
+        idx = (
+            torch.arange(S, device=torch_device)[None, :] * num_envs + e_t[:, None]
+        ).reshape(-1)
+        J_all = torch.stack([J_fd_dict[e] for e in valid_triggered], dim=0)
+
+        if per_group_solve:
+            n_ag = len(active_groups)
+            dxs, dvs = [], []
+            for _ in range(n):
+                for _g in range(n_ag):
+                    dxs.append(torch.randn(3, S, generator=self._bundle_rng))
+                    dvs.append(torch.randn(3, S, generator=self._bundle_rng))
+            dx_all = torch.stack(dxs).view(n, n_ag, 3, S)
+            dv_all = torch.stack(dvs).view(n, n_ag, 3, S)
+            for gi, g in enumerate(active_groups):
+                ds, de = group_dof_start[g], group_dof_end[g]
+                J_g = J_all[:, gi * 3:(gi + 1) * 3, ds:de]
+                JJt_g = (
+                    J_g @ J_g.transpose(1, 2)
+                    + damping * torch.eye(3, device=torch_device, dtype=J_g.dtype)
+                )
+                dx = (dx_all[:, gi] * bundle_sigma_pos).to(device=torch_device, dtype=J_g.dtype)
+                dv = (dv_all[:, gi] * bundle_sigma_vel).to(device=torch_device, dtype=J_g.dtype)
+                alpha_q = torch.linalg.solve(JJt_g, dx)
+                alpha_qd = torch.linalg.solve(JJt_g, dv)
+                dq = (J_g.transpose(1, 2) @ alpha_q).clamp(*dq_clamp)
+                dqd = (J_g.transpose(1, 2) @ alpha_qd).clamp(*dqd_clamp)
+                w = de - ds
+                delta_q_torch[idx, ds:de] = dq.permute(0, 2, 1).reshape(n * S, w)
+                delta_qd_torch[idx, ds:de] = dqd.permute(0, 2, 1).reshape(n * S, w)
+        else:
+            task_dim = 3 * len(active_groups)
+            JJt = (
+                J_all @ J_all.transpose(1, 2)
+                + damping * torch.eye(task_dim, device=torch_device, dtype=J_all.dtype)
+            )
+            dxs, dvs = [], []
+            for _ in range(n):
+                dxs.append(torch.randn(task_dim, S, generator=self._bundle_rng))
+                dvs.append(torch.randn(task_dim, S, generator=self._bundle_rng))
+            dx = (torch.stack(dxs) * bundle_sigma_pos).to(device=torch_device, dtype=J_all.dtype)
+            dv = (torch.stack(dvs) * bundle_sigma_vel).to(device=torch_device, dtype=J_all.dtype)
+            alpha_q = torch.linalg.solve(JJt, dx)
+            alpha_qd = torch.linalg.solve(JJt, dv)
+            dq = (J_all.transpose(1, 2) @ alpha_q).clamp(*dq_clamp)
+            dqd = (J_all.transpose(1, 2) @ alpha_qd).clamp(*dqd_clamp)
+            delta_q_torch[idx, :max_perturb_dof] = dq.permute(0, 2, 1).reshape(n * S, max_perturb_dof)
+            delta_qd_torch[idx, :max_perturb_dof] = dqd.permute(0, 2, 1).reshape(n * S, max_perturb_dof)
 
     def _init_bundle_branches(
         self, model, state_in, bundle_model, bundle_state_in, should_bundle,
@@ -5214,7 +5294,27 @@ class MoreauRoughIntegrator(Integrator):
                             main_jq_snap, root_q_dim, coord_per_env, n_groups, max_perturb_dof,
                         )
 
-                for e in triggered_list:
+                # Batched jacobian-mode fast path — eliminates the per-env Python
+                # loop (per-env solve / H2D / scatter) when every triggered env
+                # shares the same active-group set (the soft-inner-mode case).
+                # Bit-identical to the per-env loop (same math + same RNG chunk
+                # pattern); used for both ANYmal and G1. Falls back to the per-env
+                # loop for non-jacobian modes / non-uniform active groups.
+                batched_done = False
+                if perturbation_mode == "jacobian" and valid_triggered:
+                    ag0 = active_groups_per_env[valid_triggered[0]]
+                    if all(active_groups_per_env[e] == ag0 for e in valid_triggered):
+                        self._init_branches_jacobian_batched(
+                            valid_triggered, ag0, J_fd_dict,
+                            delta_q_torch, delta_qd_torch,
+                            num_bundle_samples, num_envs, torch_device,
+                            bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+                            root_qd_dim, leg_dof_count, max_perturb_dof,
+                            per_group_solve, group_dof_start, group_dof_end, damping,
+                        )
+                        batched_done = True
+
+                for e in (triggered_list if not batched_done else ()):
                     active_groups = active_groups_per_env.get(e)
                     if active_groups is None:
                         continue
@@ -5337,6 +5437,10 @@ class MoreauRoughIntegrator(Integrator):
             # Env-major launch (samples looped inside the kernel) so the adjoint
             # accumulation into state_in.grad is single-threaded per env and
             # therefore bitwise-deterministic (see kernel docstring).
+            # The delta buffers were just written by torch (torch's stream); this
+            # kernel runs on Warp's own stream and reads them, so order the two
+            # with one sync (was implicit via the removed per-env host loop).
+            wp.synchronize_device()
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
                 dim=num_envs,
@@ -5417,22 +5521,31 @@ class MoreauRoughIntegrator(Integrator):
             branch_mask_t = wp.to_torch(branch_contact_mask)
             feet_mask_t = wp.to_torch(contact_feet_mask)
 
-            for e in range(num_envs):
-                if int(reperturb_t[e].item()) == 0:
-                    continue
-                union_mask = 0
-                for s in range(num_bundle_samples):
-                    union_mask |= int(branch_mask_t[s * num_envs + e].item())
-                prev_mask = int(feet_mask_t[e].item())
-                newly_contacting = union_mask & ~prev_mask
-                if newly_contacting == 0:
-                    continue
-                feet_mask_t[e] = prev_mask | newly_contacting
-                apply_mask_host[e] = 1
-                new_groups_per_env[e] = [g for g in range(n_groups) if newly_contacting & (1 << g)]
-
-            if not new_groups_per_env:
+            # Vectorized new-contact detection. Replaces an
+            # O(num_envs * num_bundle_samples) per-element .item() host loop (each
+            # .item() forces a D2H sync). Bundle layout is samples-major
+            # (slot = s*num_envs + e); OR across the sample axis to get each env's
+            # union contact mask, compare to the previous mask. Identical result;
+            # only ONE D2H sync remains and (soft inner mode) it usually returns.
+            union_mask_t = torch.zeros(
+                num_envs, dtype=branch_mask_t.dtype, device=branch_mask_t.device
+            )
+            bm = branch_mask_t.view(num_bundle_samples, num_envs)
+            for s in range(num_bundle_samples):
+                union_mask_t = torch.bitwise_or(union_mask_t, bm[s])
+            newly_t = torch.bitwise_and(union_mask_t, torch.bitwise_not(feet_mask_t))
+            newly_t = torch.where(reperturb_t != 0, newly_t, torch.zeros_like(newly_t))
+            newly_cpu = newly_t.cpu()  # single D2H sync
+            envs_with_new = torch.nonzero(newly_cpu, as_tuple=False).flatten().tolist()
+            if not envs_with_new:
                 return
+
+            feet_mask_t.copy_(torch.bitwise_or(feet_mask_t, newly_t))
+            newly_list = newly_cpu.tolist()
+            for e in envs_with_new:
+                apply_mask_host[e] = 1
+                newly_contacting = int(newly_list[e])
+                new_groups_per_env[e] = [g for g in range(n_groups) if newly_contacting & (1 << g)]
 
             # Diagnostics: count env-level reperturbation events (probe use only).
             self.reperturb_event_count = (

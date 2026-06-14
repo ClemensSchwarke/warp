@@ -1084,13 +1084,28 @@ def sort_env_contact_bins(
     if n > max_contacts_per_env:
         n = max_contacts_per_env
     base = env * max_contacts_per_env
-    # insertion sort env_contact_ids[base : base+n] ascending
+    # insertion sort env_contact_ids[base : base+n] ascending.
+    # NOTE: the inner test MUST guard the array read by j>=0 in a way that does
+    # not read at j=-1. Warp does NOT short-circuit `and` (codegen evaluates both
+    # operands eagerly), so `while j >= 0 and env_contact_ids[base+j] > key`
+    # would read env_contact_ids[base-1] when j reaches -1 — for env 0 (base=0)
+    # that is env_contact_ids[-1], an out-of-bounds read (intermittent CUDA
+    # illegal access, data-dependent on the bucket order). Structure it so the
+    # read only happens under j>=0. The result is otherwise identical.
     for i in range(1, n):
         key = env_contact_ids[base + i]
         j = i - 1
-        while j >= 0 and env_contact_ids[base + j] > key:
-            env_contact_ids[base + j + 1] = env_contact_ids[base + j]
-            j -= 1
+        shifting = int(1)
+        # Both `and` operands are scalars (no array read), so Warp's eager
+        # (non-short-circuit) BoolOp eval is safe here; the array read below only
+        # executes inside the loop body, where j>=0 is guaranteed.
+        while j >= 0 and shifting == 1:
+            prev = env_contact_ids[base + j]
+            if prev > key:
+                env_contact_ids[base + j + 1] = prev
+                j -= 1
+            else:
+                shifting = 0
         env_contact_ids[base + j + 1] = key
 
 
@@ -3807,7 +3822,7 @@ class MoreauIntegrator:
             record_tape=False,
         )
 
-    def _run_fk_foot_pos(self, model):
+    def _run_fk_foot_pos(self, model, sync=True):
         """Evaluate FK using self._fk_scratch_joint_q/_qd; return foot positions.
 
         The caller must write the desired joint configuration into
@@ -3816,6 +3831,12 @@ class MoreauIntegrator:
 
         Returns: torch.Tensor, shape ``(num_envs, 4, 3)`` on the model device.
                  Detached — does NOT participate in any autograd tape.
+
+        ``sync=False`` skips the full-device sync — safe ONLY when the caller has
+        put Warp on torch's stream (so the FK launches and the torch reductions
+        below are ordered on one stream); used by the batched FD-Jacobian loop to
+        pipeline its 2*max_perturb_dof FK evaluations instead of draining the
+        device after every one.
         """
         state = self._fk_scratch_state
         device = model.device
@@ -3868,7 +3889,8 @@ class MoreauIntegrator:
             device=device,
             record_tape=False,
         )
-        wp.synchronize_device()
+        if sync:
+            wp.synchronize_device()
         all_pts = wp.to_torch(state.point_vec).reshape(model.articulation_count, 8, 3)
         group_slots = getattr(model, "bundle_group_sphere_slots", [[0], [1], [2], [3]])
         group_centers = torch.stack(
@@ -3936,21 +3958,28 @@ class MoreauIntegrator:
         # J_fd_full[env, group*3+xyz, dof_i] for all groups and all perturbed DOFs
         J_fd_full = torch.zeros(num_envs, n_groups * 3, max_perturb_dof, dtype=torch.float32, device=torch_device)
 
-        for i in range(max_perturb_dof):
-            dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
+        # Run all 2*max_perturb_dof FK evaluations on torch's stream so the
+        # interleaved torch writes to fk_jq_t and the Warp FK launches are
+        # ordered on ONE stream. This lets us drop the per-call full-device sync
+        # (sync=False) and pipeline the whole loop instead of draining the
+        # device after every FK — the dominant host cost on G1. Bit-identical:
+        # same kernels, same reads, just no redundant syncs.
+        with wp.ScopedStream(wp.stream_from_torch()):
+            for i in range(max_perturb_dof):
+                dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
 
-            # Perturb DOF i for ALL triggered envs simultaneously, then run FK once.
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
-            # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
-            # the second FK call would overwrite fp_plus in-place without it.
-            fp_plus = self._run_fk_foot_pos(model).clone()  # (num_envs, n_groups, 3)
+                # Perturb DOF i for ALL triggered envs simultaneously, then run FK once.
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+                # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
+                # the second FK call would overwrite fp_plus in-place without it.
+                fp_plus = self._run_fk_foot_pos(model, sync=False).clone()  # (num_envs, n_groups, 3)
 
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-            fp_minus = self._run_fk_foot_pos(model)  # (num_envs, n_groups, 3)
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+                fp_minus = self._run_fk_foot_pos(model, sync=False)  # (num_envs, n_groups, 3)
 
-            fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
+                fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
 
-            J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
+                J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
 
         # Slice out only the active-group rows for each env.
         J_fd_dict = {}
@@ -3962,6 +3991,102 @@ class MoreauIntegrator:
             J_fd_dict[e] = J_fd_full[e][active_rows, :]  # (3*n_active_groups, max_perturb_dof)
 
         return J_fd_dict
+
+    def _init_branches_jacobian_batched(
+        self, valid_triggered, active_groups, J_fd_dict,
+        delta_q_torch, delta_qd_torch,
+        num_bundle_samples, num_envs, torch_device,
+        bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+        root_qd_dim, leg_dof_count, max_perturb_dof,
+        per_group_solve, group_dof_start, group_dof_end, damping,
+    ):
+        """Vectorized replacement for the jacobian-mode per-env perturbation loop.
+
+        Requires every env in ``valid_triggered`` to share the SAME
+        ``active_groups`` set (checked by the caller). Produces results
+        BIT-IDENTICAL to the per-env loop: same damped-pseudoinverse math, same
+        clamps, AND the perturbation noise is drawn from ``self._bundle_rng`` in
+        the EXACT same per-(env[,group]) chunk pattern the scalar loop uses.
+
+        The chunking matters: ``torch.randn`` does NOT consume the generator the
+        same way for one big tensor vs many small draws (its normal-sampling
+        consumes the stream by tensor, not by element), so a single big
+        ``randn(n, ...)`` would yield a DIFFERENT noise realization than the
+        per-env loop's many ``randn(3, S)`` / ``randn(task_dim, S)`` calls — which
+        not only breaks bit-exactness but, on G1, lands the inner contact solve
+        in a configuration it can't handle (CUDA illegal access). So we replicate
+        the per-env draw pattern exactly (cheap CPU draws, no GPU sync) and batch
+        only the linear-algebra (the part that was launch/sync-bound).
+        """
+        S = num_bundle_samples
+        n = len(valid_triggered)
+        e_t = torch.tensor(valid_triggered, device=torch_device, dtype=torch.long)
+        # Bundle layout is samples-major: slot = s * num_envs + e. Build the
+        # (n*S,) scatter index in env-major, sample-minor order to match the
+        # per-env loop's `bundle_indices = arange(S)*num_envs + e` writes.
+        idx = (
+            torch.arange(S, device=torch_device)[None, :] * num_envs + e_t[:, None]
+        ).reshape(-1)
+        # Stack each env's FD Jacobian (rows ordered by active_groups already).
+        J_all = torch.stack([J_fd_dict[e] for e in valid_triggered], dim=0)
+
+        if per_group_solve:
+            n_ag = len(active_groups)
+            # Replicate the scalar draw order EXACTLY: per env, per group,
+            # randn(3,S) for dx then randn(3,S) for dv.
+            dxs, dvs = [], []
+            for _ in range(n):
+                for _g in range(n_ag):
+                    dxs.append(torch.randn(3, S, generator=self._bundle_rng))
+                    dvs.append(torch.randn(3, S, generator=self._bundle_rng))
+            dx_all = torch.stack(dxs).view(n, n_ag, 3, S)  # [env, group, 3, S]
+            dv_all = torch.stack(dvs).view(n, n_ag, 3, S)
+            for gi, g in enumerate(active_groups):
+                ds, de = group_dof_start[g], group_dof_end[g]
+                J_g = J_all[:, gi * 3:(gi + 1) * 3, ds:de]              # (n, 3, n_dof_g)
+                JJt_g = (
+                    J_g @ J_g.transpose(1, 2)
+                    + damping * torch.eye(3, device=torch_device, dtype=J_g.dtype)
+                )
+                dx = (dx_all[:, gi] * bundle_sigma_pos).to(device=torch_device, dtype=J_g.dtype)
+                dv = (dv_all[:, gi] * bundle_sigma_vel).to(device=torch_device, dtype=J_g.dtype)
+                alpha_q = torch.linalg.solve(JJt_g, dx)                 # (n, 3, S)
+                alpha_qd = torch.linalg.solve(JJt_g, dv)
+                dq = (J_g.transpose(1, 2) @ alpha_q).clamp(*dq_clamp)   # (n, n_dof_g, S)
+                dqd = (J_g.transpose(1, 2) @ alpha_qd).clamp(*dqd_clamp)
+                w = de - ds
+                delta_q_torch[idx, ds:de] = dq.permute(0, 2, 1).reshape(n * S, w)
+                delta_qd_torch[idx, ds:de] = dqd.permute(0, 2, 1).reshape(n * S, w)
+                if getattr(self, "_bundle_track_dq_range", False):
+                    _m = dq.abs().max().item()
+                    self._bundle_dq_range_max[(ds, de)] = max(
+                        self._bundle_dq_range_max.get((ds, de), 0.0), _m
+                    )
+        else:
+            task_dim = 3 * len(active_groups)
+            JJt = (
+                J_all @ J_all.transpose(1, 2)
+                + damping * torch.eye(task_dim, device=torch_device, dtype=J_all.dtype)
+            )                                                          # (n, task_dim, task_dim)
+            # Replicate the scalar draw order EXACTLY: per env, randn(task_dim,S)
+            # for dx then randn(task_dim,S) for dv.
+            dxs, dvs = [], []
+            for _ in range(n):
+                dxs.append(torch.randn(task_dim, S, generator=self._bundle_rng))
+                dvs.append(torch.randn(task_dim, S, generator=self._bundle_rng))
+            dx = (torch.stack(dxs) * bundle_sigma_pos).to(device=torch_device, dtype=J_all.dtype)
+            dv = (torch.stack(dvs) * bundle_sigma_vel).to(device=torch_device, dtype=J_all.dtype)
+            alpha_q = torch.linalg.solve(JJt, dx)                      # (n, task_dim, S)
+            alpha_qd = torch.linalg.solve(JJt, dv)
+            dq = (J_all.transpose(1, 2) @ alpha_q).clamp(*dq_clamp)    # (n, max_perturb_dof, S)
+            dqd = (J_all.transpose(1, 2) @ alpha_qd).clamp(*dqd_clamp)
+            delta_q_torch[idx, :max_perturb_dof] = dq.permute(0, 2, 1).reshape(n * S, max_perturb_dof)
+            delta_qd_torch[idx, :max_perturb_dof] = dqd.permute(0, 2, 1).reshape(n * S, max_perturb_dof)
+            if getattr(self, "_bundle_track_dq_range", False):
+                _m = dq.abs().max().item()
+                self._bundle_dq_range_max[(0, max_perturb_dof)] = max(
+                    self._bundle_dq_range_max.get((0, max_perturb_dof), 0.0), _m
+                )
 
     def _init_bundle_branches(
         self,
@@ -4092,7 +4217,33 @@ class MoreauIntegrator:
                         )
                         # fk_jq is fully restored to main_jq_snap inside the helper.
 
-                for e in triggered_list:
+                # ------------------------------------------------------------------
+                # Batched jacobian-mode fast path. Eliminates the per-env Python
+                # loop (per-env linalg.solve / H2D / scatter launches) when every
+                # triggered env shares the same active-group set — which is the
+                # case in soft inner mode (col_height keeps all groups "in
+                # contact"). Used for BOTH combined-solve (ANYmal) and per-group
+                # (G1): the helper replicates the per-env loop's exact RNG chunk
+                # pattern, so it is bit-identical to the scalar path (the G1
+                # illegal-access this used to trip was a separate
+                # sort_env_contact_bins OOB, now fixed). Falls back to the per-env
+                # loop for non-jacobian modes or non-uniform active groups.
+                # ------------------------------------------------------------------
+                batched_done = False
+                if perturbation_mode == "jacobian" and valid_triggered:
+                    ag0 = active_groups_per_env[valid_triggered[0]]
+                    if all(active_groups_per_env[e] == ag0 for e in valid_triggered):
+                        self._init_branches_jacobian_batched(
+                            valid_triggered, ag0, J_fd_dict,
+                            delta_q_torch, delta_qd_torch,
+                            num_bundle_samples, num_envs, torch_device,
+                            bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+                            root_qd_dim, leg_dof_count, max_perturb_dof,
+                            per_group_solve, group_dof_start, group_dof_end, damping,
+                        )
+                        batched_done = True
+
+                for e in (triggered_list if not batched_done else ()):
                     active_groups = active_groups_per_env.get(e)
                     if active_groups is None:
                         continue
@@ -4203,9 +4354,13 @@ class MoreauIntegrator:
 
                                 delta_q_torch[bundle_indices, ds:de]  = dq_g_all.T
                                 delta_qd_torch[bundle_indices, ds:de] = dqd_g_all.T
-                                _slot_max = dq_g_all.abs().max().item()
-                                _prev_max = self._bundle_dq_range_max.get((ds, de), 0.0)
-                                self._bundle_dq_range_max[(ds, de)] = max(_prev_max, _slot_max)
+                                # Debug dq-range stat: opt-in only (the .item() is
+                                # a per-env D2H sync). Enable via
+                                # self._bundle_track_dq_range = True.
+                                if getattr(self, "_bundle_track_dq_range", False):
+                                    _slot_max = dq_g_all.abs().max().item()
+                                    _prev_max = self._bundle_dq_range_max.get((ds, de), 0.0)
+                                    self._bundle_dq_range_max[(ds, de)] = max(_prev_max, _slot_max)
 
                     else:
                         # ---- Combined solve (ANYmal): stack all active groups, one solve ----
@@ -4265,14 +4420,24 @@ class MoreauIntegrator:
 
                             delta_q_torch[bundle_indices, :max_perturb_dof]  = delta_q_all.T
                             delta_qd_torch[bundle_indices, :max_perturb_dof] = delta_qd_all.T
-                            _slot_max = delta_q_all.abs().max().item()
-                            _prev_max = self._bundle_dq_range_max.get((0, max_perturb_dof), 0.0)
-                            self._bundle_dq_range_max[(0, max_perturb_dof)] = max(_prev_max, _slot_max)
+                            # Debug dq-range stat: opt-in only (the .item() is a
+                            # per-env D2H sync). Enable via
+                            # self._bundle_track_dq_range = True.
+                            if getattr(self, "_bundle_track_dq_range", False):
+                                _slot_max = delta_q_all.abs().max().item()
+                                _prev_max = self._bundle_dq_range_max.get((0, max_perturb_dof), 0.0)
+                                self._bundle_dq_range_max[(0, max_perturb_dof)] = max(_prev_max, _slot_max)
 
         # Launch warp kernel to copy main state into bundle slots and add the deltas.
         # Env-major launch (dim=num_envs, samples looped inside the kernel) so the
         # adjoint accumulation into state_in.grad is single-threaded per env and
         # therefore bitwise-deterministic (see kernel docstring).
+            # The delta buffers were just written by torch (on torch's stream);
+            # this kernel runs on Warp's own stream and reads them, so order the
+            # two with one sync. (Previously the per-env debug .item() provided
+            # this implicitly; that sync is now opt-in, so make it explicit —
+            # ONE sync per trigger-substep, vs the O(num_envs*samples) removed.)
+            wp.synchronize_device()
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
                 dim=num_envs,
@@ -4366,29 +4531,48 @@ class MoreauIntegrator:
             trigger_t = wp.to_torch(bundle_trigger)
             branch_mask_t = wp.to_torch(branch_contact_mask)
             feet_mask_t = wp.to_torch(contact_feet_mask)
+
+            # Vectorized new-contact detection. Replaces an
+            # O(num_envs * num_bundle_samples) per-element .item() host loop
+            # (each .item() forces a D2H sync). The bundle layout is
+            # samples-major (slot = s*num_envs + e), so reshape to
+            # (samples, num_envs) and bitwise-OR across the sample axis to get
+            # each env's union contact mask, then compare against the previous
+            # contact mask exactly as the scalar loop did. Result is identical;
+            # only ONE D2H sync remains (the .cpu() below), and in soft inner
+            # mode (no new contacts) this returns immediately.
+            union_mask_t = torch.zeros(
+                num_envs, dtype=branch_mask_t.dtype, device=branch_mask_t.device
+            )
+            bm = branch_mask_t.view(num_bundle_samples, num_envs)
+            for s in range(num_bundle_samples):
+                union_mask_t = torch.bitwise_or(union_mask_t, bm[s])
+            newly_t = torch.bitwise_and(union_mask_t, torch.bitwise_not(feet_mask_t))
+            newly_t = torch.where(
+                trigger_t != 0, newly_t, torch.zeros_like(newly_t)
+            )
+            newly_cpu = newly_t.cpu()  # single D2H sync
+            envs_with_new = torch.nonzero(newly_cpu, as_tuple=False).flatten().tolist()
+            if not envs_with_new:
+                return
+
+            # Fold the new contacts into contact_feet_mask so they are not
+            # re-detected next substep (same write as the scalar loop's
+            # feet_mask_t[e] = prev | newly, applied in one vectorized op).
+            feet_mask_t.copy_(torch.bitwise_or(feet_mask_t, newly_t))
+            newly_list = newly_cpu.tolist()
+
             Jc_flat = wp.to_torch(bundle_model.Jc)
             Jc_start = wp.to_torch(bundle_model.articulation_Jc_start)
 
-            for e in range(num_envs):
-                if int(trigger_t[e].item()) == 0:
-                    continue
-
-                # Union contact mask across this env's samples
-                # Bundle model uses samples-major layout: slot = s * num_envs + e
-                union_mask = 0
-                for s in range(num_bundle_samples):
-                    bundle_idx = s * num_envs + e
-                    union_mask |= int(branch_mask_t[bundle_idx].item())
-
-                prev_mask = int(feet_mask_t[e].item())
-                newly_contacting = union_mask & ~prev_mask
-                if newly_contacting == 0:
-                    continue
-
-                feet_mask_t[e] = prev_mask | newly_contacting
+            # Only the (rare) envs that actually gained a contact need the
+            # per-sample Jacobian solve. Iterating ascending env ids preserves
+            # the exact RNG draw order of the original for-e-in-range loop.
+            for e in envs_with_new:
                 apply_mask_host[e] = 1
                 any_new = True
 
+                newly_contacting = int(newly_list[e])
                 new_groups = [g for g in range(n_groups) if newly_contacting & (1 << g)]
 
                 # Per-sample Jacobian: each sample has its own Jc in bundle_model.Jc.
