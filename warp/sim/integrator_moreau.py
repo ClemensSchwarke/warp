@@ -210,6 +210,8 @@ def jcalc_tau(
     joint_static_friction: float,
     joint_dynamic_friction: float,
     max_torque: float,
+    peak_torque: float,
+    velocity_limit: float,
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
@@ -235,9 +237,8 @@ def jcalc_tau(
         t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
         t_2 += 0.0 - joint_dynamic_friction * qd
 
-        # velocity-based torque limit
-        peak_torque = 120.0  # TODO: transfer this into config file
-        velocity_limit = 7.5  # TODO: transfer this into config file
+        # velocity-based torque limit (peak_torque / velocity_limit are
+        # env-specific and threaded in from cfg.env.* via the integrator call)
         max_torque_limit = wp.clamp(peak_torque * (1.0 - qd / velocity_limit), 0.0, max_torque)
         min_torque_limit = wp.clamp(peak_torque * (-1.0 - qd / velocity_limit), -max_torque, 0.0)
 
@@ -493,6 +494,8 @@ def compute_link_tau(
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
     max_torque: float,
+    peak_torque: float,
+    velocity_limit: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -537,6 +540,8 @@ def compute_link_tau(
         static_friction,
         dynamic_friction,
         max_torque,
+        peak_torque,
+        velocity_limit,
         joint_S_s,
         joint_q,
         joint_qd,
@@ -666,6 +671,8 @@ def eval_rigid_tau(
     joint_limit_ke: wp.array(dtype=float),
     joint_limit_kd: wp.array(dtype=float),
     max_torque: float,
+    peak_torque: float,
+    velocity_limit: float,
     joint_axis: wp.array(dtype=wp.vec3),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
@@ -698,6 +705,8 @@ def eval_rigid_tau(
             joint_static_friction,
             joint_dynamic_friction,
             max_torque,
+            peak_torque,
+            velocity_limit,
             joint_limit_lower,
             joint_limit_upper,
             joint_limit_ke,
@@ -4675,6 +4684,8 @@ class MoreauIntegrator:
         update_mass_matrix,
         prox_iter,
         max_torque,
+        peak_torque,
+        velocity_limit,
         mode,
         # Bundle mode parameters
         substep,
@@ -4697,6 +4708,7 @@ class MoreauIntegrator:
             return self._simulate_bundle(
                 model, state_in, state_out_pred, state_mid, state_out, dt,
                 requires_grad, update_mass_matrix, prox_iter, max_torque,
+                peak_torque, velocity_limit,
                 substep, num_substeps, bundle_model,
                 num_bundle_samples, bundle_horizon_substeps,
                 bundle_sigma_pos, bundle_sigma_vel,
@@ -4814,6 +4826,8 @@ class MoreauIntegrator:
                 model.joint_limit_ke,
                 model.joint_limit_kd,
                 max_torque,
+                peak_torque,
+                velocity_limit,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -4852,6 +4866,8 @@ class MoreauIntegrator:
                 model.joint_limit_ke,
                 model.joint_limit_kd,
                 max_torque,
+                peak_torque,
+                velocity_limit,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5004,6 +5020,8 @@ class MoreauIntegrator:
         update_mass_matrix,
         prox_iter,
         max_torque,
+        peak_torque,
+        velocity_limit,
         substep,
         num_substeps,
         bundle_model,
@@ -5174,6 +5192,8 @@ class MoreauIntegrator:
                 model.joint_limit_ke,
                 model.joint_limit_kd,
                 max_torque,
+                peak_torque,
+                velocity_limit,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5211,6 +5231,8 @@ class MoreauIntegrator:
                 model.joint_limit_ke,
                 model.joint_limit_kd,
                 max_torque,
+                peak_torque,
+                velocity_limit,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5488,6 +5510,7 @@ class MoreauIntegrator:
             self.simulate(
                 bundle_model, b_in, b_out_pred, b_mid, chain_out,
                 dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
+                peak_torque, velocity_limit,
                 mode=inner_mode,
                 substep=0, num_substeps=1,
             )

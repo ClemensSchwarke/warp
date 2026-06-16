@@ -6061,7 +6061,7 @@ class MoreauRoughIntegrator(Integrator):
 
     def _simulate_bundle(
         self, model, state_in, state_mid, state_out, dt,
-        requires_grad, prox_iter, max_torque, mu,
+        requires_grad, prox_iter, max_torque, peak_torque, velocity_limit, mu,
         substep, num_substeps, bundle_model,
         num_bundle_samples, bundle_horizon_substeps,
         bundle_sigma_pos, bundle_sigma_vel, bundle_inner_mode,
@@ -6123,6 +6123,7 @@ class MoreauRoughIntegrator(Integrator):
         self.simulate(
             model, state_in, state_mid, state_out_pred, dt,
             mode=inner_mode, control=None, max_torque=max_torque,
+            peak_torque=peak_torque, velocity_limit=velocity_limit,
             prox_iter=prox_iter, mu=mu,
         )
 
@@ -6293,6 +6294,7 @@ class MoreauRoughIntegrator(Integrator):
             self._bundle_integrator.simulate(
                 bundle_model, b_in, b_mid, chain_out, dt,
                 mode=inner_mode, control=None, max_torque=max_torque,
+                peak_torque=peak_torque, velocity_limit=velocity_limit,
                 prox_iter=prox_iter, mu=mu,
             )
 
@@ -6552,7 +6554,7 @@ class MoreauRoughIntegrator(Integrator):
         self._step += 1
         return state_out
 
-    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, prox_iter: int = 20, mu: float = 0.8, zero_sparse_buffers: bool = False,
+    def simulate(self, model: Model, state_in: State, state_mid: State, state_out: State, dt: float, mode = "soft", control = None, max_torque: float = 20.0, peak_torque: float = 120.0, velocity_limit: float = 7.5, prox_iter: int = 20, mu: float = 0.8, zero_sparse_buffers: bool = False,
                  # Bundle-mode parameters (keyword-only, defaulted so existing
                  # positional/keyword callers are unaffected). Active only when
                  # mode == "bundle"; see _simulate_bundle.
@@ -6575,7 +6577,7 @@ class MoreauRoughIntegrator(Integrator):
         if mode == "bundle":
             return self._simulate_bundle(
                 model, state_in, state_mid, state_out, dt,
-                requires_grad, prox_iter, max_torque, mu,
+                requires_grad, prox_iter, max_torque, peak_torque, velocity_limit, mu,
                 substep, num_substeps, bundle_model,
                 num_bundle_samples, bundle_horizon_substeps,
                 bundle_sigma_pos, bundle_sigma_vel, bundle_inner_mode,
@@ -6797,6 +6799,8 @@ class MoreauRoughIntegrator(Integrator):
                             model.joint_limit_ke,
                             model.joint_limit_kd,
                             max_torque,
+                            peak_torque,
+                            velocity_limit,
                             model.joint_axis,
                             state_mid.joint_S_s,
                             state_mid.body_f_s,
@@ -6847,6 +6851,8 @@ class MoreauRoughIntegrator(Integrator):
                             model.joint_limit_ke,
                             model.joint_limit_kd,
                             max_torque,
+                            peak_torque,
+                            velocity_limit,
                             model.joint_axis,
                             state_mid.joint_S_s,
                             state_mid.body_f_s,
