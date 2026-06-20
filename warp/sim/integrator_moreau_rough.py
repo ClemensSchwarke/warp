@@ -4917,6 +4917,56 @@ class MoreauRoughIntegrator(Integrator):
             self.c_body_vec, self.rigid_contact_body0, self.rigid_contact_body1,
         ) = buffers
 
+    # ---- Per-substep bundle scratch POOL (mirrors MoreauIntegrator) ----------
+    # Reuse pooled bundle State / matrix-buffer sets across step()s instead of
+    # fresh-allocating every substep (the dominant bundle alloc cost). Safe only
+    # under checkpointing (WpInterface sets self._bundle_buffer_pool) AND soft
+    # inner mode (every read field is fully rewritten each substep). Reused slots
+    # are value-zeroed; .grad is handled by tape.reset() in _reset_tape_state.
+
+    def _bundle_pool_enabled(self, bundle_inner_mode):
+        return (
+            getattr(self, "_bundle_buffer_pool", False)
+            and (bundle_inner_mode or "soft") == "soft"
+        )
+
+    @staticmethod
+    def _zero_state_arrays(state):
+        for val in vars(state).values():
+            if isinstance(val, wp.array) and val.ptr is not None:
+                val.zero_()
+
+    def _pooled_state(self, src_model, key, substep, requires_grad, lite):
+        """Per-(key, substep) State pooled across step()s; ``src_model`` is the
+        MAIN model (state_out_pred) or bundle_model (init/b_in/b_mid)."""
+        if not self._pool_active:
+            return src_model.state(requires_grad=requires_grad, lite=lite)
+        pool = self._bundle_state_pools.setdefault(key, [])
+        if len(pool) <= substep:
+            while len(pool) <= substep:
+                pool.append(src_model.state(requires_grad=requires_grad, lite=lite))
+            return pool[substep]
+        st = pool[substep]
+        self._zero_state_arrays(st)
+        return st
+
+    def _pooled_matrix_buffers(self, bundle_model, substep, requires_grad):
+        """Pooled per-substep rough matrix-buffer set (replaces a fresh
+        alloc_matrix_buffers on the bundle integrator)."""
+        if not self._pool_active:
+            return self._bundle_integrator.alloc_matrix_buffers(bundle_model, requires_grad)
+        pool = self._bundle_matbuf_pool
+        if len(pool) <= substep:
+            while len(pool) <= substep:
+                pool.append(
+                    self._bundle_integrator.alloc_matrix_buffers(bundle_model, requires_grad)
+                )
+            return pool[substep]
+        for arr in pool[substep]:
+            if isinstance(arr, wp.array) and arr.ptr is not None:
+                arr.zero_()
+        return pool[substep]
+
     def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps, requires_grad=False):
         """Allocate persistent bundle bookkeeping (owned by the MAIN integrator).
 
@@ -4987,6 +5037,11 @@ class MoreauRoughIntegrator(Integrator):
         self._bundle_num_samples = num_bundle_samples
         self._bundle_horizon_substeps = bundle_horizon_substeps
 
+        # Per-substep bundle scratch pools (see _pooled_state / _pooled_matrix_buffers).
+        # Cleared here so an env/sample-count change drops stale-sized buffers.
+        self._bundle_state_pools = {}
+        self._bundle_matbuf_pool = []
+
         # FK scratch (MAIN model) for the perturbation Jacobian. Needs both the
         # default body transforms (from model.state) and the rough contact
         # buffers (point_vec/foot_vel from allocate_state_aux_vars).
@@ -5039,7 +5094,7 @@ class MoreauRoughIntegrator(Integrator):
             record_tape=False,
         )
 
-    def _run_fk_foot_pos(self, model, sync=True):
+    def _run_fk_foot_pos(self, model, sync=True, skip_contact_bins=False):
         """Evaluate FK at ``self._fk_scratch_joint_q`` and return group-center foot
         positions, shape ``(num_envs, n_groups, 3)``, detached (no tape).
 
@@ -5051,6 +5106,9 @@ class MoreauRoughIntegrator(Integrator):
         ``sync=False`` skips the full-device sync — safe ONLY when the caller has
         put Warp on torch's stream (FD-Jacobian loop), so the FK launches and the
         torch reductions below stay ordered on one stream.
+
+        ``skip_contact_bins=True`` skips the config-independent contact-bin rebuild
+        (built once before the FD loop) — halves the FD launches, bit-exact.
         """
         state = self._fk_scratch_state
         device = model.device
@@ -5072,7 +5130,8 @@ class MoreauRoughIntegrator(Integrator):
             device=device,
             record_tape=False,
         )
-        self._ensure_contact_bins(model)
+        if not skip_contact_bins:
+            self._ensure_contact_bins(model)
         wp.launch(
             kernel=get_foot_states_rough,
             dim=model.articulation_count,
@@ -5131,13 +5190,15 @@ class MoreauRoughIntegrator(Integrator):
         # this lets us drop the per-call full-device sync (sync=False) and
         # pipeline the loop instead of draining the device after every FK.
         # Bit-identical (same kernels/reads, fewer syncs).
+        # Contact bins are config-independent -> build once, skip in the loop.
+        self._ensure_contact_bins(model)
         with wp.ScopedStream(wp.stream_from_torch()):
             for i in range(max_perturb_dof):
                 dof_indices = dof_base + i
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
-                fp_plus = self._run_fk_foot_pos(model, sync=False).clone()
+                fp_plus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True).clone()
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-                fp_minus = self._run_fk_foot_pos(model, sync=False)
+                fp_minus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True)
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices]
                 J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
 
@@ -6084,6 +6145,9 @@ class MoreauRoughIntegrator(Integrator):
         """
         device = model.device
         inner_mode = bundle_inner_mode or "soft"
+        # Gated on requires_grad so a non-grad (eval) call never primes the pool
+        # with grad-less buffers a later training call would reuse.
+        self._pool_active = self._bundle_pool_enabled(inner_mode) and requires_grad
         num_envs = model.articulation_count
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
@@ -6119,7 +6183,10 @@ class MoreauRoughIntegrator(Integrator):
         # ============================================================
         # Phase A: NORMAL CANDIDATE -> internal state_out_pred.
         # ============================================================
-        state_out_pred = model.state(requires_grad=requires_grad)
+        # state_out role: holds only the integrated joint/foot state read by
+        # the merge for NORMAL envs; no contact-solve scratch needed -> lite.
+        # Pooled across step()s under checkpointing+soft.
+        state_out_pred = self._pooled_state(model, "pred", substep, requires_grad, lite=True)
         self.simulate(
             model, state_in, state_mid, state_out_pred, dt,
             mode=inner_mode, control=None, max_torque=max_torque,
@@ -6184,7 +6251,8 @@ class MoreauRoughIntegrator(Integrator):
         chain = self._bundle_state_chain
         chain_in = chain[substep]
         chain_out = chain[substep + 1]
-        init_state = bundle_model.state(requires_grad=requires_grad)
+        # init_state holds only perturbed joint_q/qd for triggered envs -> lite.
+        init_state = self._pooled_state(bundle_model, "init", substep, requires_grad, lite=True)
 
         # Reuse the host sync below to also accumulate a contact-trigger
         # diagnostic (how many envs opened a bundle window). Off-tape, no extra
@@ -6258,7 +6326,8 @@ class MoreauRoughIntegrator(Integrator):
 
         any_active = bool(wp.to_torch(bundle_active).any().item())
         if any_active:
-            b_in = bundle_model.state(requires_grad=requires_grad)
+            # b_in is the inner state_in (joint_q/qd only) -> lite.
+            b_in = self._pooled_state(bundle_model, "bin", substep, requires_grad, lite=True)
             # Env-major launch — keeps the adjoint accumulation into
             # state_in.grad single-threaded per env (deterministic).
             wp.launch(
@@ -6277,7 +6346,8 @@ class MoreauRoughIntegrator(Integrator):
                 record_tape=requires_grad,
             )
 
-            b_mid = bundle_model.state(requires_grad=requires_grad)
+            # b_mid is the inner state_mid; pooled (full, value-zeroed on reuse).
+            b_mid = self._pooled_state(bundle_model, "bmid", substep, requires_grad, lite=False)
 
             # Refresh bundle-model contacts at the b_in config by colliding the
             # MAIN model at each sample's config and replicating into the bundle
@@ -6286,9 +6356,10 @@ class MoreauRoughIntegrator(Integrator):
             # restore it at state_in before the foot-state tail below.
             self._refresh_bundle_contacts(model, bundle_model, b_in, num_bundle_samples)
 
-            # Fresh matrix buffers for the bundle integrator (tape lifetime).
+            # Per-substep matrix buffers for the bundle integrator (tape lifetime),
+            # pooled across step()s under checkpointing+soft.
             self._bundle_integrator.set_matrix_buffers(
-                self._bundle_integrator.alloc_matrix_buffers(bundle_model, requires_grad)
+                self._pooled_matrix_buffers(bundle_model, substep, requires_grad)
             )
 
             self._bundle_integrator.simulate(

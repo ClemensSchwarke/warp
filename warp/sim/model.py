@@ -637,11 +637,23 @@ class Model:
 
         self.device = wp.get_device(device)
 
-    def state(self, requires_grad=None) -> State:
+    def state(self, requires_grad=None, lite=False) -> State:
         """Returns a state object for the model
 
         The returned state will be initialized with the initial configuration given in
         the model description.
+
+        When ``lite=True`` the contact-solve scratch arrays (the per-contact
+        ``Jc_<i>`` / ``Inv_M_times_Jc_t_<i>`` / ``tmp_<i>`` blocks and the
+        ``Jc`` / ``G`` / ``G_mat`` / ``inv_m_times_h`` / ``c`` / ``c_vec`` /
+        ``Jc_qd`` / ``Jc_times_inv_m_times_h`` / ``tmp_inv_m_times_h`` /
+        ``Inv_M_times_Jc_t`` matrices) are NOT allocated. Those are only ever
+        written/read on the ``state_mid`` role of the Moreau pipeline, so the
+        ``state_in`` / ``state_out`` / ``state_out_pred`` roles (e.g. the bundle
+        init/chain/pred states) do not need them. Skipping the ~85 unused
+        arrays cuts the dominant per-substep bundle allocation cost. Any kernel
+        that does reference a skipped field on a lite state will raise loudly
+        (AttributeError) at launch — there is no silent-value risk.
         """
 
         s = State()
@@ -706,28 +718,29 @@ class Model:
             s.percussion = wp.zeros((self.articulation_count, 8), dtype=wp.vec3, requires_grad=requires_grad)
             s.foot_vel = wp.zeros(self.articulation_count * 8, dtype=wp.vec3, requires_grad=requires_grad)
 
-            # compute G and c
-            s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=requires_grad)
-            s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
-            s.Jc_qd = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
-            s.c = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
-            s.c_vec = wp.zeros((self.articulation_count, 8), dtype=wp.vec3, requires_grad=requires_grad)
-            s.tmp_inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=requires_grad)
+            if not lite:
+                # compute G and c — contact-solve scratch, only used on state_mid.
+                s.inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=requires_grad)
+                s.Jc_times_inv_m_times_h = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
+                s.Jc_qd = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
+                s.c = wp.zeros(self.articulation_count * 8 * 3, requires_grad=requires_grad)
+                s.c_vec = wp.zeros((self.articulation_count, 8), dtype=wp.vec3, requires_grad=requires_grad)
+                s.tmp_inv_m_times_h = wp.zeros_like(self.joint_qd, requires_grad=requires_grad)
 
-            for _i in range(1, 25):
-                setattr(s, f"Jc_{_i}", wp.zeros_like(self.joint_qd, requires_grad=requires_grad))
-                setattr(
-                    s,
-                    f"Inv_M_times_Jc_t_{_i}",
-                    wp.zeros_like(self.joint_qd, requires_grad=requires_grad),
-                )
-                setattr(s, f"tmp_{_i}", wp.zeros_like(self.joint_qd, requires_grad=requires_grad))
+                for _i in range(1, 25):
+                    setattr(s, f"Jc_{_i}", wp.zeros_like(self.joint_qd, requires_grad=requires_grad))
+                    setattr(
+                        s,
+                        f"Inv_M_times_Jc_t_{_i}",
+                        wp.zeros_like(self.joint_qd, requires_grad=requires_grad),
+                    )
+                    setattr(s, f"tmp_{_i}", wp.zeros_like(self.joint_qd, requires_grad=requires_grad))
 
-            s.Inv_M_times_Jc_t = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=requires_grad)
+                s.Inv_M_times_Jc_t = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=requires_grad)
 
-            s.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=requires_grad)
-            s.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=requires_grad)
-            s.G_mat = wp.zeros((self.articulation_count, 8, 8), dtype=wp.mat33, requires_grad=requires_grad)
+                s.Jc = wp.zeros(self.Jc_size, dtype=wp.float32, requires_grad=requires_grad)
+                s.G = wp.zeros(self.G_size, dtype=wp.float32, requires_grad=requires_grad)
+                s.G_mat = wp.zeros((self.articulation_count, 8, 8), dtype=wp.mat33, requires_grad=requires_grad)
 
             s.toi = wp.zeros(self.articulation_count, dtype=wp.float32, requires_grad=requires_grad)
 

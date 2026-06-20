@@ -3766,6 +3766,17 @@ class MoreauIntegrator:
         self._bundle_num_samples = num_bundle_samples
         self._bundle_horizon_substeps = bundle_horizon_substeps
 
+        # Per-substep bundle scratch buffer POOL (see _pooled_state / _pooled_mm).
+        # Reused across step()s instead of fresh-allocating bundle_model.state()
+        # every substep — the dominant bundle cost. Safe only under checkpointing
+        # (one step's fwd+bwd completes before the next reuses the slot) AND soft
+        # inner mode (every contact slot is active, so the inner sim fully
+        # rewrites every read field each substep → no value staleness; .grad is
+        # zeroed by tape.reset() in _reset_tape_state). Cleared here so an
+        # env/sample-count change drops stale-sized buffers.
+        self._bundle_state_pools = {}
+        self._bundle_mm_pool = []
+
         # Scratch buffers for iterative-IK FK evaluation during bundle perturbation.
         # Sized to the MAIN model (not bundle_model) — FK is run on main-model kinematics.
         self._fk_scratch_state = model.state(requires_grad=False)
@@ -3773,6 +3784,59 @@ class MoreauIntegrator:
         self._fk_scratch_joint_qd = wp.zeros(model.joint_dof_count, dtype=float, device=device)
 
         self._bundle_initialized = True
+
+    def _bundle_pool_enabled(self, bundle_inner_mode):
+        """Pooling is only safe under checkpointing (set by WpInterface) AND
+        soft inner mode (full per-substep rewrite — no stale reads)."""
+        return (
+            getattr(self, "_bundle_buffer_pool", False)
+            and (bundle_inner_mode or "soft") == "soft"
+        )
+
+    @staticmethod
+    def _zero_state_arrays(state):
+        """Restore the fresh-allocation zero VALUE state of a reused State —
+        mirrors WpInterface._ckpt_zero_shared_substep_buffers. Sparse writers
+        (construct_contact_jacobian -> Jc_<i>, the prox kernels, ...) leave
+        never-written entries untouched, so a reused buffer must be zeroed to
+        match the fresh-alloc semantics. .grad is handled separately by
+        tape.reset() in _reset_tape_state."""
+        for val in vars(state).values():
+            if isinstance(val, wp.array) and val.ptr is not None:
+                val.zero_()
+
+    def _pooled_state(self, bundle_model, key, substep, requires_grad, lite):
+        """Return a per-(key, substep) bundle State, reused across step()s when
+        pooling is enabled, else a fresh allocation (original behavior). A reused
+        slot is value-zeroed first to reproduce fresh-alloc semantics."""
+        if not self._pool_active:
+            return bundle_model.state(requires_grad=requires_grad, lite=lite)
+        pool = self._bundle_state_pools.setdefault(key, [])
+        if len(pool) <= substep:
+            while len(pool) <= substep:
+                pool.append(bundle_model.state(requires_grad=requires_grad, lite=lite))
+            return pool[substep]  # freshly allocated -> already zero
+        st = pool[substep]
+        self._zero_state_arrays(st)
+        return st
+
+    def _pooled_alloc_mm(self, bundle_model, substep, requires_grad):
+        """Bind bundle_model's mass/contact matrices for this substep: a pooled
+        per-substep set (reused across step()s, value-zeroed) when pooling is
+        enabled, else a fresh alloc_mass_matrix (original behavior)."""
+        if not self._pool_active:
+            bundle_model.alloc_mass_matrix(requires_grad=requires_grad)
+            return
+        names = ("M", "J", "P", "H", "L", "Jc", "G", "G_mat")
+        pool = self._bundle_mm_pool
+        if len(pool) <= substep:
+            while len(pool) <= substep:
+                bundle_model.alloc_mass_matrix(requires_grad=requires_grad)
+                pool.append({n: getattr(bundle_model, n) for n in names})
+            return  # freshly allocated -> M/J/L/Jc/G/G_mat zeroed, P empty-scratch
+        for n, arr in pool[substep].items():
+            arr.zero_()
+            setattr(bundle_model, n, arr)
 
     def reset_bundle(self):
         """Clear all pending bundle bookkeeping (call at episode boundaries
@@ -3831,12 +3895,18 @@ class MoreauIntegrator:
             record_tape=False,
         )
 
-    def _run_fk_foot_pos(self, model, sync=True):
+    def _run_fk_foot_pos(self, model, sync=True, skip_contact_bins=False):
         """Evaluate FK using self._fk_scratch_joint_q/_qd; return foot positions.
 
         The caller must write the desired joint configuration into
         ``self._fk_scratch_joint_q`` (and optionally ``self._fk_scratch_joint_qd``)
         before calling.  After the call the values remain in the scratch arrays.
+
+        ``skip_contact_bins=True`` skips the ``_ensure_contact_bins`` rebuild.
+        The bins partition contacts by ``rigid_contact_body0`` — a purely
+        topological, joint-CONFIG-INDEPENDENT grouping — so inside the FD-Jacobian
+        loop (many FK calls at perturbed configs on the SAME model) they only need
+        building once. Bit-exact: identical bins every call.
 
         Returns: torch.Tensor, shape ``(num_envs, 4, 3)`` on the model device.
                  Detached — does NOT participate in any autograd tape.
@@ -3873,7 +3943,8 @@ class MoreauIntegrator:
             device=device,
             record_tape=False,
         )
-        self._ensure_contact_bins(model)
+        if not skip_contact_bins:
+            self._ensure_contact_bins(model)
         wp.launch(
             kernel=get_foot_states,
             dim=model.articulation_count,
@@ -3973,6 +4044,10 @@ class MoreauIntegrator:
         # (sync=False) and pipeline the whole loop instead of draining the
         # device after every FK — the dominant host cost on G1. Bit-identical:
         # same kernels, same reads, just no redundant syncs.
+        # The contact bins are joint-config-INDEPENDENT (they partition contacts
+        # by body), so build them ONCE here and skip the per-FK rebuild inside the
+        # loop — halves the FD-Jacobian kernel launches, bit-exact.
+        self._ensure_contact_bins(model)
         with wp.ScopedStream(wp.stream_from_torch()):
             for i in range(max_perturb_dof):
                 dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
@@ -3981,10 +4056,10 @@ class MoreauIntegrator:
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
                 # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
                 # the second FK call would overwrite fp_plus in-place without it.
-                fp_plus = self._run_fk_foot_pos(model, sync=False).clone()  # (num_envs, n_groups, 3)
+                fp_plus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True).clone()
 
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-                fp_minus = self._run_fk_foot_pos(model, sync=False)  # (num_envs, n_groups, 3)
+                fp_minus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True)
 
                 fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
 
@@ -4095,6 +4170,85 @@ class MoreauIntegrator:
                 _m = dq.abs().max().item()
                 self._bundle_dq_range_max[(0, max_perturb_dof)] = max(
                     self._bundle_dq_range_max.get((0, max_perturb_dof), 0.0), _m
+                )
+
+    def _init_branches_random_batched(
+        self, valid_triggered, active_groups,
+        delta_q_torch, delta_qd_torch,
+        num_bundle_samples, num_envs, torch_device,
+        bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+        leg_dof_count, per_group_solve, group_dof_start, group_dof_end,
+    ):
+        """Vectorized replacement for the joint_space-mode per-env perturbation
+        loop. No FK / no Jacobian / no solve — samples delta_q/delta_qd directly
+        in joint space.
+
+        BIT-IDENTICAL to the scalar joint_space loop: the noise is drawn from
+        ``self._bundle_rng`` in the EXACT same per-(env, sample[, group]) chunk
+        pattern (env-major, sample-minor, group-inner; randn(width) for dq then
+        randn(width) for dqd), so it consumes the generator the same way (torch
+        normal-sampling consumes the stream per-tensor — see
+        ``_init_branches_jacobian_batched``). Only the per-(env,sample[,group])
+        GPU scatter+H2D — the launch-bound part — is batched into one write.
+
+        Requires every env in ``valid_triggered`` to share the same
+        ``active_groups`` set (checked by the caller); the per-env loop handles
+        the non-uniform case.
+        """
+        S = num_bundle_samples
+        n = len(valid_triggered)
+        e_t = torch.tensor(valid_triggered, device=torch_device, dtype=torch.long)
+        # Bundle layout samples-major: slot = s*num_envs + e. Build (n*S,) scatter
+        # index env-major/sample-minor to match the scalar loop's per-env writes.
+        idx = (
+            torch.arange(S, device=torch_device)[None, :] * num_envs + e_t[:, None]
+        ).reshape(-1)
+
+        if per_group_solve:
+            # Scalar order: for e: for s: for g in active_groups:
+            #   randn(n_dof_g) dq ; randn(n_dof_g) dqd
+            per_g_dq = {g: [] for g in active_groups}
+            per_g_dqd = {g: [] for g in active_groups}
+            for _ in range(n):
+                for _s in range(S):
+                    for g in active_groups:
+                        n_dof_g = group_dof_end[g] - group_dof_start[g]
+                        per_g_dq[g].append(torch.randn(n_dof_g, generator=self._bundle_rng))
+                        per_g_dqd[g].append(torch.randn(n_dof_g, generator=self._bundle_rng))
+            for g in active_groups:
+                ds, de = group_dof_start[g], group_dof_end[g]
+                dq_g = (torch.stack(per_g_dq[g]) * bundle_sigma_pos).to(
+                    device=torch_device, dtype=torch.float32
+                ).clamp(*dq_clamp)
+                dqd_g = (torch.stack(per_g_dqd[g]) * bundle_sigma_vel).to(
+                    device=torch_device, dtype=torch.float32
+                ).clamp(*dqd_clamp)
+                delta_q_torch[idx, ds:de] = dq_g
+                delta_qd_torch[idx, ds:de] = dqd_g
+                if getattr(self, "_bundle_track_dq_range", False):
+                    self._bundle_dq_range_max[(ds, de)] = max(
+                        self._bundle_dq_range_max.get((ds, de), 0.0),
+                        dq_g.abs().max().item(),
+                    )
+        else:
+            # Scalar order: for e: for s: randn(leg_dof_count) dq ; randn(...) dqd
+            dqs, dqds = [], []
+            for _ in range(n):
+                for _s in range(S):
+                    dqs.append(torch.randn(leg_dof_count, generator=self._bundle_rng))
+                    dqds.append(torch.randn(leg_dof_count, generator=self._bundle_rng))
+            dq = (torch.stack(dqs) * bundle_sigma_pos).to(
+                device=torch_device, dtype=torch.float32
+            ).clamp(*dq_clamp)
+            dqd = (torch.stack(dqds) * bundle_sigma_vel).to(
+                device=torch_device, dtype=torch.float32
+            ).clamp(*dqd_clamp)
+            delta_q_torch[idx, :leg_dof_count] = dq
+            delta_qd_torch[idx, :leg_dof_count] = dqd
+            if getattr(self, "_bundle_track_dq_range", False):
+                self._bundle_dq_range_max[(0, leg_dof_count)] = max(
+                    self._bundle_dq_range_max.get((0, leg_dof_count), 0.0),
+                    dq.abs().max().item(),
                 )
 
     def _init_bundle_branches(
@@ -4239,7 +4393,12 @@ class MoreauIntegrator:
                 # loop for non-jacobian modes or non-uniform active groups.
                 # ------------------------------------------------------------------
                 batched_done = False
-                if perturbation_mode == "jacobian" and valid_triggered:
+                # Test hook: force the per-env scalar loop (for batched-vs-scalar
+                # equivalence probes). Default False — zero production effect.
+                _force_scalar = getattr(self, "_bundle_force_scalar_perturb", False)
+                if _force_scalar:
+                    pass
+                elif perturbation_mode == "jacobian" and valid_triggered:
                     ag0 = active_groups_per_env[valid_triggered[0]]
                     if all(active_groups_per_env[e] == ag0 for e in valid_triggered):
                         self._init_branches_jacobian_batched(
@@ -4249,6 +4408,17 @@ class MoreauIntegrator:
                             bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
                             root_qd_dim, leg_dof_count, max_perturb_dof,
                             per_group_solve, group_dof_start, group_dof_end, damping,
+                        )
+                        batched_done = True
+                elif perturbation_mode == "joint_space" and valid_triggered:
+                    ag0 = active_groups_per_env[valid_triggered[0]]
+                    if all(active_groups_per_env[e] == ag0 for e in valid_triggered):
+                        self._init_branches_random_batched(
+                            valid_triggered, ag0,
+                            delta_q_torch, delta_qd_torch,
+                            num_bundle_samples, num_envs, torch_device,
+                            bundle_sigma_pos, bundle_sigma_vel, dq_clamp, dqd_clamp,
+                            leg_dof_count, per_group_solve, group_dof_start, group_dof_end,
                         )
                         batched_done = True
 
@@ -5074,6 +5244,10 @@ class MoreauIntegrator:
 
         device = model.device
         inner_mode = bundle_inner_mode or "soft"
+        # Resolve once per substep: are we reusing pooled bundle scratch buffers?
+        # Gated on requires_grad so a non-grad (eval) call never allocates the
+        # pool with grad-less buffers that a later training call would reuse.
+        self._pool_active = self._bundle_pool_enabled(inner_mode) and requires_grad
         num_envs = model.articulation_count
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
@@ -5372,7 +5546,11 @@ class MoreauIntegrator:
         chain_in = chain[substep]
         chain_out = chain[substep + 1]
 
-        init_state = bundle_model.state(requires_grad=requires_grad)
+        # init_state only holds the perturbed joint_q/qd for triggered envs
+        # (written by _init_bundle_branches, read by merge_bundle_input_state),
+        # so it needs no contact-solve scratch -> lite. Pooled across step()s
+        # under checkpointing+soft (see _pooled_state).
+        init_state = self._pooled_state(bundle_model, "init", substep, requires_grad, lite=True)
 
         # Reuse the host sync below to also accumulate a contact-trigger
         # diagnostic (how many envs opened a bundle window). Off-tape, no extra
@@ -5475,7 +5653,9 @@ class MoreauIntegrator:
 
         any_active = bool(wp.to_torch(bundle_active).any().item())
         if any_active:
-            b_in = bundle_model.state(requires_grad=requires_grad)
+            # b_in is the inner-step state_in (joint_q/qd only read by the
+            # inner moreau pipeline; contact scratch is written on b_mid) -> lite.
+            b_in = self._pooled_state(bundle_model, "bin", substep, requires_grad, lite=True)
             # Env-major launch — keeps the adjoint accumulation into
             # state_in.grad single-threaded per env (deterministic).
             wp.launch(
@@ -5503,9 +5683,12 @@ class MoreauIntegrator:
                 record_tape=requires_grad,
             )
 
-            b_mid = bundle_model.state(requires_grad=requires_grad)
-            b_out_pred = bundle_model.state(requires_grad=requires_grad)
-            bundle_model.alloc_mass_matrix(requires_grad=requires_grad)
+            # b_mid is the inner-step state_mid — it carries the full
+            # contact-solve scratch (Jc_<i> etc.), so it must NOT be lite.
+            b_mid = self._pooled_state(bundle_model, "bmid", substep, requires_grad, lite=False)
+            # b_out_pred only receives the inner normal-candidate joint_q/qd -> lite.
+            b_out_pred = self._pooled_state(bundle_model, "bpred", substep, requires_grad, lite=True)
+            self._pooled_alloc_mm(bundle_model, substep, requires_grad)
 
             self.simulate(
                 bundle_model, b_in, b_out_pred, b_mid, chain_out,
