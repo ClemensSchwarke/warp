@@ -1139,6 +1139,7 @@ def construct_contact_jacobian(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
@@ -1158,13 +1159,21 @@ def construct_contact_jacobian(
     point_vec[tid * 8 + 7] = above_ground
 
     # Broadphase contact pairs are NOT laid out in contiguous per-env blocks
-    # (self-collision pairs interleave foot-ground pairs across envs).  Rather
-    # than have every articulation scan the full rigid_contact_max table
-    # (O(num_envs^2) total), bin_contacts_by_env precomputes a compact per-env
-    # list of the contact slots this articulation owns; iterate only those.
-    n_c = env_contact_count[tid]
-    if n_c > max_contacts_per_env:
-        n_c = max_contacts_per_env
+    # (self-collision pairs interleave foot-ground pairs across envs).
+    #   use_binning != 0 (default): bin_contacts_by_env precomputes a compact
+    #     per-env list of the contact slots this articulation owns; iterate only
+    #     those (O(num_envs^2) -> O(num_contacts)).
+    #   use_binning == 0: the pre-binning behavior -- scan the full
+    #     rigid_contact_max table and dispatch each record to its owning
+    #     articulation. The ownership filter below makes both paths process the
+    #     same owned contacts, so the binned path is bit-identical to the scan.
+    n_c = int(0)
+    if use_binning != 0:
+        n_c = env_contact_count[tid]
+        if n_c > max_contacts_per_env:
+            n_c = max_contacts_per_env
+    else:
+        n_c = rigid_contact_max
 
     # Track the deepest (minimum world-Y) below-ground contact per slot.
     best_y_0 = float(col_height)
@@ -1177,8 +1186,18 @@ def construct_contact_jacobian(
     best_y_7 = float(col_height)
 
     for k in range(n_c):
-        contact_id = env_contact_ids[tid * max_contacts_per_env + k]
+        contact_id = int(0)
+        if use_binning != 0:
+            contact_id = env_contact_ids[tid * max_contacts_per_env + k]
+        else:
+            contact_id = k
         c_body = contact_body[contact_id]
+        # Ownership filter: a no-op for the binned path (all bucket entries are
+        # owned and valid), required for the full-table scan path.
+        if c_body < 0:
+            continue
+        if c_body / bodies_per_env != tid:
+            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
@@ -2581,6 +2600,7 @@ def get_foot_states(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
@@ -2622,15 +2642,29 @@ def get_foot_states(
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
 
-    # See construct_contact_jacobian: iterate only this env's compact contact
-    # bucket (precomputed by bin_contacts_by_env) instead of scanning the full
-    # rigid_contact_max table per articulation (which was O(num_envs^2)).
-    n_c = env_contact_count[tid]
-    if n_c > max_contacts_per_env:
-        n_c = max_contacts_per_env
+    # See construct_contact_jacobian: use_binning != 0 iterates only this env's
+    # compact contact bucket (bin_contacts_by_env); use_binning == 0 restores the
+    # pre-binning full rigid_contact_max scan (O(num_envs^2)). The ownership
+    # filter below makes the two paths process the same owned contacts.
+    n_c = int(0)
+    if use_binning != 0:
+        n_c = env_contact_count[tid]
+        if n_c > max_contacts_per_env:
+            n_c = max_contacts_per_env
+    else:
+        n_c = rigid_contact_max
     for k in range(n_c):
-        contact_id = env_contact_ids[tid * max_contacts_per_env + k]
+        contact_id = int(0)
+        if use_binning != 0:
+            contact_id = env_contact_ids[tid * max_contacts_per_env + k]
+        else:
+            contact_id = k
         c_body = contact_body[contact_id]
+        # Ownership filter: no-op for the binned path, required for the scan.
+        if c_body < 0:
+            continue
+        if c_body / bodies_per_env != tid:
+            continue
         c_point = contact_point[contact_id]
         c_shape = contact_shape[contact_id]
         c_dist = geo.thickness[c_shape]
@@ -3657,6 +3691,13 @@ class MoreauIntegrator:
         self._bundle_perturbation_clamp_q = 0.1
         self._bundle_perturbation_clamp_qd = 0.5
 
+        # Per-env contact binning. True (default) -> contact kernels iterate the
+        # compact per-env bucket built by bin_contacts_by_env (fast). False ->
+        # the pre-binning behavior: each articulation scans the full contact
+        # table and filters by ownership (O(num_envs^2), deterministic). Set by
+        # WpInterface from cfg.sim.contact_binning.
+        self.contact_binning = True
+
     def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps, requires_grad=False):
         """Allocate persistent bundle state buffers owned by the integrator.
 
@@ -3964,6 +4005,7 @@ class MoreauIntegrator:
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
@@ -5172,6 +5214,7 @@ class MoreauIntegrator:
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -5974,6 +6017,7 @@ class MoreauIntegrator:
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[state_out.point_vec, state_out.foot_vel],
         )
@@ -6078,6 +6122,11 @@ class MoreauIntegrator:
             model.env_contact_ids = wp.zeros(nart * maxc, dtype=wp.int32, device=model.device)
             model.env_contact_count = wp.zeros(nart, dtype=wp.int32, device=model.device)
             model.max_contacts_per_env = int(maxc)
+        # Binning disabled: the consumer kernels do the full-table scan and never
+        # read the buckets, so skip the (useless) bin + sort launches. The arrays
+        # stay allocated so the kernel launch arguments remain valid.
+        if not self.contact_binning:
+            return
         model.env_contact_count.zero_()
         wp.launch(
             kernel=bin_contacts_by_env,
@@ -6132,6 +6181,7 @@ class MoreauIntegrator:
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[model.Jc, model.c_body_vec, state_mid.point_vec],
             device=model.device,

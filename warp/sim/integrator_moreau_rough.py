@@ -1981,6 +1981,7 @@ def construct_contact_jacobian(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # Outputs
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
@@ -2004,13 +2005,23 @@ def construct_contact_jacobian(
 
     total_contacts = rigid_contact_count[0]
     
-    # Iterate only this env's binned contacts (bin_contacts_by_env) instead of
-    # scanning the full contact table per articulation (was O(num_envs^2)).
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    # use_binning != 0: iterate this env's binned contacts (bin_contacts_by_env);
+    # use_binning == 0: scan the full contact table (pre-binning, O(num_envs^2)).
+    # The per-contact schedule/ownership checks below are identical for both, so
+    # the binned path is bit-identical to the full scan.
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = wp.min(total_contacts, max_contacts)
     for ki_bin in range(n_c_bin):
-        contact_idx = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        contact_idx = int(0)
+        if use_binning != 0:
+            contact_idx = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            contact_idx = ki_bin
 
         # 1. Check Schedule
         # The scheduler already decided if this contact *might* belong to us.
@@ -2247,6 +2258,7 @@ def schedule_contacts(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # Outputs
     contact_schedule: wp.array(dtype=int),
 ):
@@ -2264,11 +2276,19 @@ def schedule_contacts(
     best_dists = wp.vec4(1.0e6, 1.0e6, 1.0e6, 1.0e6)
     best_keys = wp.vec4i(-1, -1, -1, -1)
 
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = limit
     for ki_bin in range(n_c_bin):
-        i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        i = int(0)
+        if use_binning != 0:
+            i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            i = ki_bin
         
         # 1. Check Ownership
         body_0 = rigid_contact_body0[i]
@@ -2396,6 +2416,7 @@ def schedule_contacts_8(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # Outputs
     contact_schedule: wp.array(dtype=int),
 ):
@@ -2419,11 +2440,19 @@ def schedule_contacts_8(
     bk_0 = int(-1); bk_1 = int(-1); bk_2 = int(-1); bk_3 = int(-1)
     bk_4 = int(-1); bk_5 = int(-1); bk_6 = int(-1); bk_7 = int(-1)
 
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = limit
     for ki_bin in range(n_c_bin):
-        i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        i = int(0)
+        if use_binning != 0:
+            i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            i = ki_bin
         body_0 = rigid_contact_body0[i]
         body_1 = rigid_contact_body1[i]
 
@@ -2672,6 +2701,7 @@ def schedule_contacts_foot_only(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # Outputs
     contact_schedule: wp.array(dtype=int),
 ):
@@ -2687,11 +2717,19 @@ def schedule_contacts_foot_only(
     bi_0 = int(-1); bi_1 = int(-1); bi_2 = int(-1); bi_3 = int(-1)
     bd_0 = float(1.0e6); bd_1 = float(1.0e6); bd_2 = float(1.0e6); bd_3 = float(1.0e6)
 
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = limit
     for ki_bin in range(n_c_bin):
-        i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        i = int(0)
+        if use_binning != 0:
+            i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            i = ki_bin
 
         # 1. Check Ownership
         body_0 = rigid_contact_body0[i]
@@ -2788,6 +2826,7 @@ def schedule_contacts_foot_only_8(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     # Outputs
     contact_schedule: wp.array(dtype=int),
 ):
@@ -2808,11 +2847,19 @@ def schedule_contacts_foot_only_8(
     bd_0 = float(1.0e6); bd_1 = float(1.0e6); bd_2 = float(1.0e6); bd_3 = float(1.0e6)
     bd_4 = float(1.0e6); bd_5 = float(1.0e6); bd_6 = float(1.0e6); bd_7 = float(1.0e6)
 
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = limit
     for ki_bin in range(n_c_bin):
-        i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        i = int(0)
+        if use_binning != 0:
+            i = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            i = ki_bin
         body_0 = rigid_contact_body0[i]
         body_1 = rigid_contact_body1[i]
 
@@ -2919,6 +2966,7 @@ def get_foot_states_rough(
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
+    use_binning: int,
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
 ):
@@ -2942,15 +2990,23 @@ def get_foot_states_rough(
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
 
-    # Iterate only this env's binned contacts (bin_contacts_by_env) rather than
-    # scanning the whole table per articulation (was O(num_envs^2)). The
-    # internal c_body/bodies_per_env == tid check is kept so the selected set is
-    # identical to the previous full-table dispatch.
-    n_c_bin = env_contact_count[tid]
-    if n_c_bin > max_contacts_per_env:
-        n_c_bin = max_contacts_per_env
+    # use_binning != 0: iterate this env's binned contacts (bin_contacts_by_env);
+    # use_binning == 0: scan the whole table (pre-binning, O(num_envs^2)). The
+    # internal c_body/bodies_per_env == tid check is kept either way, so the
+    # binned path selects an identical set to the full-table dispatch.
+    n_c_bin = int(0)
+    if use_binning != 0:
+        n_c_bin = env_contact_count[tid]
+        if n_c_bin > max_contacts_per_env:
+            n_c_bin = max_contacts_per_env
+    else:
+        n_c_bin = total_contacts
     for ki_bin in range(n_c_bin):
-        contact_id = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        contact_id = int(0)
+        if use_binning != 0:
+            contact_id = env_contact_ids[tid * max_contacts_per_env + ki_bin]
+        else:
+            contact_id = ki_bin
         c_body = contact_body[contact_id]
         if c_body >= 0 and (c_body / bodies_per_env) == tid:
             if True:
@@ -4824,6 +4880,15 @@ class MoreauRoughIntegrator(Integrator):
         #     cfg.sim.foot_only_contacts.
         self.foot_only_contacts = False
 
+        # Per-env contact binning. True (default) -> the schedulers /
+        # construct_contact_jacobian / get_foot_states_rough iterate the compact
+        # per-env bucket built by bin_contacts_by_env (fast). False -> the
+        # pre-binning behavior: each articulation scans the full contact table
+        # and filters by ownership (O(num_envs^2), deterministic). Set by
+        # WpInterface from cfg.sim.contact_binning; propagated to the bundle
+        # sub-integrator.
+        self.contact_binning = True
+
         self._step = 0
 
         # ---- Bundle-mode state (lazily allocated on first bundle simulate) ----
@@ -5007,6 +5072,7 @@ class MoreauRoughIntegrator(Integrator):
             self._bundle_integrator.col_height = float(getattr(self, "col_height", 0.0))
             # Inner bundle rollout must use the same contact-selection policy.
             self._bundle_integrator.foot_only_contacts = self.foot_only_contacts
+            self._bundle_integrator.contact_binning = self.contact_binning
             self._bundle_fk_scratch = bundle_model.state(requires_grad=False)
 
         if (
@@ -5152,6 +5218,7 @@ class MoreauRoughIntegrator(Integrator):
                 self.env_contact_ids,
                 self.env_contact_count,
                 self.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
@@ -6599,6 +6666,7 @@ class MoreauRoughIntegrator(Integrator):
                 model.contact_body_offsets, model.bodies_per_env,
                 model.contact_local_x_sign, model.contact_local_y_sign,
                 self.env_contact_ids, self.env_contact_count, self.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[fk_point_vec_local, fk_foot_vel],
             device=model.device,
@@ -7104,6 +7172,7 @@ class MoreauRoughIntegrator(Integrator):
                         self.env_contact_ids,
                         self.env_contact_count,
                         self.max_contacts_per_env,
+                        int(self.contact_binning),
                     ],
                     outputs=[out_point_vec, state_out.foot_vel],
                     device=model.device,
@@ -7279,6 +7348,11 @@ class MoreauRoughIntegrator(Integrator):
             self.env_contact_ids = wp.zeros(nart * maxc, dtype=wp.int32, device=model.device)
             self.env_contact_count = wp.zeros(nart, dtype=wp.int32, device=model.device)
             self.max_contacts_per_env = int(maxc)
+        # Binning disabled: the consumer kernels do the full-table scan and never
+        # read the buckets, so skip the (useless) bin + sort launches. The arrays
+        # stay allocated so the kernel launch arguments remain valid.
+        if not self.contact_binning:
+            return
         self.env_contact_count.zero_()
         wp.launch(
             kernel=bin_contacts_by_env,
@@ -7379,12 +7453,14 @@ class MoreauRoughIntegrator(Integrator):
             ]
         else:
             sched_kernel = schedule_contacts if self.num_contacts == 4 else schedule_contacts_8
-        # Bucket contacts per env so the scheduler skips the O(N^2) full scan.
+        # Bucket contacts per env so the scheduler skips the O(N^2) full scan
+        # (no-op population when contact_binning is off; the kernel then scans).
         self._ensure_contact_bins(model)
         sched_inputs = sched_inputs + [
             self.env_contact_ids,
             self.env_contact_count,
             self.max_contacts_per_env,
+            int(self.contact_binning),
         ]
         wp.launch(
             kernel=sched_kernel,
@@ -7430,6 +7506,7 @@ class MoreauRoughIntegrator(Integrator):
                 self.env_contact_ids,
                 self.env_contact_count,
                 self.max_contacts_per_env,
+                int(self.contact_binning),
             ],
             outputs=[self.Jc, self.c_body_vec, state_mid.point_vec, state_mid.contact_normals, state_mid.ground_point_vec],
             device=model.device,
