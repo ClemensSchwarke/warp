@@ -2650,7 +2650,9 @@ def schedule_contacts_8(
 def _foot_slot_id(
     body_offset: int,
     c_point_local: wp.vec3,
+    shape_radius: float,
     contact_body_offsets: wp.array(dtype=int),
+    contact_radius: wp.array(dtype=float),
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
     num_contacts: int,
@@ -2667,11 +2669,12 @@ def _foot_slot_id(
     foot_id = int(-1)
     for s in range(num_contacts):
         if body_offset == contact_body_offsets[s]:
+            radius_ok = wp.abs(shape_radius - contact_radius[s]) < 1.0e-5
             xs = contact_local_x_sign[s]
             ys = contact_local_y_sign[s]
             x_ok = xs == 0 or (xs > 0 and c_point_local[0] >= 0.0) or (xs < 0 and c_point_local[0] < 0.0)
             y_ok = ys == 0 or (ys > 0 and c_point_local[1] >= 0.0) or (ys < 0 and c_point_local[1] < 0.0)
-            if x_ok and y_ok:
+            if radius_ok and x_ok and y_ok:
                 foot_id = s
     return foot_id
 
@@ -2694,6 +2697,7 @@ def schedule_contacts_foot_only(
     max_contacts: int,
     # Foot-body restriction (see _foot_slot_id).
     contact_body_offsets: wp.array(dtype=int),
+    contact_radius: wp.array(dtype=float),
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
     bodies_per_env: int,
@@ -2766,8 +2770,12 @@ def schedule_contacts_foot_only(
 
             # Restrict to designated foot bodies + map to a fixed slot.
             body_offset = target_body - tid * bodies_per_env
+            shape_radius = float(0.0)
+            if shape_ok:
+                shape_radius = shape_thickness[shape_id]
             foot_id = _foot_slot_id(
-                body_offset, c_point_local, contact_body_offsets,
+                body_offset, c_point_local, shape_radius,
+                contact_body_offsets, contact_radius,
                 contact_local_x_sign, contact_local_y_sign, num_contacts,
             )
 
@@ -2819,6 +2827,7 @@ def schedule_contacts_foot_only_8(
     max_contacts: int,
     # Foot-body restriction (see _foot_slot_id).
     contact_body_offsets: wp.array(dtype=int),
+    contact_radius: wp.array(dtype=float),
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
     bodies_per_env: int,
@@ -2893,8 +2902,12 @@ def schedule_contacts_foot_only_8(
 
             # Restrict to designated foot bodies + map to a fixed slot.
             body_offset = target_body - tid * bodies_per_env
+            shape_radius = float(0.0)
+            if shape_ok:
+                shape_radius = shape_thickness[shape_id]
             foot_id = _foot_slot_id(
-                body_offset, c_point_local, contact_body_offsets,
+                body_offset, c_point_local, shape_radius,
+                contact_body_offsets, contact_radius,
                 contact_local_x_sign, contact_local_y_sign, num_contacts,
             )
 
@@ -2960,6 +2973,7 @@ def get_foot_states_rough(
     contact_shape: wp.array(dtype=int),
     geo: ModelShapeGeometry,
     contact_body_offsets: wp.array(dtype=int),
+    contact_radius: wp.array(dtype=float),
     bodies_per_env: int,
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
@@ -3073,6 +3087,9 @@ def get_foot_states_rough(
                     y_ok = ys == 0 or (ys > 0 and c_point[1] >= float(0.0)) or (ys < 0 and c_point[1] < float(0.0))
                     if x_ok and y_ok:
                         foot_id = int(7)
+
+                if foot_id >= 0 and wp.abs(c_dist - contact_radius[foot_id]) >= 1.0e-5:
+                    foot_id = int(-1)
 
                 if foot_id >= 0 and foot_id < num_contacts:
                     X_s = body_X_s[c_body]
@@ -5212,6 +5229,7 @@ class MoreauRoughIntegrator(Integrator):
                 model.rigid_contact_shape0,
                 model.shape_geo,
                 model.contact_body_offsets,
+                model.contact_radius,
                 model.bodies_per_env,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
@@ -6663,7 +6681,7 @@ class MoreauRoughIntegrator(Integrator):
                 state_out.body_X_sc, state_out.body_v_s,
                 self.rigid_contact_body0, model.rigid_contact_point0,
                 model.rigid_contact_shape0, model.shape_geo,
-                model.contact_body_offsets, model.bodies_per_env,
+                model.contact_body_offsets, model.contact_radius, model.bodies_per_env,
                 model.contact_local_x_sign, model.contact_local_y_sign,
                 self.env_contact_ids, self.env_contact_count, self.max_contacts_per_env,
                 int(self.contact_binning),
@@ -7166,6 +7184,7 @@ class MoreauRoughIntegrator(Integrator):
                         model.rigid_contact_shape0,
                         model.shape_geo,
                         model.contact_body_offsets,
+                        model.contact_radius,
                         model.bodies_per_env,
                         model.contact_local_x_sign,
                         model.contact_local_y_sign,
@@ -7446,6 +7465,7 @@ class MoreauRoughIntegrator(Integrator):
             )
             sched_inputs = sched_inputs + [
                 model.contact_body_offsets,
+                model.contact_radius,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
                 model.bodies_per_env,

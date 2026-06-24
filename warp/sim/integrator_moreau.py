@@ -1134,8 +1134,12 @@ def construct_contact_jacobian(
     col_height: float,
     contact_body_offsets: wp.array(dtype=int),
     bodies_per_env: int,
+    num_contacts: int,
+    contact_local_pos: wp.array(dtype=wp.vec3),
+    contact_radius: wp.array(dtype=float),
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
+    fixed_contact_points: int,
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
@@ -1157,6 +1161,43 @@ def construct_contact_jacobian(
     point_vec[tid * 8 + 5] = above_ground
     point_vec[tid * 8 + 6] = above_ground
     point_vec[tid * 8 + 7] = above_ground
+    c_body_vec[tid * 8 + 0] = -1
+    c_body_vec[tid * 8 + 1] = -1
+    c_body_vec[tid * 8 + 2] = -1
+    c_body_vec[tid * 8 + 3] = -1
+    c_body_vec[tid * 8 + 4] = -1
+    c_body_vec[tid * 8 + 5] = -1
+    c_body_vec[tid * 8 + 6] = -1
+    c_body_vec[tid * 8 + 7] = -1
+
+    if fixed_contact_points != 0:
+        for foot_id in range(8):
+            if foot_id < num_contacts:
+                body_offset = contact_body_offsets[foot_id]
+                if body_offset >= 0:
+                    c_body = tid * bodies_per_env + body_offset
+                    c_point = contact_local_pos[foot_id]
+                    c_dist = contact_radius[foot_id]
+
+                    X_s = body_X_sc[c_body]
+                    n = wp.vec3(0.0, 1.0, 0.0)
+                    p = wp.transform_point(X_s, c_point) - n * c_dist
+                    c = wp.dot(n, p)
+
+                    if c <= col_height:
+                        p_skew = wp.skew(wp.vec3(p[0], p[1], p[2]))
+                        for j in range(0, 3):
+                            for k in range(0, dof_count):
+                                Jc[dense_J_index(Jc_start, 3, dof_count, tid, foot_id, j, k)] = (
+                                    J[dense_J_index(J_start, 6, dof_count, 0, c_body, j + 3, k)]
+                                    - p_skew[j, 0] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 0, k)]
+                                    - p_skew[j, 1] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 1, k)]
+                                    - p_skew[j, 2] * J[dense_J_index(J_start, 6, dof_count, 0, c_body, 2, k)]
+                                )
+
+                    c_body_vec[tid * 8 + foot_id] = c_body
+                    point_vec[tid * 8 + foot_id] = p
+        return
 
     # Broadphase contact pairs are NOT laid out in contiguous per-env blocks
     # (self-collision pairs interleave foot-ground pairs across envs).
@@ -2441,10 +2482,12 @@ def p_to_f_s(
     tid = wp.tid()
 
     for i in range(8):
-        # foot forces and torques
-        f = -percussion[tid, i] / dt
-        t = wp.cross(point_vec[tid * 8 + i], f)
-        wp.atomic_add(body_f_s, c_body_vec[tid * 8 + i], wp.spatial_vector(t, f))
+        c_body = c_body_vec[tid * 8 + i]
+        if c_body >= 0:
+            # foot forces and torques
+            f = -percussion[tid, i] / dt
+            t = wp.cross(point_vec[tid * 8 + i], f)
+            wp.atomic_add(body_f_s, c_body, wp.spatial_vector(t, f))
 
 
 @wp.kernel
@@ -2595,8 +2638,12 @@ def get_foot_states(
     geo: ModelShapeGeometry,
     contact_body_offsets: wp.array(dtype=int),
     bodies_per_env: int,
+    num_contacts: int,
+    contact_local_pos: wp.array(dtype=wp.vec3),
+    contact_radius: wp.array(dtype=float),
     contact_local_x_sign: wp.array(dtype=int),
     contact_local_y_sign: wp.array(dtype=int),
+    fixed_contact_points: int,
     env_contact_ids: wp.array(dtype=int),
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
@@ -2641,6 +2688,28 @@ def get_foot_states(
     best_y_5 = float(1.0e6)
     best_y_6 = float(1.0e6)
     best_y_7 = float(1.0e6)
+
+    if fixed_contact_points != 0:
+        for foot_id in range(8):
+            if foot_id < num_contacts:
+                body_offset = contact_body_offsets[foot_id]
+                if body_offset >= 0:
+                    c_body = tid * bodies_per_env + body_offset
+                    c_point = contact_local_pos[foot_id]
+                    c_dist = contact_radius[foot_id]
+
+                    X_s = body_X_s[c_body]
+                    v_s = body_v_s[c_body]
+                    n = wp.vec3(0.0, 1.0, 0.0)
+                    p = wp.transform_point(X_s, c_point) - n * c_dist
+
+                    w = wp.spatial_top(v_s)
+                    v = wp.spatial_bottom(v_s)
+                    dpdt = v + wp.cross(w, p)
+
+                    point_vec[tid * 8 + foot_id] = p
+                    foot_vel[tid * 8 + foot_id] = dpdt
+        return
 
     # See construct_contact_jacobian: use_binning != 0 iterates only this env's
     # compact contact bucket (bin_contacts_by_env); use_binning == 0 restores the
@@ -3698,6 +3767,28 @@ class MoreauIntegrator:
         # WpInterface from cfg.sim.contact_binning.
         self.contact_binning = True
 
+    @staticmethod
+    def _ensure_contact_metadata(model):
+        """Provide backward-compatible defaults for flat contact selection."""
+        if not hasattr(model, "num_contacts_per_env"):
+            model.num_contacts_per_env = 4
+        if not hasattr(model, "contact_body_offsets"):
+            model.contact_body_offsets = wp.array(
+                [3, 6, 9, 12, -1, -1, -1, -1],
+                dtype=wp.int32,
+                device=model.device,
+            )
+        if not hasattr(model, "contact_local_x_sign"):
+            model.contact_local_x_sign = wp.zeros(8, dtype=wp.int32, device=model.device)
+        if not hasattr(model, "contact_local_y_sign"):
+            model.contact_local_y_sign = wp.zeros(8, dtype=wp.int32, device=model.device)
+        if not hasattr(model, "contact_local_pos"):
+            model.contact_local_pos = wp.zeros(8, dtype=wp.vec3, device=model.device)
+        if not hasattr(model, "contact_radius"):
+            model.contact_radius = wp.zeros(8, dtype=wp.float32, device=model.device)
+        if not hasattr(model, "foot_only_contacts"):
+            model.foot_only_contacts = False
+
     def _lazy_init_bundle(self, model, bundle_model, num_bundle_samples, bundle_horizon_substeps, requires_grad=False):
         """Allocate persistent bundle state buffers owned by the integrator.
 
@@ -3960,6 +4051,7 @@ class MoreauIntegrator:
         """
         state = self._fk_scratch_state
         device = model.device
+        self._ensure_contact_metadata(model)
         wp.launch(
             kernel=eval_articulation_fk,
             dim=model.articulation_count,
@@ -4000,8 +4092,12 @@ class MoreauIntegrator:
                 model.shape_geo,
                 model.contact_body_offsets,
                 model.bodies_per_env,
+                int(model.num_contacts_per_env),
+                model.contact_local_pos,
+                model.contact_radius,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                int(model.foot_only_contacts),
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
@@ -4927,9 +5023,7 @@ class MoreauIntegrator:
                 bundle_inner_mode,
             )
 
-        # Ensure contact_local_x_sign is present (zeros = no x-axis filtering).
-        if not hasattr(model, "contact_local_x_sign"):
-            model.contact_local_x_sign = wp.zeros(4, dtype=wp.int32, device=model.device)
+        self._ensure_contact_metadata(model)
 
         if zero_sparse_buffers:
             # Match SHAC's per-substep fresh-zero allocation for the matrices
@@ -5209,8 +5303,12 @@ class MoreauIntegrator:
                 model.shape_geo,
                 model.contact_body_offsets,
                 model.bodies_per_env,
+                int(model.num_contacts_per_env),
+                model.contact_local_pos,
+                model.contact_radius,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                int(model.foot_only_contacts),
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
@@ -5281,9 +5379,9 @@ class MoreauIntegrator:
         state lands in ``state_out_pred`` and is discarded by the merge for
         HOLD and WRITE-PENDING envs.
         """
-        # Ensure contact_local_x_sign is present (zeros = no x-axis filtering).
-        if not hasattr(model, "contact_local_x_sign"):
-            model.contact_local_x_sign = wp.zeros(4, dtype=wp.int32, device=model.device)
+        self._ensure_contact_metadata(model)
+        if bundle_model is not None:
+            self._ensure_contact_metadata(bundle_model)
 
         device = model.device
         inner_mode = bundle_inner_mode or "soft"
@@ -6012,8 +6110,12 @@ class MoreauIntegrator:
                 model.shape_geo,
                 model.contact_body_offsets,
                 model.bodies_per_env,
+                int(model.num_contacts_per_env),
+                model.contact_local_pos,
+                model.contact_radius,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                int(model.foot_only_contacts),
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
@@ -6176,8 +6278,12 @@ class MoreauIntegrator:
                 model.col_height,
                 model.contact_body_offsets,
                 model.bodies_per_env,
+                int(model.num_contacts_per_env),
+                model.contact_local_pos,
+                model.contact_radius,
                 model.contact_local_x_sign,
                 model.contact_local_y_sign,
+                int(model.foot_only_contacts),
                 model.env_contact_ids,
                 model.env_contact_count,
                 model.max_contacts_per_env,
