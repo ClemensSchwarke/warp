@@ -16,6 +16,27 @@ from .articulation import eval_articulation_fk
 from .model import ModelShapeGeometry, ModelShapeMaterials
 
 
+def _ensure_motor_limit_arrays(model, max_torque, peak_torque, velocity_limit):
+    """Provide scalar-call compatibility for models without per-joint arrays."""
+    device = model.device
+    if not hasattr(model, "joint_dof_max_torque"):
+        model.joint_dof_max_torque = wp.full(
+            model.joint_dof_count, float(max_torque), dtype=wp.float32, device=device
+        )
+    if not hasattr(model, "joint_dof_peak_torque"):
+        model.joint_dof_peak_torque = wp.full(
+            model.joint_dof_count, float(peak_torque), dtype=wp.float32, device=device
+        )
+    if not hasattr(model, "joint_dof_velocity_limit"):
+        model.joint_dof_velocity_limit = wp.full(
+            model.joint_dof_count, float(velocity_limit), dtype=wp.float32, device=device
+        )
+    if not hasattr(model, "joint_dof_motor_torque_curve"):
+        model.joint_dof_motor_torque_curve = wp.full(
+            model.joint_dof_count, 1.0, dtype=wp.float32, device=device
+        )
+
+
 @wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
     return 1.0 / (
@@ -209,9 +230,10 @@ def jcalc_tau(
     limit_k_d: float,
     joint_static_friction: float,
     joint_dynamic_friction: float,
-    max_torque: float,
-    peak_torque: float,
-    velocity_limit: float,
+    max_torque: wp.array(dtype=float),
+    peak_torque: wp.array(dtype=float),
+    velocity_limit: wp.array(dtype=float),
+    motor_torque_curve: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
@@ -237,10 +259,20 @@ def jcalc_tau(
         t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
         t_2 += 0.0 - joint_dynamic_friction * qd
 
-        # velocity-based torque limit (peak_torque / velocity_limit are
-        # env-specific and threaded in from cfg.env.* via the integrator call)
-        max_torque_limit = wp.clamp(peak_torque * (1.0 - qd / velocity_limit), 0.0, max_torque)
-        min_torque_limit = wp.clamp(peak_torque * (-1.0 - qd / velocity_limit), -max_torque, 0.0)
+        # DC-motor torque-speed envelope. Non-DC actuators skip this curve and
+        # use only their documented effort/continuous-torque clamp.
+        joint_max_torque = max_torque[dof_start]
+        joint_peak_torque = peak_torque[dof_start]
+        joint_velocity_limit = velocity_limit[dof_start]
+        max_torque_limit = joint_max_torque
+        min_torque_limit = 0.0 - joint_max_torque
+        if motor_torque_curve[dof_start] > 0.5:
+            max_torque_limit = wp.clamp(
+                joint_peak_torque * (1.0 - qd / joint_velocity_limit), 0.0, joint_max_torque
+            )
+            min_torque_limit = wp.clamp(
+                joint_peak_torque * (-1.0 - qd / joint_velocity_limit), -joint_max_torque, 0.0
+            )
 
         # total torque / force on the joint
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
@@ -493,9 +525,10 @@ def compute_link_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
-    max_torque: float,
-    peak_torque: float,
-    velocity_limit: float,
+    max_torque: wp.array(dtype=float),
+    peak_torque: wp.array(dtype=float),
+    velocity_limit: wp.array(dtype=float),
+    motor_torque_curve: wp.array(dtype=float),
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -542,6 +575,7 @@ def compute_link_tau(
         max_torque,
         peak_torque,
         velocity_limit,
+        motor_torque_curve,
         joint_S_s,
         joint_q,
         joint_qd,
@@ -670,9 +704,10 @@ def eval_rigid_tau(
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
     joint_limit_kd: wp.array(dtype=float),
-    max_torque: float,
-    peak_torque: float,
-    velocity_limit: float,
+    max_torque: wp.array(dtype=float),
+    peak_torque: wp.array(dtype=float),
+    velocity_limit: wp.array(dtype=float),
+    motor_torque_curve: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
@@ -707,6 +742,7 @@ def eval_rigid_tau(
             max_torque,
             peak_torque,
             velocity_limit,
+            motor_torque_curve,
             joint_limit_lower,
             joint_limit_upper,
             joint_limit_ke,
@@ -5012,6 +5048,7 @@ class MoreauIntegrator:
         # next substep's prox solve. Default False keeps SHAC bit-identical.
         zero_sparse_buffers=False,
     ):
+        _ensure_motor_limit_arrays(model, max_torque, peak_torque, velocity_limit)
         if mode == "bundle":
             return self._simulate_bundle(
                 model, state_in, state_out_pred, state_mid, state_out, dt,
@@ -5131,9 +5168,10 @@ class MoreauIntegrator:
                 model.joint_limit_upper,
                 model.joint_limit_ke,
                 model.joint_limit_kd,
-                max_torque,
-                peak_torque,
-                velocity_limit,
+                model.joint_dof_max_torque,
+                model.joint_dof_peak_torque,
+                model.joint_dof_velocity_limit,
+                model.joint_dof_motor_torque_curve,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5171,9 +5209,10 @@ class MoreauIntegrator:
                 model.joint_limit_upper,
                 model.joint_limit_ke,
                 model.joint_limit_kd,
-                max_torque,
-                peak_torque,
-                velocity_limit,
+                model.joint_dof_max_torque,
+                model.joint_dof_peak_torque,
+                model.joint_dof_velocity_limit,
+                model.joint_dof_motor_torque_curve,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5506,9 +5545,10 @@ class MoreauIntegrator:
                 model.joint_limit_upper,
                 model.joint_limit_ke,
                 model.joint_limit_kd,
-                max_torque,
-                peak_torque,
-                velocity_limit,
+                model.joint_dof_max_torque,
+                model.joint_dof_peak_torque,
+                model.joint_dof_velocity_limit,
+                model.joint_dof_motor_torque_curve,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
@@ -5545,9 +5585,10 @@ class MoreauIntegrator:
                 model.joint_limit_upper,
                 model.joint_limit_ke,
                 model.joint_limit_kd,
-                max_torque,
-                peak_torque,
-                velocity_limit,
+                model.joint_dof_max_torque,
+                model.joint_dof_peak_torque,
+                model.joint_dof_velocity_limit,
+                model.joint_dof_motor_torque_curve,
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,

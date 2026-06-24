@@ -15,6 +15,17 @@ import warp as wp
 from .model import ModelShapeGeometry, ModelShapeMaterials
 
 
+def _ensure_motor_limit_array(model, max_torque):
+    """Provide scalar-call compatibility for models without per-joint limits."""
+    if not hasattr(model, "joint_dof_max_torque"):
+        model.joint_dof_max_torque = wp.full(
+            model.joint_dof_count,
+            float(max_torque),
+            dtype=wp.float32,
+            device=model.device,
+        )
+
+
 @wp.func
 def offset_sigmoid(x: float, scale: float, offset: float):
     return 1.0 / (1.0 + wp.exp(-x * scale - offset)) / 0.9
@@ -195,7 +206,7 @@ def jcalc_tau(
     target_k_d: float,
     limit_k_e: float,
     limit_k_d: float,
-    max_torque: float,
+    max_torque: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
@@ -219,6 +230,7 @@ def jcalc_tau(
         target = joint_target[coord_start]
         lower = joint_limit_lower[coord_start]
         upper = joint_limit_upper[coord_start]
+        torque_limit = max_torque[dof_start]
 
         limit_f = 0.0
 
@@ -234,7 +246,9 @@ def jcalc_tau(
         # total torque / force on the joint
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
         t_2 = wp.clamp(
-            0.0 - target_k_e * (q - target) - target_k_d * qd + act + limit_f + damping_f, 0.0 - max_torque, max_torque
+            0.0 - target_k_e * (q - target) - target_k_d * qd + act + limit_f + damping_f,
+            0.0 - torque_limit,
+            torque_limit,
         )
 
         tau[dof_start] = t_1 + t_2
@@ -513,7 +527,7 @@ def compute_link_tau(
     joint_target: wp.array(dtype=float),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
-    max_torque: float,
+    max_torque: wp.array(dtype=float),
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -678,7 +692,7 @@ def eval_rigid_tau(
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
     joint_limit_kd: wp.array(dtype=float),
-    max_torque: float,
+    max_torque: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
@@ -1525,6 +1539,8 @@ class TOIIntegrator:
         max_torque,
         mode,
     ):
+        _ensure_motor_limit_array(model, max_torque)
+
         # eval mass matrix
         if update_mass_matrix:
             self.eval_mass_matrix(model, state_in)
@@ -2293,7 +2309,7 @@ class TOIIntegrator:
                 model.joint_limit_upper,
                 model.joint_limit_ke,
                 model.joint_limit_kd,
-                max_torque,
+                model.joint_dof_max_torque,
                 model.joint_axis,
                 state_in.joint_S_s,
                 state_in.body_f_s,

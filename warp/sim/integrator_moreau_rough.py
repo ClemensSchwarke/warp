@@ -28,6 +28,7 @@ from .model import Model, State
 # from the active integrator and use them with their native arg list -- the
 # rough integrator only adds the contact-handling layer on top.
 from .integrator_moreau import (
+    _ensure_motor_limit_arrays,
     eval_rigid_fk as _active_eval_rigid_fk,
     eval_rigid_id as _active_eval_rigid_id,
     eval_rigid_tau as _active_eval_rigid_tau,
@@ -697,7 +698,10 @@ def jcalc_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
     joint_limit_kd: wp.array(dtype=float),
-    max_torque: float,
+    max_torque: wp.array(dtype=float),
+    peak_torque: wp.array(dtype=float),
+    velocity_limit: wp.array(dtype=float),
+    motor_torque_curve: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
@@ -734,8 +738,19 @@ def jcalc_tau(
 
         f_internal = eval_joint_force_rough(q, qd, act, target_ke, target_kd, lower, upper, limit_ke, limit_kd, mode)
         
-        # Clamp the internal force (actuation + limits)
-        f_internal = wp.clamp(f_internal, -max_torque, max_torque)
+        joint_max_torque = max_torque[axis_start]
+        joint_peak_torque = peak_torque[axis_start]
+        joint_velocity_limit = velocity_limit[axis_start]
+        max_torque_limit = joint_max_torque
+        min_torque_limit = 0.0 - joint_max_torque
+        if motor_torque_curve[axis_start] > 0.5:
+            max_torque_limit = wp.clamp(
+                joint_peak_torque * (1.0 - qd / joint_velocity_limit), 0.0, joint_max_torque
+            )
+            min_torque_limit = wp.clamp(
+                joint_peak_torque * (-1.0 - qd / joint_velocity_limit), -joint_max_torque, 0.0
+            )
+        f_internal = wp.clamp(f_internal, min_torque_limit, max_torque_limit)
 
         # total torque / force on the joint
         t = -wp.dot(S_s, body_f_s) + f_internal
@@ -1238,7 +1253,10 @@ def eval_rigid_tau(
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
     joint_limit_kd: wp.array(dtype=float),
-    max_torque: float,
+    max_torque: wp.array(dtype=float),
+    peak_torque: wp.array(dtype=float),
+    velocity_limit: wp.array(dtype=float),
+    motor_torque_curve: wp.array(dtype=float),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
     body_f_ext: wp.array(dtype=wp.spatial_vector),
@@ -1281,6 +1299,9 @@ def eval_rigid_tau(
             joint_limit_ke,
             joint_limit_kd,
             max_torque,
+            peak_torque,
+            velocity_limit,
+            motor_torque_curve,
             joint_S_s,
             joint_q,
             joint_qd,
@@ -6719,6 +6740,7 @@ class MoreauRoughIntegrator(Integrator):
                  num_bundle_samples: int = 8, bundle_horizon_substeps: int = 4,
                  bundle_sigma_pos: float = 0.01, bundle_sigma_vel: float = 0.01,
                  bundle_inner_mode = None):
+        _ensure_motor_limit_arrays(model, max_torque, peak_torque, velocity_limit)
         # Active warp's State doesn't expose `requires_grad` directly -- derive
         # it from a representative array. joint_q is always allocated.
         if hasattr(state_in, "requires_grad"):
@@ -6955,9 +6977,10 @@ class MoreauRoughIntegrator(Integrator):
                             model.joint_limit_upper,
                             model.joint_limit_ke,
                             model.joint_limit_kd,
-                            max_torque,
-                            peak_torque,
-                            velocity_limit,
+                            model.joint_dof_max_torque,
+                            model.joint_dof_peak_torque,
+                            model.joint_dof_velocity_limit,
+                            model.joint_dof_motor_torque_curve,
                             model.joint_axis,
                             state_mid.joint_S_s,
                             state_mid.body_f_s,
@@ -7007,9 +7030,10 @@ class MoreauRoughIntegrator(Integrator):
                             model.joint_limit_upper,
                             model.joint_limit_ke,
                             model.joint_limit_kd,
-                            max_torque,
-                            peak_torque,
-                            velocity_limit,
+                            model.joint_dof_max_torque,
+                            model.joint_dof_peak_torque,
+                            model.joint_dof_velocity_limit,
+                            model.joint_dof_motor_torque_curve,
                             model.joint_axis,
                             state_mid.joint_S_s,
                             state_mid.body_f_s,
