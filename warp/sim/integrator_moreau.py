@@ -3214,21 +3214,31 @@ def average_bundle_into_buffer(
         if root_q_dim == 7 and qi >= 3 and qi < 7:
             continue
 
-        avg = float(0.0)
-        for s in range(num_bundle_samples):
+        # Anchor the mean at sample 0 and average only deviations. Besides
+        # reducing cancellation for tightly clustered branches, this makes an
+        # identical zero-noise bundle reproduce sample 0 exactly: every
+        # subtraction is between identical float operands, so delta_sum is
+        # exactly zero instead of accumulating n copies and multiplying by an
+        # inexact reciprocal (notably 0.1 for the default 10 samples).
+        ref_q_start = tid * coord_count
+        ref = bundle_joint_q[ref_q_start + qi]
+        delta_sum = float(0.0)
+        for s in range(1, num_bundle_samples):
             bundle_slot = s * num_envs + tid
             bundle_q_start = bundle_slot * coord_count
-            avg = avg + bundle_joint_q[bundle_q_start + qi]
-        bundle_avg_q[main_q_start + qi] = avg * inv_n
+            delta_sum = delta_sum + (bundle_joint_q[bundle_q_start + qi] - ref)
+        bundle_avg_q[main_q_start + qi] = ref + delta_sum * inv_n
 
     # Average joint_qd (spatial velocity — pure tangent vector, no sign issues).
     for qdi in range(dof_count):
-        avg = float(0.0)
-        for s in range(num_bundle_samples):
+        ref_qd_start = tid * dof_count
+        ref = bundle_joint_qd[ref_qd_start + qdi]
+        delta_sum = float(0.0)
+        for s in range(1, num_bundle_samples):
             bundle_slot = s * num_envs + tid
             bundle_qd_start = bundle_slot * dof_count
-            avg = avg + bundle_joint_qd[bundle_qd_start + qdi]
-        bundle_avg_qd[main_qd_start + qdi] = avg * inv_n
+            delta_sum = delta_sum + (bundle_joint_qd[bundle_qd_start + qdi] - ref)
+        bundle_avg_qd[main_qd_start + qdi] = ref + delta_sum * inv_n
 
 
 @wp.kernel

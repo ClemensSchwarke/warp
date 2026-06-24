@@ -120,6 +120,43 @@ def compute_root_xz_ref(
 
 
 @wp.kernel
+def compute_bundle_output_root_xz_ref(
+    main_joint_q: wp.array(dtype=float),
+    bundle_input_joint_q: wp.array(dtype=float),
+    do_average: wp.array(dtype=int),
+    articulation_coord_start: wp.array(dtype=int),
+    num_envs: int,
+    num_bundle_samples: int,
+    coord_per_env: int,
+    p_ref: wp.array(dtype=wp.vec3),
+):
+    """Reference frame for the merged rough-bundle output kinematics.
+
+    Normal/held environments use the main substep input root. Environments
+    committing a bundle result use the mean root of the actual branch inputs
+    for that inner substep. This is the frame in which each branch integrated
+    its origin-referenced spatial velocity.
+    """
+    env_id = wp.tid()
+    if do_average[env_id] == 0:
+        base = articulation_coord_start[env_id]
+        p_ref[env_id] = wp.vec3(main_joint_q[base + 0], 0.0, main_joint_q[base + 2])
+        return
+
+    ref_base = env_id * coord_per_env
+    ref_x = bundle_input_joint_q[ref_base + 0]
+    ref_z = bundle_input_joint_q[ref_base + 2]
+    dx_sum = float(0.0)
+    dz_sum = float(0.0)
+    for s in range(1, num_bundle_samples):
+        base = (s * num_envs + env_id) * coord_per_env
+        dx_sum = dx_sum + (bundle_input_joint_q[base + 0] - ref_x)
+        dz_sum = dz_sum + (bundle_input_joint_q[base + 2] - ref_z)
+    inv_n = 1.0 / float(num_bundle_samples)
+    p_ref[env_id] = wp.vec3(ref_x + dx_sum * inv_n, 0.0, ref_z + dz_sum * inv_n)
+
+
+@wp.kernel
 def recenter_joint_q_xz(
     joint_q: wp.array(dtype=float),
     p_ref: wp.array(dtype=wp.vec3),
@@ -6177,7 +6214,10 @@ class MoreauRoughIntegrator(Integrator):
         main_coord = model.joint_coord_count
         main_dof = model.joint_dof_count
         bc = model.body_count
-        sc = model.shape_count
+        # The finalized bundle packs each sample's replicated shapes first and
+        # appends one shared fallback plane as the final shape.
+        bundle_ground_shape = bundle_model.shape_count - 1
+        shapes_per_sample = bundle_ground_shape // num_bundle_samples
 
         b_in_q = wp.to_torch(b_in.joint_q)
         b_in_qd = wp.to_torch(b_in.joint_qd)
@@ -6214,10 +6254,23 @@ class MoreauRoughIntegrator(Integrator):
                 ms0 = wp.to_torch(model.rigid_contact_shape0)[:mc]
                 ms1 = wp.to_torch(model.rigid_contact_shape1)[:mc].clone()
                 bb0[dst] = mb0 + s * bc
-                mb1[mb1 >= 0] += s * bc
+                valid_body1 = mb1 >= 0
+                mb1[valid_body1] += s * bc
                 bb1[dst] = mb1
-                bs0[dst] = ms0 + s * sc
-                ms1[ms1 >= 0] += s * sc
+
+                shape_offset = s * shapes_per_sample
+
+                mapped_s0 = ms0.clone()
+                s0_replicated = (mapped_s0 >= 0) & (mapped_s0 < shapes_per_sample)
+                s0_shared = mapped_s0 >= shapes_per_sample
+                mapped_s0[s0_replicated] += shape_offset
+                mapped_s0[s0_shared] = bundle_ground_shape
+                bs0[dst] = mapped_s0
+
+                s1_replicated = (ms1 >= 0) & (ms1 < shapes_per_sample)
+                s1_shared = ms1 >= shapes_per_sample
+                ms1[s1_replicated] += shape_offset
+                ms1[s1_shared] = bundle_ground_shape
                 bs1[dst] = ms1
                 bp0[dst] = wp.to_torch(model.rigid_contact_point0)[:mc]
                 bp1[dst] = wp.to_torch(model.rigid_contact_point1)[:mc]
@@ -6431,6 +6484,7 @@ class MoreauRoughIntegrator(Integrator):
         )
 
         any_active = bool(wp.to_torch(bundle_active).any().item())
+        b_in = None
         if any_active:
             # b_in is the inner state_in (joint_q/qd only) -> lite.
             b_in = self._pooled_state(bundle_model, "bin", substep, requires_grad, lite=True)
@@ -6625,18 +6679,29 @@ class MoreauRoughIntegrator(Integrator):
         # are an acceptable basis here.
         if any_active:
             self._collide_main_at(model, state_in.joint_q, state_in.joint_qd)
-        # Env-local recentering of the FK-tail (mirrors the normal simulate
-        # output path) so the reported body_qd / foot states match the soft
-        # path bit-for-bit -- otherwise the world offset inflates body_qd here
-        # while the soft path computes it locally, breaking zero-noise
-        # bundle==soft. p_ref is derived from the merged world joint_q.
+        # Env-local recentering of the FK tail. Match normal simulate exactly:
+        # its local frame is anchored at the SUBSTEP INPUT root position, not
+        # the integrated output root. Using state_out here shifts the spatial
+        # velocity reference by the root displacement over dt, so identical
+        # joint_q/joint_qd still produce different body_qd and reward gradients.
         coord_per_env = int(len(state_out.joint_q) // max(model.articulation_count, 1))
         p_ref = wp.zeros(model.articulation_count, dtype=wp.vec3, device=model.device)
-        wp.launch(
-            kernel=compute_root_xz_ref, dim=model.articulation_count,
-            inputs=[state_out.joint_q, coord_per_env], outputs=[p_ref],
-            device=model.device, record_tape=False,
-        )
+        if any_avg:
+            wp.launch(
+                kernel=compute_bundle_output_root_xz_ref, dim=model.articulation_count,
+                inputs=[
+                    state_in.joint_q, b_in.joint_q, do_average,
+                    self.articulation_coord_start, num_envs, num_bundle_samples,
+                    coord_per_env,
+                ],
+                outputs=[p_ref], device=model.device, record_tape=False,
+            )
+        else:
+            wp.launch(
+                kernel=compute_root_xz_ref, dim=model.articulation_count,
+                inputs=[state_in.joint_q, coord_per_env], outputs=[p_ref],
+                device=model.device, record_tape=False,
+            )
         joint_q_local = wp.zeros_like(state_out.joint_q)
         wp.launch(
             kernel=recenter_joint_q_xz, dim=len(state_out.joint_q),
