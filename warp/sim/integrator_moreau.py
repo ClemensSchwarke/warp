@@ -4004,6 +4004,22 @@ class MoreauIntegrator:
         # WpInterface from cfg.sim.contact_binning.
         self.contact_binning = True
 
+        # Fused contact solve. The contact-space matrix X = H^-1 * Jc^T is
+        # computed column by column (24 = 8 contact slots * 3). The legacy path
+        # splits Jc into 24 per-column vectors, launches 24 separate
+        # dense_solve_batched kernels (each only `articulation_count` threads —
+        # very low GPU occupancy), then recombines. When no autograd tape is
+        # being recorded (PPO / the checkpointed rollout forward) the whole
+        # split/solve/recombine is replaced by ONE dense_solve_batched launch
+        # over (articulation_count * 24) threads reading model.Jc and writing
+        # state_mid.Inv_M_times_Jc_t directly. Forward output is bit-identical;
+        # 24x more threads and 26->1 launches. The legacy per-column path is
+        # kept for the tape-recording case because dense_solve's adjoint does a
+        # non-atomic `adj_H += ...` that would race across the 24 concurrent
+        # columns of one env in a single fused adjoint launch. Set by
+        # WpInterface from cfg.sim.fused_contact_solve.
+        self.fused_contact_solve = True
+
     @staticmethod
     def _ensure_contact_metadata(model):
         """Provide backward-compatible defaults for flat contact selection."""
@@ -6803,6 +6819,134 @@ class MoreauIntegrator:
             device=model.device,
         )
 
+        # solve for X^T (X = H^-1*Jc^T).  When no autograd tape is recording
+        # (PPO or the checkpointed rollout forward) a single fused
+        # dense_solve_batched over (articulation_count * 24) threads replaces
+        # split_matrix + 24 per-column solves + create_matrix — bit-identical
+        # forward, 24x the GPU occupancy, 26 launches -> 1. The per-column path
+        # runs whenever a tape is active because dense_solve's non-atomic adjoint
+        # on H would race across an env's 24 columns in one fused adjoint launch.
+        if self.fused_contact_solve and wp.context.runtime.tape is None:
+            self._solve_inv_m_times_jct_fused(model, state_mid)
+        else:
+            self._eval_inv_m_times_jct_split(model, state_mid)
+
+        # compute G = Jc*(H^-1*Jc^T)
+        # kernel 14
+        matmul_batched(
+            model.articulation_count,
+            model.articulation_Jc_rows,  # m
+            model.articulation_Jc_rows,  # n
+            model.articulation_Jc_cols,  # intermediate dim
+            0,
+            1,
+            model.articulation_Jc_start,
+            model.articulation_Jc_start,
+            model.articulation_G_start,
+            model.Jc,
+            state_mid.Inv_M_times_Jc_t,
+            model.G,
+            device=model.device,
+        )
+
+        # convert G to matrix
+        # kernel 13
+        wp.launch(
+            kernel=convert_G_to_matrix,
+            dim=model.articulation_count,
+            inputs=[model.articulation_G_start, model.G],
+            outputs=[model.G_mat],
+            device=model.device,
+        )
+
+        # solve for x (x = H^-1*h(tau))
+        # kernel 12
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_dof_start,
+                model.articulation_H_start,
+                model.articulation_H_rows,
+                model.H,
+                model.L,
+                state_mid.joint_tau,
+                state_mid.tmp_inv_m_times_h,
+            ],
+            outputs=[state_mid.inv_m_times_h],
+            device=model.device,
+        )
+
+        # compute Jc*(H^-1*h(tau))
+        # kernel 11
+        matmul_batched(
+            model.articulation_count,
+            model.articulation_Jc_rows,  # m
+            model.articulation_vec_size,  # n
+            model.articulation_Jc_cols,  # intermediate dim
+            0,
+            0,
+            model.articulation_Jc_start,
+            model.articulation_dof_start,
+            model.articulation_contact_dim_start,
+            model.Jc,
+            state_mid.inv_m_times_h,
+            state_mid.Jc_times_inv_m_times_h,
+            device=model.device,
+        )
+
+        # compute Jc*qd
+        # kernel 10
+        matmul_batched(
+            model.articulation_count,
+            model.articulation_Jc_rows,  # m
+            model.articulation_vec_size,  # n
+            model.articulation_Jc_cols,  # intermediate dim
+            0,
+            0,
+            model.articulation_Jc_start,
+            model.articulation_dof_start,
+            model.articulation_contact_dim_start,
+            model.Jc,
+            state_in.joint_qd,
+            state_mid.Jc_qd,
+            device=model.device,
+        )
+
+        # compute Jc*qd + Jc*(H^-1*h(tau)) * dt
+        # kernel 9
+        wp.launch(
+            kernel=eval_dense_add_batched,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_Jc_rows,
+                model.articulation_contact_dim_start,
+                state_mid.Jc_qd,
+                state_mid.Jc_times_inv_m_times_h,
+                dt,
+            ],
+            outputs=[state_mid.c],
+            device=model.device,
+        )
+
+        # convert c to matrix/vector arrays
+        # kernel 8
+        wp.launch(
+            kernel=convert_c_to_vector,
+            dim=model.articulation_count,
+            inputs=[state_mid.c],
+            outputs=[state_mid.c_vec],
+            device=model.device,
+        )
+
+    def _eval_inv_m_times_jct_split(self, model, state_mid):
+        """Legacy per-column solve of X = H^-1 * Jc^T (24 contact-dim columns).
+
+        Splits model.Jc into 24 per-column vectors, launches 24 separate
+        dense_solve_batched kernels (each carrying dense_solve's analytic
+        per-column adjoint), then recombines into state_mid.Inv_M_times_Jc_t.
+        Used whenever a Warp tape is recording so the backward stays correct.
+        """
         # solve for X^T (X = H^-1*Jc^T)
         wp.launch(
             kernel=split_matrix,
@@ -7261,111 +7405,44 @@ class MoreauIntegrator:
             outputs=[state_mid.Inv_M_times_Jc_t],
         )
 
-        # compute G = Jc*(H^-1*Jc^T)
-        # kernel 14
-        matmul_batched(
-            model.articulation_count,
-            model.articulation_Jc_rows,  # m
-            model.articulation_Jc_rows,  # n
-            model.articulation_Jc_cols,  # intermediate dim
-            0,
-            1,
-            model.articulation_Jc_start,
-            model.articulation_Jc_start,
-            model.articulation_G_start,
-            model.Jc,
-            state_mid.Inv_M_times_Jc_t,
-            model.G,
-            device=model.device,
+    def _ensure_fused_solve_index(self, model):
+        """Build and cache the per-(env, contact-dim column) b_start offsets into
+        the contiguous model.Jc / state.Inv_M_times_Jc_t buffers (24 columns of
+        dof_count floats per articulation, row-major, matching split_matrix /
+        create_matrix). Constant per model, so computed once."""
+        if getattr(model, "_fused_solve_b_start", None) is not None:
+            return
+        ncols = 24  # 8 contact slots * 3, matches articulation_Jc_rows
+        n_art = int(model.articulation_count)
+        dof_count = int(model.joint_dof_count / n_art)
+        jc_start = model.articulation_Jc_start.numpy().tolist()
+        b_start = [int(jc_start[e]) + c * dof_count
+                   for e in range(n_art) for c in range(ncols)]
+        model._fused_solve_b_start = wp.array(
+            b_start, dtype=wp.int32, device=model.device
         )
 
-        # convert G to matrix
-        # kernel 13
-        wp.launch(
-            kernel=convert_G_to_matrix,
-            dim=model.articulation_count,
-            inputs=[model.articulation_G_start, model.G],
-            outputs=[model.G_mat],
-            device=model.device,
-        )
-
-        # solve for x (x = H^-1*h(tau))
-        # kernel 12
+    def _solve_inv_m_times_jct_fused(self, model, state_mid):
+        """Fused single-launch solve of X = H^-1 * Jc^T for all 24 contact-dim
+        columns at once: one dense_solve_batched over (articulation_count * 24)
+        threads, reading model.Jc and writing state_mid.Inv_M_times_Jc_t in the
+        same layout create_matrix would produce (bit-identical forward). Only
+        valid when no tape is recording (guarded by eval_contact_quantities).
+        """
+        self._ensure_fused_solve_index(model)
         wp.launch(
             kernel=eval_dense_solve_batched,
-            dim=model.articulation_count,
+            dim=int(model.articulation_count) * 24,
             inputs=[
-                model.articulation_dof_start,
-                model.articulation_H_start,
-                model.articulation_H_rows,
+                model._fused_solve_b_start,
+                model.articulation_H_start_matrix,
+                model.articulation_H_rows_matrix,
                 model.H,
                 model.L,
-                state_mid.joint_tau,
-                state_mid.tmp_inv_m_times_h,
+                model.Jc,
+                state_mid.Inv_M_times_Jc_t,  # tmp — unused by the forward solve
             ],
-            outputs=[state_mid.inv_m_times_h],
-            device=model.device,
-        )
-
-        # compute Jc*(H^-1*h(tau))
-        # kernel 11
-        matmul_batched(
-            model.articulation_count,
-            model.articulation_Jc_rows,  # m
-            model.articulation_vec_size,  # n
-            model.articulation_Jc_cols,  # intermediate dim
-            0,
-            0,
-            model.articulation_Jc_start,
-            model.articulation_dof_start,
-            model.articulation_contact_dim_start,
-            model.Jc,
-            state_mid.inv_m_times_h,
-            state_mid.Jc_times_inv_m_times_h,
-            device=model.device,
-        )
-
-        # compute Jc*qd
-        # kernel 10
-        matmul_batched(
-            model.articulation_count,
-            model.articulation_Jc_rows,  # m
-            model.articulation_vec_size,  # n
-            model.articulation_Jc_cols,  # intermediate dim
-            0,
-            0,
-            model.articulation_Jc_start,
-            model.articulation_dof_start,
-            model.articulation_contact_dim_start,
-            model.Jc,
-            state_in.joint_qd,
-            state_mid.Jc_qd,
-            device=model.device,
-        )
-
-        # compute Jc*qd + Jc*(H^-1*h(tau)) * dt
-        # kernel 9
-        wp.launch(
-            kernel=eval_dense_add_batched,
-            dim=model.articulation_count,
-            inputs=[
-                model.articulation_Jc_rows,
-                model.articulation_contact_dim_start,
-                state_mid.Jc_qd,
-                state_mid.Jc_times_inv_m_times_h,
-                dt,
-            ],
-            outputs=[state_mid.c],
-            device=model.device,
-        )
-
-        # convert c to matrix/vector arrays
-        # kernel 8
-        wp.launch(
-            kernel=convert_c_to_vector,
-            dim=model.articulation_count,
-            inputs=[state_mid.c],
-            outputs=[state_mid.c_vec],
+            outputs=[state_mid.Inv_M_times_Jc_t],
             device=model.device,
         )
 

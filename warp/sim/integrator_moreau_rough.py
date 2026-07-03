@@ -4964,6 +4964,21 @@ class MoreauRoughIntegrator(Integrator):
         # sub-integrator.
         self.contact_binning = True
 
+        # Fused contact solve (mirrors MoreauIntegrator). The contact-space
+        # matrix X = H^-1 * Jc^T is solved column by column (num_contacts * 3
+        # columns). The legacy path splits Jc, launches one dense_solve_batched
+        # per column (each only `articulation_count` threads), then recombines.
+        # When no autograd tape is recording (PPO / the checkpointed rollout
+        # forward) that whole block is replaced by ONE dense_solve_batched over
+        # (articulation_count * num_contacts * 3) threads reading self.Jc and
+        # writing state_mid.Inv_M_times_Jc_t directly — bit-identical forward,
+        # far higher GPU occupancy, and one launch instead of N+2. The legacy
+        # per-column path is kept whenever a tape is recording because
+        # dense_solve's non-atomic `adj_H += ...` would race across an env's
+        # columns in a single fused adjoint launch. Set by WpInterface from
+        # cfg.sim.fused_contact_solve.
+        self.fused_contact_solve = True
+
         self._step = 0
 
         # ---- Bundle-mode state (lazily allocated on first bundle simulate) ----
@@ -7876,7 +7891,18 @@ class MoreauRoughIntegrator(Integrator):
         4-contact path: 12 rows (4 contacts x 3 spatial dims). 8-contact path:
         24 rows. Each path goes through ``_active_eval_dense_solve_batched``,
         which uses the cached Cholesky factor ``self.L`` from ``eval_mass_matrix``.
+
+        Fast path: when no autograd tape is being recorded (PPO / the
+        checkpointed rollout forward) a single fused dense_solve_batched over
+        (articulation_count * num_contacts * 3) threads replaces the split /
+        per-column-solve / re-stack sequence. Forward output is bit-identical;
+        the per-column path runs whenever a tape is active because
+        dense_solve's non-atomic adjoint on H would race across an env's
+        columns in a fused adjoint launch.
         """
+        if self.fused_contact_solve and wp.context.runtime.tape is None:
+            self._solve_inv_m_times_jct_fused(model, state_mid)
+            return
         n_c = self.num_contacts
         if n_c == 4:
             wp.launch(
@@ -8009,3 +8035,46 @@ class MoreauRoughIntegrator(Integrator):
                 ],
                 outputs=[state_mid.Inv_M_times_Jc_t],
             )
+
+    def _ensure_fused_solve_index(self, model):
+        """Build and cache the per-(env, contact-dim column) index arrays for the
+        fused contact solve: b_start offsets into the contiguous self.Jc /
+        state.Inv_M_times_Jc_t (num_contacts*3 columns of dof_count floats per
+        articulation, matching split_matrix* / create_matrix*) and the matching
+        A_dim (H_rows) expansion. Constant per model, so computed once."""
+        if getattr(self, "_fused_solve_b_start", None) is not None:
+            return
+        ncols = int(self.num_contacts) * 3
+        n_art = int(model.articulation_count)
+        dof_count = int(self.dof_count)
+        jc_start = self.articulation_Jc_start.numpy().tolist()
+        h_rows = self.articulation_H_rows.numpy().tolist()
+        b_start = [int(jc_start[e]) + c * dof_count
+                   for e in range(n_art) for c in range(ncols)]
+        a_dim = [int(h_rows[e]) for e in range(n_art) for _ in range(ncols)]
+        self._fused_solve_b_start = wp.array(b_start, dtype=wp.int32, device=model.device)
+        self._fused_solve_a_dim = wp.array(a_dim, dtype=wp.int32, device=model.device)
+
+    def _solve_inv_m_times_jct_fused(self, model, state_mid):
+        """Fused single-launch solve of X = H^-1 * Jc^T for all num_contacts*3
+        contact-dim columns at once: one dense_solve_batched over
+        (articulation_count * num_contacts * 3) threads reading self.Jc and
+        writing state_mid.Inv_M_times_Jc_t in the same layout create_matrix*
+        would produce (bit-identical forward). Only valid when no tape is
+        recording (guarded by _solve_split_jc)."""
+        self._ensure_fused_solve_index(model)
+        wp.launch(
+            kernel=_active_eval_dense_solve_batched,
+            dim=int(model.articulation_count) * int(self.num_contacts) * 3,
+            inputs=[
+                self._fused_solve_b_start,
+                self.articulation_H_start_matrix,
+                self._fused_solve_a_dim,
+                self.H,
+                self.L,
+                self.Jc,
+                state_mid.Inv_M_times_Jc_t,  # tmp — unused by the forward solve
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t],
+            device=model.device,
+        )
