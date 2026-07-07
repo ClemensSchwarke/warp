@@ -404,6 +404,7 @@ def compute_link_transform(
     joint_X_pj: wp.array(dtype=wp.transform),
     joint_X_cm: wp.array(dtype=wp.transform),
     joint_axis: wp.array(dtype=wp.vec3),
+    joint_axis_start: wp.array(dtype=int),
     body_X_sc: wp.array(dtype=wp.transform),
     body_X_sm: wp.array(dtype=wp.transform),
 ):
@@ -416,7 +417,12 @@ def compute_link_transform(
         X_sp = body_X_sc[parent]
 
     type = joint_type[i]
-    axis = joint_axis[i]
+    # joint_axis is a per-AXIS array (one row per revolute/prismatic dof, none for
+    # the free base), indexed by joint_axis_start[i] — matching wp.sim.eval_fk and
+    # integrator_moreau_rough. Indexing it by the joint index i is only valid when
+    # the asset builder prepends a free-base axis row (the legacy layout); it reads
+    # the wrong (next joint's) axis for a standard per-axis model.joint_axis.
+    axis = joint_axis[joint_axis_start[i]]
     coord_start = joint_q_start[i]
 
     # compute transform across joint
@@ -444,6 +450,7 @@ def compute_link_velocity(
     joint_qd_start: wp.array(dtype=int),
     joint_qd: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
+    joint_axis_start: wp.array(dtype=int),
     body_I_m: wp.array(dtype=wp.spatial_matrix),
     body_X_sc: wp.array(dtype=wp.transform),
     body_X_sm: wp.array(dtype=wp.transform),
@@ -457,7 +464,8 @@ def compute_link_velocity(
     body_a_s: wp.array(dtype=wp.spatial_vector),
 ):
     type = joint_type[i]
-    axis = joint_axis[i]
+    # Per-AXIS joint_axis indexed by joint_axis_start[i] (see compute_link_transform).
+    axis = joint_axis[joint_axis_start[i]]
     parent = joint_parent[i]
     dof_start = joint_qd_start[i]
 
@@ -607,6 +615,7 @@ def eval_rigid_fk(
     joint_X_pj: wp.array(dtype=wp.transform),
     joint_X_cm: wp.array(dtype=wp.transform),
     joint_axis: wp.array(dtype=wp.vec3),
+    joint_axis_start: wp.array(dtype=int),
     body_X_sc: wp.array(dtype=wp.transform),
     body_X_sm: wp.array(dtype=wp.transform),
 ):
@@ -627,6 +636,7 @@ def eval_rigid_fk(
             joint_X_pj,
             joint_X_cm,
             joint_axis,
+            joint_axis_start,
             body_X_sc,
             body_X_sm,
         )
@@ -642,6 +652,7 @@ def eval_rigid_id(
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
     joint_axis: wp.array(dtype=wp.vec3),
+    joint_axis_start: wp.array(dtype=int),
     joint_target_ke: wp.array(dtype=float),
     joint_target_kd: wp.array(dtype=float),
     body_I_m: wp.array(dtype=wp.spatial_matrix),
@@ -672,6 +683,7 @@ def eval_rigid_id(
             joint_qd_start,
             joint_qd,
             joint_axis,
+            joint_axis_start,
             body_I_m,
             body_X_sc,
             body_X_sm,
@@ -5358,6 +5370,7 @@ class MoreauIntegrator:
                 model.joint_X_p,  # now, originally joint_X_pj
                 model.joint_X_cm,
                 model.joint_axis,
+                model.joint_axis_start,
             ],
             outputs=[state_mid.body_X_sc, state_mid.body_X_sm],
             device=model.device,
@@ -5377,6 +5390,7 @@ class MoreauIntegrator:
                 state_mid.joint_q,
                 state_in.joint_qd,
                 model.joint_axis,
+                model.joint_axis_start,
                 model.joint_target_ke,
                 model.joint_target_kd,
                 model.body_I_m,
@@ -5547,6 +5561,7 @@ class MoreauIntegrator:
                 model.joint_X_p,  # now, originally joint_X_pj
                 model.joint_X_cm,
                 model.joint_axis,
+                model.joint_axis_start,
             ],
             outputs=[state_out.body_X_sc, state_out.body_X_sm],
             device=model.device,
@@ -5566,6 +5581,7 @@ class MoreauIntegrator:
                 joint_q_local_out,
                 state_out.joint_qd,
                 model.joint_axis,
+                model.joint_axis_start,
                 model.joint_target_ke,
                 model.joint_target_kd,
                 model.body_I_m,
@@ -5827,6 +5843,7 @@ class MoreauIntegrator:
                 model.joint_X_p,
                 model.joint_X_cm,
                 model.joint_axis,
+                model.joint_axis_start,
             ],
             outputs=[state_mid.body_X_sc, state_mid.body_X_sm],
             device=device,
@@ -5845,6 +5862,7 @@ class MoreauIntegrator:
                 state_mid.joint_q,
                 state_in.joint_qd,
                 model.joint_axis,
+                model.joint_axis_start,
                 model.joint_target_ke,
                 model.joint_target_kd,
                 model.body_I_m,
@@ -6512,6 +6530,7 @@ class MoreauIntegrator:
                 model.joint_X_p,
                 model.joint_X_cm,
                 model.joint_axis,
+                model.joint_axis_start,
             ],
             outputs=[state_out.body_X_sc, state_out.body_X_sm],
             device=device,
@@ -6530,6 +6549,7 @@ class MoreauIntegrator:
                 rc_fk_jq,
                 state_out.joint_qd,
                 model.joint_axis,
+                model.joint_axis_start,
                 model.joint_target_ke,
                 model.joint_target_kd,
                 model.body_I_m,
