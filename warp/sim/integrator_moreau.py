@@ -3571,6 +3571,84 @@ def compute_do_average(
 
 
 @wp.kernel
+def compute_bundle_substep_flags(
+    # inputs (pre-stage state + fresh trigger detection)
+    bundle_active: wp.array(dtype=int),
+    cache_horizon_remaining: wp.array(dtype=int),
+    cache_is_continuation: wp.array(dtype=int),
+    bundle_trigger: wp.array(dtype=int),
+    contact_feet_mask: wp.array(dtype=int),
+    substep: int,
+    num_substeps: int,
+    horizon: int,
+    num_envs: int,
+    # outputs
+    readback: wp.array(dtype=int),
+    reperturb_mask: wp.array(dtype=int),
+):
+    """Predict every host-side control flag of this bundle substep in ONE pass
+    so the host needs a single D2H readback instead of 4-5 separate
+    ``.item()`` syncs.
+
+    Mirrors (bit-for-bit) the sequential per-env int logic of
+    ``stage_bundle_trigger`` -> ``decrement_cache_horizon`` ->
+    ``compute_do_average`` WITHOUT mutating any live state:
+
+      active_after = active_pre OR trigger        (stage)
+      rem_after    = trigger ? horizon : rem_pre  (stage)
+      reperturb    = active_after AND rem_after > 1   (read between stage
+                                                       and decrement)
+      rem_dec      = active_after AND rem_after > 0 ? rem_after - 1
+                                                    : rem_after (decrement)
+      do_average   = active_after AND (rem_dec == 0 OR last substep)
+
+    Layout of ``readback`` (size 8 + 2*num_envs):
+      [0] trigger count           [1] any active-after
+      [2] any reperturb           [3] any do_average
+      [4] any continuation (pre-clear)
+      [8 : 8+num_envs]            per-env trigger mask
+      [8+num_envs : 8+2*num_envs] per-env contact_feet_mask
+    The racy ``readback[i] = 1`` writes are same-value and benign.
+    """
+    tid = wp.tid()
+    active_pre = bundle_active[tid]
+    rem_pre = cache_horizon_remaining[tid]
+    trig = bundle_trigger[tid]
+
+    active_after = active_pre
+    rem_after = rem_pre
+    if trig == 1:
+        active_after = 1
+        rem_after = horizon
+
+    rep = 0
+    if active_after == 1 and rem_after > 1:
+        rep = 1
+    reperturb_mask[tid] = rep
+
+    rem_dec = rem_after
+    if active_after == 1 and rem_after > 0:
+        rem_dec = rem_after - 1
+
+    do_avg = 0
+    if active_after == 1 and (rem_dec == 0 or substep == num_substeps - 1):
+        do_avg = 1
+
+    if trig == 1:
+        wp.atomic_add(readback, 0, 1)
+    if active_after == 1:
+        readback[1] = 1
+    if rep == 1:
+        readback[2] = 1
+    if do_avg == 1:
+        readback[3] = 1
+    if cache_is_continuation[tid] == 1:
+        readback[4] = 1
+    readback[8 + tid] = trig
+    readback[8 + num_envs + tid] = contact_feet_mask[tid]
+
+
+@wp.kernel
 def set_pending_after_average(
     # inputs
     do_average: wp.array(dtype=int),
@@ -3982,11 +4060,31 @@ def recenter_compute_bundle_output_root_xz_ref(
 
 
 class MoreauIntegrator:
+    # Advertises support for the checkpointed-backward perturbation-delta
+    # record/replay protocol (see _init_bundle_branches /
+    # _detect_and_perturb_new_contacts). The checkpointed wrapper only engages
+    # the protocol when this is True.
+    _supports_delta_replay = True
+
     def __init__(self):
         self._bundle_initialized = False
         self.debug_print_bundle_inner = False
         self.debug_current_outer_call = 0
         self.debug_head_values = 6
+        # Perturbation-delta record/replay (checkpointed backward fast path).
+        # The staged perturbation deltas (delta_q_buf / delta_qd_buf and the
+        # reperturb apply masks) are DETACHED constants w.r.t. the tape, and
+        # their generation (FD FK Jacobian + CPU RNG draws + linalg solves) is
+        # the single most expensive host phase of a bundle substep. The
+        # checkpointed wrapper sets mode="record" during its rollout forward
+        # (deltas are cloned into the store, keyed by substep) and
+        # mode="replay" during the backward recompute (deltas are copied back
+        # from the store and the whole generation phase is skipped). The
+        # recompute is bit-identical either way — the RNG state is restored
+        # around the recompute, so a full re-run would regenerate the exact
+        # same deltas the store holds.
+        self._bundle_delta_mode = None
+        self._bundle_delta_store = None
         # Dedicated CPU generator for bundle perturbation sampling.
         # Using a separate generator (never the global RNG) ensures that bundle
         # operations — which fire on every trigger even when sigma==0 — do NOT
@@ -4173,6 +4271,12 @@ class MoreauIntegrator:
         # env/sample-count change drops stale-sized buffers.
         self._bundle_state_pools = {}
         self._bundle_mm_pool = []
+        # Generic per-(key, substep) scratch array pool (see _scratch) for the
+        # many small fresh wp.zeros a bundle substep otherwise allocates.
+        self._bundle_scratch_pool = {}
+        # Set around the inner rollout's simulate() call so its recentering
+        # scratch allocations can be pooled per OUTER substep.
+        self._scratch_inner_substep = None
 
         # Scratch buffers for iterative-IK FK evaluation during bundle perturbation.
         # Sized to the MAIN model (not bundle_model) — FK is run on main-model kinematics.
@@ -4216,6 +4320,35 @@ class MoreauIntegrator:
         st = pool[substep]
         self._zero_state_arrays(st)
         return st
+
+    def _scratch(self, key, substep, shape, dtype, device, requires_grad=False):
+        """Per-(key, substep) pooled zeroed scratch array.
+
+        When the bundle buffer pool is active (checkpointing + soft inner
+        mode, see :meth:`_bundle_pool_enabled`), returns a persistent
+        per-(key, substep) array value-zeroed on reuse — replacing the
+        fresh ``wp.zeros`` per substep (a synchronous cudaMalloc, plus a
+        device-syncing cudaFree when the old one is collected). Otherwise
+        falls back to a fresh allocation (original behavior).
+
+        Safety mirrors ``_pooled_state``: within one step()'s tape every
+        substep gets a DISTINCT slot (no aliasing on the tape); across
+        step()s a slot's values are only needed between one step's
+        (re)compute and its ``tape.backward()``, which never interleaves
+        with another step's use of the slot under checkpointing. ``.grad``
+        of requires_grad slots is zeroed by ``tape.reset()`` in
+        ``_reset_tape_state``.
+        """
+        if not getattr(self, "_pool_active", False):
+            return wp.zeros(shape, dtype=dtype, device=device, requires_grad=requires_grad)
+        pool = self._bundle_scratch_pool
+        arr = pool.get((key, substep))
+        if arr is None:
+            arr = wp.zeros(shape, dtype=dtype, device=device, requires_grad=requires_grad)
+            pool[(key, substep)] = arr
+        else:
+            arr.zero_()
+        return arr
 
     def _pooled_alloc_mm(self, bundle_model, substep, requires_grad):
         """Bind bundle_model's mass/contact matrices for this substep: a pooled
@@ -4418,6 +4551,99 @@ class MoreauIntegrator:
 
         return J_fd
 
+    def _ensure_fdfk_cmds(self, model, max_perturb_dof):
+        """Pre-recorded Launch command objects + persistent collection buffers
+        for the FD FK Jacobian sweep.
+
+        The sweep is 2*max_perturb_dof (FK + foot-state) launches on fixed
+        scratch buffers; a normal ``wp.launch`` spends its time re-packing the
+        ~20 kernel args on every call, which dominates the whole perturbation
+        phase. Recording the two launches once (``record_cmd=True``) and
+        replaying them with ``cmd.launch()`` — a raw ``cuda_launch_kernel``
+        on the same pre-packed params — is bit-identical and removes the
+        per-call marshaling. ``cmd.launch()`` uses the device's CURRENT
+        stream, so replays inside ``wp.ScopedStream(torch stream)`` are
+        ordered with the interleaved torch writes exactly like the original
+        per-call ``wp.launch``es were.
+        """
+        state = self._fk_scratch_state
+        key = (
+            id(model),
+            model.articulation_count,
+            int(max_perturb_dof),
+            self._fk_scratch_joint_q.ptr,
+            state.point_vec.ptr,
+        )
+        if getattr(self, "_fdfk_key", None) == key:
+            return self._fdfk_cmds
+        self._ensure_contact_metadata(model)
+        self._ensure_contact_bins(model)
+        fk_cmd = wp.launch(
+            kernel=eval_articulation_fk,
+            dim=model.articulation_count,
+            inputs=[
+                model.articulation_start,
+                None,
+                self._fk_scratch_joint_q,
+                self._fk_scratch_joint_qd,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_axis_start,
+                model.joint_axis_dim,
+                model.body_com,
+            ],
+            outputs=[state.body_q, state.body_qd],
+            device=model.device,
+            record_tape=False,
+            record_cmd=True,
+        )
+        foot_cmd = wp.launch(
+            kernel=get_foot_states,
+            dim=model.articulation_count,
+            inputs=[
+                model.rigid_contact_max,
+                model.articulation_count,
+                state.body_q,
+                state.body_qd,
+                model.rigid_contact_body0,
+                model.rigid_contact_point0,
+                model.rigid_contact_shape0,
+                model.shape_geo,
+                model.contact_body_offsets,
+                model.bodies_per_env,
+                int(model.num_contacts_per_env),
+                model.contact_local_pos,
+                model.contact_radius,
+                model.contact_local_x_sign,
+                model.contact_local_y_sign,
+                int(model.foot_only_contacts),
+                model.env_contact_ids,
+                model.env_contact_count,
+                model.max_contacts_per_env,
+                int(self.contact_binning),
+            ],
+            outputs=[state.point_vec, state.foot_vel],
+            device=model.device,
+            record_tape=False,
+            record_cmd=True,
+        )
+        torch_device = wp.device_to_torch(model.device)
+        num_envs = model.articulation_count
+        pv_t = wp.to_torch(state.point_vec).view(num_envs, 8, 3)
+        plus_buf = torch.zeros(
+            max_perturb_dof, num_envs, 8, 3, dtype=torch.float32, device=torch_device
+        )
+        minus_buf = torch.zeros_like(plus_buf)
+        self._fdfk_cmds = (fk_cmd, foot_cmd, pv_t, plus_buf, minus_buf)
+        self._fdfk_key = key
+        return self._fdfk_cmds
+
     def _compute_fd_leg_jacobians_batched(
         self, model, triggered_env_ids, active_groups_per_env,
         main_jq_snap, root_q_dim, coord_per_env, n_groups, max_perturb_dof, epsilon=1e-4
@@ -4438,9 +4664,6 @@ class MoreauIntegrator:
         e_tensor = torch.tensor(triggered_env_ids, device=torch_device, dtype=torch.long)
         dof_base = e_tensor * coord_per_env + root_q_dim  # (n_triggered,)
 
-        # J_fd_full[env, group*3+xyz, dof_i] for all groups and all perturbed DOFs
-        J_fd_full = torch.zeros(num_envs, n_groups * 3, max_perturb_dof, dtype=torch.float32, device=torch_device)
-
         # Run all 2*max_perturb_dof FK evaluations on torch's stream so the
         # interleaved torch writes to fk_jq_t and the Warp FK launches are
         # ordered on ONE stream. This lets us drop the per-call full-device sync
@@ -4451,31 +4674,84 @@ class MoreauIntegrator:
         # by body), so build them ONCE here and skip the per-FK rebuild inside the
         # loop — halves the FD-Jacobian kernel launches, bit-exact.
         self._ensure_contact_bins(model)
-        with wp.ScopedStream(wp.stream_from_torch()):
-            for i in range(max_perturb_dof):
-                dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
+        if getattr(self, "_bundle_fdfk_fast", True):
+            # Fast path: pre-recorded Launch commands (no per-call arg
+            # marshaling) + raw point_vec collection into persistent buffers;
+            # the group-center means and the central-difference are computed
+            # ONCE, batched over all DOF sweeps, after the loop. Elementwise
+            # math (mean over the same slot values, subtract, divide) is
+            # identical to the per-iteration version — bit-exact.
+            fk_cmd, foot_cmd, pv_t, plus_buf, minus_buf = self._ensure_fdfk_cmds(
+                model, max_perturb_dof
+            )
+            with wp.ScopedStream(wp.stream_from_torch()):
+                for i in range(max_perturb_dof):
+                    dof_indices = dof_base + i
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+                    fk_cmd.launch()
+                    foot_cmd.launch()
+                    plus_buf[i].copy_(pv_t)
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+                    fk_cmd.launch()
+                    foot_cmd.launch()
+                    minus_buf[i].copy_(pv_t)
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
+            group_slots = getattr(model, "bundle_group_sphere_slots", [[0], [1], [2], [3]])
+            cp = torch.stack(
+                [plus_buf[:, :, slots, :].mean(dim=2) for slots in group_slots], dim=2
+            )  # (max_perturb_dof, num_envs, n_groups, 3)
+            cm = torch.stack(
+                [minus_buf[:, :, slots, :].mean(dim=2) for slots in group_slots], dim=2
+            )
+            # J_fd_full[env, group*3+xyz, dof_i]
+            J_fd_full = (
+                ((cp - cm) / (2.0 * epsilon))
+                .reshape(max_perturb_dof, num_envs, n_groups * 3)
+                .permute(1, 2, 0)
+            )
+        else:
+            # Legacy per-iteration path (kept as a fallback / A-B reference).
+            J_fd_full = torch.zeros(
+                num_envs, n_groups * 3, max_perturb_dof, dtype=torch.float32, device=torch_device
+            )
+            with wp.ScopedStream(wp.stream_from_torch()):
+                for i in range(max_perturb_dof):
+                    dof_indices = dof_base + i  # absolute indices into fk_jq_t for all triggered envs
 
-                # Perturb DOF i for ALL triggered envs simultaneously, then run FK once.
-                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
-                # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
-                # the second FK call would overwrite fp_plus in-place without it.
-                fp_plus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True).clone()
+                    # Perturb DOF i for ALL triggered envs simultaneously, then run FK once.
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
+                    # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
+                    # the second FK call would overwrite fp_plus in-place without it.
+                    fp_plus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True).clone()
 
-                fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-                fp_minus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True)
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
+                    fp_minus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True)
 
-                fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
+                    fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
 
-                J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
+                    J_fd_full[:, :, i] = ((fp_plus - fp_minus) / (2.0 * epsilon)).reshape(num_envs, n_groups * 3)
 
-        # Slice out only the active-group rows for each env.
+        # Slice out only the active-group rows for each env. When every env
+        # shares the same active-group set (the common case — and the
+        # precondition of the batched perturbation helpers) one batched
+        # gather replaces the per-env advanced-indexing kernels; the dict
+        # entries are then cheap views of the gathered tensor. Non-uniform
+        # sets fall back to the per-env slicing.
         J_fd_dict = {}
-        for e in triggered_env_ids:
-            active_groups = active_groups_per_env.get(e, [])
-            if not active_groups:
-                continue
-            active_rows = [3 * g + xyz for g in active_groups for xyz in range(3)]
-            J_fd_dict[e] = J_fd_full[e][active_rows, :]  # (3*n_active_groups, max_perturb_dof)
+        valid = [e for e in triggered_env_ids if active_groups_per_env.get(e)]
+        if valid:
+            ag0 = active_groups_per_env[valid[0]]
+            uniform = all(active_groups_per_env[e] == ag0 for e in valid)
+            if uniform:
+                active_rows = [3 * g + xyz for g in ag0 for xyz in range(3)]
+                J_sel = J_fd_full[:, active_rows, :]  # (num_envs, task_dim, max_perturb_dof)
+                for e in valid:
+                    J_fd_dict[e] = J_sel[e]
+            else:
+                for e in valid:
+                    active_groups = active_groups_per_env[e]
+                    active_rows = [3 * g + xyz for g in active_groups for xyz in range(3)]
+                    J_fd_dict[e] = J_fd_full[e][active_rows, :]
 
         return J_fd_dict
 
@@ -4671,6 +4947,9 @@ class MoreauIntegrator:
         root_qd_dim,
         requires_grad,
         damping=1e-4,
+        substep=None,
+        triggered_list=None,
+        feet_mask_list=None,
     ):
         """Initialize bundle branch states with perturbations.
 
@@ -4713,6 +4992,49 @@ class MoreauIntegrator:
         dof_per_env = int(model.joint_dof_count / num_envs)
         leg_dof_count = dof_per_env - root_qd_dim
 
+        # --- Checkpointed-backward replay fast path -------------------------
+        # The deltas staged by this call are tape-detached constants; during
+        # the checkpointed backward recompute they are bit-identical to the
+        # rollout forward's (the RNG state is restored around the recompute),
+        # so replay them from the store instead of regenerating (FD FK
+        # Jacobian + RNG draws + solves — the dominant host cost).
+        if self._bundle_delta_mode == "replay" and self._bundle_delta_store is not None:
+            entry = self._bundle_delta_store.get(("init", substep))
+            if entry is not None:
+                dq_saved, dqd_saved = entry
+                # Device-to-device copies on Warp's stream: ordered with the
+                # kernel launch below, no host sync needed.
+                wp.copy(delta_q_buf, dq_saved)
+                wp.copy(delta_qd_buf, dqd_saved)
+            else:
+                # Defensive: a trigger substep must have a recorded entry
+                # (trigger detection is deterministic across fwd/recompute).
+                delta_q_buf.zero_()
+                delta_qd_buf.zero_()
+            wp.launch(
+                kernel=init_bundle_state_with_perturbation,
+                dim=num_envs,
+                inputs=[
+                    should_bundle,
+                    num_envs,
+                    num_bundle_samples,
+                    model.articulation_coord_start,
+                    model.articulation_dof_start,
+                    coord_per_env,
+                    dof_per_env,
+                    root_q_dim,
+                    root_qd_dim,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                    delta_q_buf,
+                    delta_qd_buf,
+                ],
+                outputs=[bundle_state_in.joint_q, bundle_state_in.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+            return
+
         # Generalised group configuration (backward-compatible defaults = ANYmal).
         n_groups = getattr(model, "bundle_n_groups", 4)
         group_dof_start = getattr(model, "bundle_group_dof_start", None)
@@ -4731,8 +5053,15 @@ class MoreauIntegrator:
         dqd_clamp = (-clamp_qd, clamp_qd) if clamp_qd > 0 else (-_INF, _INF)
 
         with torch.no_grad():
-            should_t = wp.to_torch(should_bundle)
-            triggered_envs = torch.where(should_t > 0)[0]
+            # Host-side trigger/feet masks: normally passed in from the fused
+            # flags readback in _simulate_bundle (one D2H covers the whole
+            # substep); fall back to reading them here when called standalone
+            # (tests / probes).
+            if triggered_list is None:
+                should_t = wp.to_torch(should_bundle)
+                triggered_list = torch.where(should_t > 0)[0].cpu().tolist()
+            if feet_mask_list is None:
+                feet_mask_list = wp.to_torch(contact_feet_mask).cpu().tolist()
 
             # Always zero the staging buffers — old contents must not leak through.
             delta_q_torch = wp.to_torch(delta_q_buf)
@@ -4744,13 +5073,7 @@ class MoreauIntegrator:
             if not hasattr(self, "_bundle_dq_range_max"):
                 self._bundle_dq_range_max = {}  # (ds, de) -> float max-abs ever seen
 
-            if len(triggered_envs) > 0:
-                feet_mask_t = wp.to_torch(contact_feet_mask)
-
-                # Move to CPU once to avoid per-element D2H sync overhead from .item() calls.
-                triggered_list = triggered_envs.cpu().tolist()
-                feet_mask_list = feet_mask_t.cpu().tolist()
-
+            if len(triggered_list) > 0:
                 # Pre-collect active groups for all triggered envs (shared across all modes).
                 # contact_feet_mask bits now correspond to group indices.
                 active_groups_per_env = {}
@@ -4762,14 +5085,23 @@ class MoreauIntegrator:
                         active_groups_per_env[e] = ag
                         valid_triggered.append(e)
 
+                # Test hook: force the per-env scalar loop (for batched-vs-scalar
+                # equivalence probes). Default False — zero production effect.
+                _force_scalar = getattr(self, "_bundle_force_scalar_perturb", False)
+
+                main_foot_pos_all = None
                 if perturbation_mode in ("jacobian", "iterative"):
-                    # Pre-compute main group-center positions for all envs once.
-                    # _run_fk_foot_pos returns (num_envs, n_groups, 3) group centers.
                     fk_jq = wp.to_torch(self._fk_scratch_joint_q)
                     fk_jqd = wp.to_torch(self._fk_scratch_joint_qd)
                     fk_jq.copy_(wp.to_torch(state_in.joint_q))
                     fk_jqd.zero_()
-                    main_foot_pos_all = self._run_fk_foot_pos(model).clone()  # (num_envs, n_groups, 3)
+                    # Main group-center positions are only consumed by the
+                    # iterative mode and the per-env scalar fallback loop —
+                    # the batched jacobian path never reads them, so skip the
+                    # extra FK + full-device sync there (computed lazily
+                    # below if the fallback loop does run).
+                    if perturbation_mode == "iterative" or _force_scalar:
+                        main_foot_pos_all = self._run_fk_foot_pos(model).clone()  # (num_envs, n_groups, 3)
                     # Keep a snapshot for restore during FD and iterative IK.
                     main_jq_snap = fk_jq.clone()
 
@@ -4796,9 +5128,6 @@ class MoreauIntegrator:
                 # loop for non-jacobian modes or non-uniform active groups.
                 # ------------------------------------------------------------------
                 batched_done = False
-                # Test hook: force the per-env scalar loop (for batched-vs-scalar
-                # equivalence probes). Default False — zero production effect.
-                _force_scalar = getattr(self, "_bundle_force_scalar_perturb", False)
                 if _force_scalar:
                     pass
                 elif perturbation_mode == "jacobian" and valid_triggered:
@@ -4824,6 +5153,16 @@ class MoreauIntegrator:
                             leg_dof_count, per_group_solve, group_dof_start, group_dof_end,
                         )
                         batched_done = True
+
+                if (
+                    not batched_done
+                    and perturbation_mode in ("jacobian", "iterative")
+                    and main_foot_pos_all is None
+                    and triggered_list
+                ):
+                    # Lazy main-FK for the scalar fallback loop (fk_jq was
+                    # restored to the main config by the FD-Jacobian helper).
+                    main_foot_pos_all = self._run_fk_foot_pos(model).clone()
 
                 for e in (triggered_list if not batched_done else ()):
                     active_groups = active_groups_per_env.get(e)
@@ -5020,6 +5359,13 @@ class MoreauIntegrator:
             # this implicitly; that sync is now opt-in, so make it explicit —
             # ONE sync per trigger-substep, vs the O(num_envs*samples) removed.)
             wp.synchronize_device()
+            if self._bundle_delta_mode == "record" and self._bundle_delta_store is not None:
+                # Clone the staged deltas for the checkpointed backward's
+                # replay (post-sync, so the torch writes are visible).
+                self._bundle_delta_store[("init", substep)] = (
+                    wp.clone(delta_q_buf),
+                    wp.clone(delta_qd_buf),
+                )
             wp.launch(
                 kernel=init_bundle_state_with_perturbation,
                 dim=num_envs,
@@ -5059,6 +5405,7 @@ class MoreauIntegrator:
         root_qd_dim,
         requires_grad,
         damping=1e-4,
+        substep=None,
     ):
         """Detect newly contacting feet mid-rollout and stage per-sample perturbations.
 
@@ -5076,6 +5423,37 @@ class MoreauIntegrator:
         coord_per_env = int(bundle_model.joint_coord_count / bundle_model.articulation_count)
         dof_per_env = int(bundle_model.joint_dof_count / bundle_model.articulation_count)
         leg_dof_count = dof_per_env - root_qd_dim
+
+        # --- Checkpointed-backward replay fast path (see _init_bundle_branches).
+        # The reperturb deltas + apply mask recorded during the rollout forward
+        # are replayed verbatim; the detection kernel, the D2H readback and the
+        # per-env Jacobian solves are all skipped. A missing entry means the
+        # forward's call returned without applying anything at this substep.
+        if self._bundle_delta_mode == "replay" and self._bundle_delta_store is not None:
+            entry = self._bundle_delta_store.get(("rep", substep))
+            if entry is None:
+                return
+            mask_saved, dq_saved, dqd_saved = entry
+            wp.copy(delta_q_buf, dq_saved)
+            wp.copy(delta_qd_buf, dqd_saved)
+            wp.launch(
+                kernel=apply_perturbation_to_bundle_slots,
+                dim=bundle_model.articulation_count,
+                inputs=[
+                    mask_saved,
+                    num_envs,
+                    coord_per_env,
+                    dof_per_env,
+                    root_q_dim,
+                    root_qd_dim,
+                    delta_q_buf,
+                    delta_qd_buf,
+                ],
+                outputs=[bundle_state_out.joint_q, bundle_state_out.joint_qd],
+                device=device,
+                record_tape=requires_grad,
+            )
+            return
         clamp_q  = getattr(self, "_bundle_perturbation_clamp_q",  0.1)
         clamp_qd = getattr(self, "_bundle_perturbation_clamp_qd", 0.5)
         _INF = 1e9
@@ -5225,8 +5603,18 @@ class MoreauIntegrator:
             getattr(self, "reperturb_event_count", 0) + int(apply_mask_host.sum().item())
         )
 
-        # 3) upload apply_mask and launch the in-place perturbation kernel
+        # 3) upload apply_mask and launch the in-place perturbation kernel.
+        # The delta buffers (and the mask upload) were staged by torch on
+        # torch's stream; the kernel below runs on Warp's stream — order the
+        # two with one sync (mirrors the explicit sync in _init_bundle_branches).
         apply_mask = wp.from_torch(apply_mask_host.to(torch_device))
+        wp.synchronize_device()
+        if self._bundle_delta_mode == "record" and self._bundle_delta_store is not None:
+            self._bundle_delta_store[("rep", substep)] = (
+                wp.clone(apply_mask),
+                wp.clone(delta_q_buf),
+                wp.clone(delta_qd_buf),
+            )
         wp.launch(
             kernel=apply_perturbation_to_bundle_slots,
             dim=bundle_model.articulation_count,
@@ -5311,13 +5699,23 @@ class MoreauIntegrator:
         # integrator's recenter_world_offset flag (set by the torch wrapper from
         # cfg.sim.recenter_world_offset; default True).
         recenter = bool(getattr(self, "recenter_world_offset", True))
+        # Inner-rollout scratch pooling: when this simulate() is the bundle's
+        # inner substep (marked by _scratch_inner_substep) and the bundle pool
+        # is active, the recentering scratch below comes from the per-(name,
+        # outer-substep) pool instead of fresh wp.zeros — same zeroed value
+        # semantics, no cudaMalloc/cudaFree churn.
+        _inner_ss = getattr(self, "_scratch_inner_substep", None)
+        _inner_pooled = getattr(self, "_pool_active", False) and _inner_ss is not None
         p_ref = None
         q_local_in = state_in.joint_q
         if recenter and model.joint_count:
             art_count = model.articulation_count
             coord_per_env = int(len(state_in.joint_q) // max(art_count, 1))
             self._recenter_coord_per_env = coord_per_env
-            p_ref = wp.zeros(art_count, dtype=wp.vec3, device=model.device)
+            if _inner_pooled:
+                p_ref = self._scratch("in_p_ref", _inner_ss, art_count, wp.vec3, model.device)
+            else:
+                p_ref = wp.zeros(art_count, dtype=wp.vec3, device=model.device)
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=art_count,
@@ -5326,10 +5724,16 @@ class MoreauIntegrator:
                 device=model.device,
                 record_tape=False,
             )
-            q_local_in = wp.zeros(
-                len(state_in.joint_q), dtype=float, device=model.device,
-                requires_grad=requires_grad,
-            )
+            if _inner_pooled:
+                q_local_in = self._scratch(
+                    "in_q_local", _inner_ss, len(state_in.joint_q), float,
+                    model.device, requires_grad=requires_grad,
+                )
+            else:
+                q_local_in = wp.zeros(
+                    len(state_in.joint_q), dtype=float, device=model.device,
+                    requires_grad=requires_grad,
+                )
             wp.launch(
                 kernel=recenter_joint_q_xz,
                 dim=len(state_in.joint_q),
@@ -5519,7 +5923,13 @@ class MoreauIntegrator:
         # are state_out.joint_q and q_local_in is state_in.joint_q -> identical
         # to the legacy path.
         if recenter and p_ref is not None:
-            joint_q_local_out = wp.zeros_like(state_out.joint_q)
+            if _inner_pooled:
+                joint_q_local_out = self._scratch(
+                    "in_jq_out", _inner_ss, len(state_out.joint_q), float,
+                    model.device, requires_grad=state_out.joint_q.requires_grad,
+                )
+            else:
+                joint_q_local_out = wp.zeros_like(state_out.joint_q)
         else:
             joint_q_local_out = state_out.joint_q
         wp.launch(
@@ -5605,7 +6015,14 @@ class MoreauIntegrator:
         # The body_X_sc above is env-local, so body_q lands local and is shifted
         # to world below; body_qd is frame-invariant.
         if recenter and p_ref is not None:
-            out_body_q = wp.zeros_like(state_out.body_q)
+            if _inner_pooled:
+                out_body_q = self._scratch(
+                    "in_body_q", _inner_ss, len(state_out.body_q),
+                    state_out.body_q.dtype, model.device,
+                    requires_grad=state_out.body_q.requires_grad,
+                )
+            else:
+                out_body_q = wp.zeros_like(state_out.body_q)
         else:
             out_body_q = state_out.body_q
         wp.launch(
@@ -5626,7 +6043,14 @@ class MoreauIntegrator:
         # get_foot_states
         # kernel -2
         if recenter and p_ref is not None:
-            out_point_vec = wp.zeros_like(state_out.point_vec)
+            if _inner_pooled:
+                out_point_vec = self._scratch(
+                    "in_point_vec", _inner_ss, len(state_out.point_vec),
+                    state_out.point_vec.dtype, model.device,
+                    requires_grad=state_out.point_vec.requires_grad,
+                )
+            else:
+                out_point_vec = wp.zeros_like(state_out.point_vec)
         else:
             out_point_vec = state_out.point_vec
         wp.launch(
@@ -5781,7 +6205,7 @@ class MoreauIntegrator:
         rc_p_ref = None
         rc_saved_state_in_q = None
         if recenter:
-            rc_p_ref = wp.zeros(num_envs, dtype=wp.vec3, device=device)
+            rc_p_ref = self._scratch("rc_p_ref", substep, num_envs, wp.vec3, device)
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=num_envs,
@@ -5791,8 +6215,8 @@ class MoreauIntegrator:
                 record_tape=False,
             )
             rc_saved_state_in_q = state_in.joint_q
-            _q_local = wp.zeros(
-                len(state_in.joint_q), dtype=float, device=device,
+            _q_local = self._scratch(
+                "rc_q_local", substep, len(state_in.joint_q), float, device,
                 requires_grad=requires_grad,
             )
             wp.launch(
@@ -5997,6 +6421,86 @@ class MoreauIntegrator:
         )
 
         # ============================================================
+        # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
+        # detect_bundle_contacts unconditionally fills contact_feet_mask from
+        # the current point_vec (soft col_height), but only sets
+        # bundle_trigger=1 for envs with bundle_active==0 (cache-active envs are
+        # suppressed from re-trigger) AND with a real load-bearing contact
+        # (percussion above force_thresh) — so full-flight envs run the cheap
+        # normal step instead of bundling.
+        # (Runs BEFORE the continuation refresh block — detection only reads
+        # Phase A outputs, and hoisting it lets the fused flags kernel below
+        # serve every host-side gate of this substep with ONE readback.)
+        # ============================================================
+        force_thresh = float(getattr(self, "_bundle_contact_force_thresh", 1e-6))
+        bundle_trigger = self._scratch("trigger", substep, num_envs, int, device)
+        contact_feet_mask = self._scratch("feet_mask", substep, num_envs, int, device)
+
+        wp.launch(
+            kernel=detect_bundle_contacts,
+            dim=num_envs,
+            inputs=[state_mid.point_vec, model.col_height, state_mid.percussion, force_thresh,
+                    bundle_active, model.bundle_slot_to_group],
+            outputs=[bundle_trigger, contact_feet_mask],
+            device=device,
+            record_tape=False,
+        )
+
+        # ============================================================
+        # Phase B-flags: ONE fused flags pass + ONE D2H readback replaces the
+        # 4-5 separate ``.item()`` syncs this substep used to make (trigger
+        # count / any-active / reperturb gate / do-average / continuation) plus
+        # _init_bundle_branches' own two ``.cpu()`` mask readbacks. The kernel
+        # PREDICTS the post-stage/post-decrement values with the exact same
+        # int logic the live kernels apply later — see its docstring. During a
+        # checkpointed-backward recompute the (deterministic) host flags are
+        # replayed from the delta store and the readback is skipped entirely.
+        # ============================================================
+        reperturb_mask_wp = self._scratch("reperturb_mask", substep, num_envs, int, device)
+        _replay_flags = None
+        if self._bundle_delta_mode == "replay" and self._bundle_delta_store is not None:
+            _replay_flags = self._bundle_delta_store.get(("flags", substep))
+        if _replay_flags is not None:
+            (_trig_count, any_active, any_reperturb, any_avg,
+             any_continuation, triggered_list, feet_mask_list) = _replay_flags
+        else:
+            flags_readback = self._scratch(
+                "flags_readback", substep, 8 + 2 * num_envs, int, device
+            )
+            wp.launch(
+                kernel=compute_bundle_substep_flags,
+                dim=num_envs,
+                inputs=[
+                    bundle_active,
+                    self._cache_horizon_remaining,
+                    self._cache_is_continuation,
+                    bundle_trigger,
+                    contact_feet_mask,
+                    substep,
+                    num_substeps,
+                    bundle_horizon_substeps,
+                    num_envs,
+                ],
+                outputs=[flags_readback, reperturb_mask_wp],
+                device=device,
+                record_tape=False,
+            )
+            rb = wp.to_torch(flags_readback).cpu()  # the substep's single D2H sync
+            _trig_count = int(rb[0])
+            any_active = bool(rb[1])
+            any_reperturb = bool(rb[2])
+            any_avg = bool(rb[3])
+            any_continuation = (substep == 0) and bool(rb[4])
+            trig_mask_list = rb[8:8 + num_envs].tolist()
+            triggered_list = [e for e in range(num_envs) if trig_mask_list[e]]
+            feet_mask_list = rb[8 + num_envs:8 + 2 * num_envs].tolist()
+            if self._bundle_delta_mode == "record" and self._bundle_delta_store is not None:
+                self._bundle_delta_store[("flags", substep)] = (
+                    _trig_count, any_active, any_reperturb, any_avg,
+                    any_continuation, triggered_list, feet_mask_list,
+                )
+
+        # ============================================================
         # Phase B-pre: ACTION REFRESH FOR CONTINUATION ENVS (substep 0 only)
         # If any env entered this step with cache_is_continuation==1 (its
         # bundle horizon spans this step()), refresh its bundle slots' actions
@@ -6015,60 +6519,34 @@ class MoreauIntegrator:
         # envs from the committed averaged state in state_in). A fresh
         # allocation per substep keeps the tape adjoint reading the values
         # this substep actually saw.
-        continuation_mask = wp.zeros(num_envs, dtype=int, device=device)
-        any_continuation = False
-        if substep == 0:
-            any_continuation = bool(wp.to_torch(self._cache_is_continuation).any().item())
-            if any_continuation:
-                # Snapshot the continuation flag — the live ``self._cache_is_continuation``
-                # is cleared off-tape immediately after the copy, and is also
-                # rewritten in later step()'s, so the tape adjoint would
-                # otherwise re-read a zeroed mask and skip the gradient
-                # propagation from bundle_model.joint_target back to
-                # model.joint_target for continuation envs.
-                wp.launch(
-                    kernel=copy_int_array,
-                    dim=num_envs,
-                    inputs=[self._cache_is_continuation],
-                    outputs=[continuation_mask],
-                    device=device,
-                    record_tape=False,
-                )
-                wp.launch(
-                    kernel=clear_continuation_flags,
-                    dim=num_envs,
-                    inputs=[],
-                    outputs=[self._cache_is_continuation],
-                    device=device,
-                    record_tape=False,
-                )
-                # The actual action refresh is performed by the COMBINED
-                # refresh launch after Phase B' (one single-write rebuild of
-                # the bundle action buffers covering continuation AND trigger
-                # envs while carrying every other env's actions forward).
-
-        # ============================================================
-        # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
-        # detect_bundle_contacts unconditionally fills contact_feet_mask from
-        # the current point_vec (soft col_height), but only sets
-        # bundle_trigger=1 for envs with bundle_active==0 (cache-active envs are
-        # suppressed from re-trigger) AND with a real load-bearing contact
-        # (percussion above force_thresh) — so full-flight envs run the cheap
-        # normal step instead of bundling.
-        # ============================================================
-        force_thresh = float(getattr(self, "_bundle_contact_force_thresh", 1e-6))
-        bundle_trigger = wp.zeros(num_envs, dtype=int, device=device)
-        contact_feet_mask = wp.zeros(num_envs, dtype=int, device=device)
-
-        wp.launch(
-            kernel=detect_bundle_contacts,
-            dim=num_envs,
-            inputs=[state_mid.point_vec, model.col_height, state_mid.percussion, force_thresh,
-                    bundle_active, model.bundle_slot_to_group],
-            outputs=[bundle_trigger, contact_feet_mask],
-            device=device,
-            record_tape=False,
-        )
+        continuation_mask = self._scratch("cont_mask", substep, num_envs, int, device)
+        if substep == 0 and any_continuation:
+            # Snapshot the continuation flag — the live ``self._cache_is_continuation``
+            # is cleared off-tape immediately after the copy, and is also
+            # rewritten in later step()'s, so the tape adjoint would
+            # otherwise re-read a zeroed mask and skip the gradient
+            # propagation from bundle_model.joint_target back to
+            # model.joint_target for continuation envs.
+            wp.launch(
+                kernel=copy_int_array,
+                dim=num_envs,
+                inputs=[self._cache_is_continuation],
+                outputs=[continuation_mask],
+                device=device,
+                record_tape=False,
+            )
+            wp.launch(
+                kernel=clear_continuation_flags,
+                dim=num_envs,
+                inputs=[],
+                outputs=[self._cache_is_continuation],
+                device=device,
+                record_tape=False,
+            )
+            # The actual action refresh is performed by the COMBINED
+            # refresh launch after Phase B' (one single-write rebuild of
+            # the bundle action buffers covering continuation AND trigger
+            # envs while carrying every other env's actions forward).
 
         # ============================================================
         # Phase B': TRIGGER PROCESSING
@@ -6099,8 +6577,8 @@ class MoreauIntegrator:
         rc_saved_chain_in_q = None
         if recenter:
             rc_saved_chain_in_q = chain_in.joint_q
-            _chain_local = wp.zeros(
-                len(chain_in.joint_q), dtype=float, device=device,
+            _chain_local = self._scratch(
+                "rc_chain_local", substep, len(chain_in.joint_q), float, device,
                 requires_grad=requires_grad,
             )
             wp.launch(
@@ -6118,10 +6596,8 @@ class MoreauIntegrator:
         # under checkpointing+soft (see _pooled_state).
         init_state = self._pooled_state(bundle_model, "init", substep, requires_grad, lite=True)
 
-        # Reuse the host sync below to also accumulate a contact-trigger
-        # diagnostic (how many envs opened a bundle window). Off-tape, no extra
-        # device sync vs the original .any() check.
-        _trig_count = int(wp.to_torch(bundle_trigger).sum().item())
+        # Contact-trigger diagnostic (how many envs opened a bundle window) —
+        # the count comes from the fused flags readback above.
         self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
         self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
         any_triggered = _trig_count > 0
@@ -6134,6 +6610,9 @@ class MoreauIntegrator:
                 num_bundle_samples, bundle_sigma_pos, bundle_sigma_vel,
                 self._delta_q_buf, self._delta_qd_buf,
                 root_q_dim, root_qd_dim, requires_grad,
+                substep=substep,
+                triggered_list=triggered_list,
+                feet_mask_list=feet_mask_list,
             )
 
             # 2) Stage trigger flags: bundle_active=1, horizon=H.
@@ -6161,12 +6640,16 @@ class MoreauIntegrator:
         if any_continuation or any_triggered:
             joint_act_old = bundle_model.joint_act
             joint_target_old = bundle_model.joint_target
-            bundle_model.joint_act = wp.zeros(
-                bundle_model.joint_dof_count, dtype=float, device=device,
+            # Pool-safe: the "old" arrays read below are either the wrapper's
+            # per-step fresh buffers (substep 0) or an EARLIER substep's slot
+            # of this pool (later refreshes) — never this substep's slot, so
+            # zero-on-reuse cannot clobber a value still to be read.
+            bundle_model.joint_act = self._scratch(
+                "bundle_act", substep, bundle_model.joint_dof_count, float, device,
                 requires_grad=requires_grad,
             )
-            bundle_model.joint_target = wp.zeros(
-                bundle_model.joint_coord_count, dtype=float, device=device,
+            bundle_model.joint_target = self._scratch(
+                "bundle_tgt", substep, bundle_model.joint_coord_count, float, device,
                 requires_grad=requires_grad,
             )
             # Env-major launch — keeps the adjoint accumulation into
@@ -6207,7 +6690,7 @@ class MoreauIntegrator:
         # per substep (not a shared persistent buffer) so multi-step backward
         # — where multiple step()'s forwards run before any backward — does
         # not overwrite earlier steps' snapshots in place.
-        bundle_active_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        bundle_active_snapshot = self._scratch("active_snap", substep, num_envs, int, device)
         wp.launch(
             kernel=copy_int_array,
             dim=num_envs,
@@ -6217,7 +6700,9 @@ class MoreauIntegrator:
             record_tape=False,
         )
 
-        any_active = bool(wp.to_torch(bundle_active).any().item())
+        # any_active comes from the fused flags readback (predicted
+        # post-stage value: active_pre OR trigger — identical to reading
+        # bundle_active here, after stage_bundle_trigger ran).
         if any_active:
             # b_in is the inner-step state_in (joint_q/qd only read by the
             # inner moreau pipeline; contact scratch is written on b_mid) -> lite.
@@ -6256,13 +6741,19 @@ class MoreauIntegrator:
             b_out_pred = self._pooled_state(bundle_model, "bpred", substep, requires_grad, lite=True)
             self._pooled_alloc_mm(bundle_model, substep, requires_grad)
 
-            self.simulate(
-                bundle_model, b_in, b_out_pred, b_mid, chain_out,
-                dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
-                peak_torque, velocity_limit,
-                mode=inner_mode,
-                substep=0, num_substeps=1,
-            )
+            # Mark the OUTER substep so the inner simulate()'s recentering
+            # scratch allocations can be pooled per (name, outer substep).
+            self._scratch_inner_substep = substep
+            try:
+                self.simulate(
+                    bundle_model, b_in, b_out_pred, b_mid, chain_out,
+                    dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
+                    peak_torque, velocity_limit,
+                    mode=inner_mode,
+                    substep=0, num_substeps=1,
+                )
+            finally:
+                self._scratch_inner_substep = None
             if self.debug_print_bundle_inner:
                 _print_bundle_inner_debug(
                     self.debug_current_outer_call,
@@ -6285,19 +6776,16 @@ class MoreauIntegrator:
             # simulate output, mirroring the original behavior (which only
             # ran reperturb for h < H-1) and avoiding an extra in-place
             # write to chain_out on the tape at horizon-end substeps.
-            cache_rem_torch = wp.to_torch(self._cache_horizon_remaining)
-            active_torch = wp.to_torch(bundle_active)
-            reperturb_mask_torch = (
-                ((cache_rem_torch > 1) & (active_torch == 1)).to(torch.int32)
-            )
-            if bool(reperturb_mask_torch.any().item()):
-                reperturb_mask = wp.from_torch(reperturb_mask_torch.contiguous())
+            # Gate + per-env mask come from the fused flags pass (identical
+            # logic evaluated between stage and decrement) — no extra sync.
+            if any_reperturb:
                 self._detect_and_perturb_new_contacts(
-                    bundle_model, chain_out, contact_feet_mask, reperturb_mask,
+                    bundle_model, chain_out, contact_feet_mask, reperturb_mask_wp,
                     num_bundle_samples, model,
                     bundle_sigma_pos, bundle_sigma_vel,
                     self._delta_q_buf, self._delta_qd_buf,
                     root_q_dim, root_qd_dim, requires_grad,
+                    substep=substep,
                 )
 
             # Decrement horizon counter for cache-active envs (non-tape).
@@ -6316,7 +6804,7 @@ class MoreauIntegrator:
         # bundle samples are averaged into the per-substep pending slot, and
         # the pending flag is set so the merge writes state_out this substep.
         # ============================================================
-        do_average = wp.zeros(num_envs, dtype=int, device=device)
+        do_average = self._scratch("do_avg", substep, num_envs, int, device)
         wp.launch(
             kernel=compute_do_average,
             dim=num_envs,
@@ -6332,13 +6820,16 @@ class MoreauIntegrator:
         # Pending q/qd are also fresh per substep — they carry the bundle
         # gradient from the average kernel into merge_state_transitions, and
         # must not be shared across substeps or across step()'s.
-        pending_bundle_q_slot = wp.zeros(
-            model.joint_coord_count, dtype=float, device=device, requires_grad=requires_grad,
+        pending_bundle_q_slot = self._scratch(
+            "pend_q", substep, model.joint_coord_count, float, device,
+            requires_grad=requires_grad,
         )
-        pending_bundle_qd_slot = wp.zeros(
-            model.joint_dof_count, dtype=float, device=device, requires_grad=requires_grad,
+        pending_bundle_qd_slot = self._scratch(
+            "pend_qd", substep, model.joint_dof_count, float, device,
+            requires_grad=requires_grad,
         )
-        any_avg = bool(wp.to_torch(do_average).any().item())
+        # any_avg comes from the fused flags readback (predicted
+        # post-decrement value — identical to reading do_average here).
         if any_avg:
             wp.launch(
                 kernel=average_bundle_into_buffer,
@@ -6385,8 +6876,8 @@ class MoreauIntegrator:
         # would re-read post-bookkeeping values and route gradient through the
         # wrong branch.
         # ============================================================
-        pending_has_result_snapshot = wp.zeros(num_envs, dtype=int, device=device)
-        pending_target_substep_snapshot = wp.zeros(num_envs, dtype=int, device=device)
+        pending_has_result_snapshot = self._scratch("pend_has_snap", substep, num_envs, int, device)
+        pending_target_substep_snapshot = self._scratch("pend_tgt_snap", substep, num_envs, int, device)
         wp.launch(
             kernel=copy_int_array,
             dim=num_envs,
@@ -6409,7 +6900,13 @@ class MoreauIntegrator:
         # in-place +constant adjoint doubling). joint_qd is frame-invariant and
         # goes straight to state_out. Without recentering this is state_out.joint_q.
         if recenter:
-            rc_merged_jq = wp.zeros_like(state_out.joint_q)
+            rc_merged_jq = (
+                self._scratch(
+                    "rc_merged_jq", substep, len(state_out.joint_q), float, device,
+                    requires_grad=state_out.joint_q.requires_grad,
+                )
+                if self._pool_active else wp.zeros_like(state_out.joint_q)
+            )
         else:
             rc_merged_jq = state_out.joint_q
         wp.launch(
@@ -6477,7 +6974,7 @@ class MoreauIntegrator:
         # outputs back by the combined frame offset.
         # ============================================================
         if recenter:
-            rc_fk_p_ref = wp.zeros(num_envs, dtype=wp.vec3, device=device)
+            rc_fk_p_ref = self._scratch("rc_fk_p_ref", substep, num_envs, wp.vec3, device)
             if any_avg:
                 wp.launch(
                     kernel=recenter_compute_bundle_output_root_xz_ref,
@@ -6495,7 +6992,13 @@ class MoreauIntegrator:
                     device=device,
                     record_tape=False,
                 )
-            rc_fk_jq = wp.zeros_like(state_out.joint_q)
+            rc_fk_jq = (
+                self._scratch(
+                    "rc_fk_jq", substep, len(state_out.joint_q), float, device,
+                    requires_grad=state_out.joint_q.requires_grad,
+                )
+                if self._pool_active else wp.zeros_like(state_out.joint_q)
+            )
             wp.launch(
                 kernel=recenter_joint_q_xz,
                 dim=len(state_out.joint_q),
@@ -6503,7 +7006,7 @@ class MoreauIntegrator:
                 outputs=[rc_fk_jq],
                 device=device,
             )
-            rc_output_p_ref = wp.zeros(num_envs, dtype=wp.vec3, device=device)
+            rc_output_p_ref = self._scratch("rc_out_p_ref", substep, num_envs, wp.vec3, device)
             wp.launch(
                 kernel=recenter_add_xz_refs,
                 dim=num_envs,
@@ -6570,7 +7073,14 @@ class MoreauIntegrator:
 
         # body position and velocity in inertial frame (kernel 0)
         if recenter:
-            rc_out_body_q = wp.zeros_like(state_out.body_q)
+            rc_out_body_q = (
+                self._scratch(
+                    "rc_out_body_q", substep, len(state_out.body_q),
+                    state_out.body_q.dtype, device,
+                    requires_grad=state_out.body_q.requires_grad,
+                )
+                if self._pool_active else wp.zeros_like(state_out.body_q)
+            )
         else:
             rc_out_body_q = state_out.body_q
         wp.launch(
@@ -6590,7 +7100,14 @@ class MoreauIntegrator:
 
         # get_foot_states (kernel -2)
         if recenter:
-            rc_out_point_vec = wp.zeros_like(state_out.point_vec)
+            rc_out_point_vec = (
+                self._scratch(
+                    "rc_out_point_vec", substep, len(state_out.point_vec),
+                    state_out.point_vec.dtype, device,
+                    requires_grad=state_out.point_vec.requires_grad,
+                )
+                if self._pool_active else wp.zeros_like(state_out.point_vec)
+            )
         else:
             rc_out_point_vec = state_out.point_vec
         self._ensure_contact_bins(model)
@@ -6651,8 +7168,8 @@ class MoreauIntegrator:
             # The updated per-sample cache (chain_out) goes back to world for the
             # next substep/step (kept world between calls). Re-point chain[substep+1]
             # at the world array (distinct src/dst, single write, no aliasing).
-            _chain_out_world = wp.zeros(
-                len(chain_out.joint_q), dtype=float, device=device,
+            _chain_out_world = self._scratch(
+                "rc_chain_world", substep, len(chain_out.joint_q), float, device,
                 requires_grad=requires_grad,
             )
             wp.launch(
