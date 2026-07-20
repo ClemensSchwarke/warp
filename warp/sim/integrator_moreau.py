@@ -3122,6 +3122,7 @@ def average_bundle_into_buffer(
     coord_count: int,
     dof_count: int,
     root_q_dim: int,
+    root_qd_is_root_centered: int,
     # outputs
     bundle_avg_q: wp.array(dtype=float),
     bundle_avg_qd: wp.array(dtype=float),
@@ -3132,11 +3133,10 @@ def average_bundle_into_buffer(
     writes to bundle_avg_q / bundle_avg_qd, which have the same per-env layout as
     the main joint_q / joint_qd.
 
-    When root_q_dim == 7 (floating-base free joint), the quaternion at indices
-    [main_q_start+3 .. main_q_start+6] is averaged in the tangent space of
-    sample 0's quaternion. Each sample contributes the short-arc rotation vector
-    from the reference to that sample; the mean rotation vector is then mapped
-    back to quaternion space and composed with the reference quaternion.
+    When root_q_dim == 7 (floating-base free joint), quaternions are hemisphere-
+    aligned to sample 0 and averaged with an anchored chordal mean. The result is
+    intentionally not renormalized here so identical branches preserve exact
+    forward and adjoint identity; the next integration normalizes it.
 
     Non-triggered envs leave the buffer slot untouched.
     """
@@ -3241,7 +3241,14 @@ def average_bundle_into_buffer(
             delta_sum = delta_sum + (bundle_joint_q[bundle_q_start + qi] - ref)
         bundle_avg_q[main_q_start + qi] = ref + delta_sum * inv_n
 
-    # Average joint_qd (spatial velocity — pure tangent vector, no sign issues).
+    # Average joint_qd. Revolute rates and angular root velocity are ordinary
+    # tangent vectors. With recentering, however, each branch's root spatial
+    # bottom is expressed about that branch's own ground-projected root, so the
+    # raw components cannot be interpreted without their root height. Leave
+    # those three outputs unwritten here and emit their corrected values exactly
+    # once below. Warp's reverse pass does not support a kernel reading and then
+    # overwriting one of its own outputs reliably.
+    centered_free_root = root_q_dim == 7 and root_qd_is_root_centered != 0
     for qdi in range(dof_count):
         ref_qd_start = tid * dof_count
         ref = bundle_joint_qd[ref_qd_start + qdi]
@@ -3250,7 +3257,76 @@ def average_bundle_into_buffer(
             bundle_slot = s * num_envs + tid
             bundle_qd_start = bundle_slot * dof_count
             delta_sum = delta_sum + (bundle_joint_qd[bundle_qd_start + qdi] - ref)
-        bundle_avg_qd[main_qd_start + qdi] = ref + delta_sum * inv_n
+        if not (centered_free_root and qdi >= 3 and qdi < 6):
+            bundle_avg_qd[main_qd_start + qdi] = ref + delta_sum * inv_n
+
+    if centered_free_root:
+        # Average physical root-origin linear velocities, then encode the mean
+        # back into the root-horizontal-centred spatial convention:
+        #
+        #   u_i = v_i + omega_i x (0, y_i, 0)
+        #   v_bar = mean(u_i) - omega_bar x (0, mean(y_i), 0)
+        #
+        # Starting from mean(v_i), the needed term is the covariance
+        # mean((omega_i-omega_bar) x (0,y_i-y_bar,0)). Expressing it this way
+        # makes the correction bit-exact zero for identical/zero-noise branches,
+        # preserving the existing soft/bundle identity regression.
+        ref_q_start = tid * coord_count
+        ref_qd_start = tid * dof_count
+        y_ref = bundle_joint_q[ref_q_start + 1]
+        omega_ref = wp.vec3(
+            bundle_joint_qd[ref_qd_start + 0],
+            bundle_joint_qd[ref_qd_start + 1],
+            bundle_joint_qd[ref_qd_start + 2],
+        )
+        bottom_ref = wp.vec3(
+            bundle_joint_qd[ref_qd_start + 3],
+            bundle_joint_qd[ref_qd_start + 4],
+            bundle_joint_qd[ref_qd_start + 5],
+        )
+        y_delta_sum = float(0.0)
+        omega_delta_sum = wp.vec3(0.0, 0.0, 0.0)
+        bottom_delta_sum = wp.vec3(0.0, 0.0, 0.0)
+        for s in range(1, num_bundle_samples):
+            slot = s * num_envs + tid
+            q_start = slot * coord_count
+            qd_start = slot * dof_count
+            omega_i = wp.vec3(
+                bundle_joint_qd[qd_start + 0],
+                bundle_joint_qd[qd_start + 1],
+                bundle_joint_qd[qd_start + 2],
+            )
+            bottom_i = wp.vec3(
+                bundle_joint_qd[qd_start + 3],
+                bundle_joint_qd[qd_start + 4],
+                bundle_joint_qd[qd_start + 5],
+            )
+            y_delta_sum = y_delta_sum + (bundle_joint_q[q_start + 1] - y_ref)
+            omega_delta_sum = omega_delta_sum + (omega_i - omega_ref)
+            bottom_delta_sum = bottom_delta_sum + (bottom_i - bottom_ref)
+        y_bar = y_ref + y_delta_sum * inv_n
+        omega_bar = omega_ref + omega_delta_sum * inv_n
+        bottom_bar = bottom_ref + bottom_delta_sum * inv_n
+
+        correction = wp.vec3(0.0, 0.0, 0.0)
+        for s in range(num_bundle_samples):
+            slot = s * num_envs + tid
+            q_start = slot * coord_count
+            qd_start = slot * dof_count
+            omega_i = wp.vec3(
+                bundle_joint_qd[qd_start + 0],
+                bundle_joint_qd[qd_start + 1],
+                bundle_joint_qd[qd_start + 2],
+            )
+            dy = bundle_joint_q[q_start + 1] - y_bar
+            correction = correction + wp.cross(
+                omega_i - omega_bar, wp.vec3(0.0, dy, 0.0)
+            )
+        correction = correction * inv_n
+        corrected_bottom = bottom_bar + correction
+        bundle_avg_qd[main_qd_start + 3] = corrected_bottom[0]
+        bundle_avg_qd[main_qd_start + 4] = corrected_bottom[1]
+        bundle_avg_qd[main_qd_start + 5] = corrected_bottom[2]
 
 
 @wp.kernel
@@ -3874,16 +3950,15 @@ def _print_bundle_inner_debug(
 # forward silently drifts with |p| at the roundoff of those inflated terms. A
 # running policy translates several metres from the origin over a long episode,
 # so SHAC gradients explode exactly when episodes get long. Fix: shift each
-# articulation's base to the origin by a DETACHED horizontal reference before
-# the FK / dynamics / contact solve, so those run in a well-conditioned env-local
-# frame; integrate in that same frame; then shift the POSITION outputs back to
-# world. Flat ground (z=0 everywhere) is translation invariant in x,z, so no
-# ground geometry needs shifting (unlike the rough integrator). The shift is a
-# constant (identity adjoint), so the gradient w.r.t. joint_q is the exact same
-# physical gradient, only without the |p| blow-up; and the forward becomes
+# articulation's base to the origin before the FK / dynamics / contact solve, so
+# those run in a well-conditioned env-local frame; integrate in that same frame;
+# then shift the POSITION outputs back to world. The reference extraction and
+# both sides of every frame transform stay on the tape and use distinct arrays,
+# so their adjoints cancel exactly where the coordinate shift cancels physically.
+# Flat ground (y=0 everywhere) is translation invariant in x,z, so no ground
+# geometry needs shifting (unlike the rough integrator). The forward becomes
 # offset-invariant down to the float32 representation of the world position
-# (~10x tighter than the legacy world-origin path). Mirrors
-# integrator_moreau_rough.py.
+# (~10x tighter than the legacy world-origin path).
 @wp.kernel
 def recenter_compute_root_xz_ref(
     joint_q: wp.array(dtype=float),
@@ -3912,6 +3987,57 @@ def recenter_joint_q_xz(
     if local == 2:
         v = v - p_ref[art][2]
     joint_q_out[i] = v
+
+
+@wp.kernel
+def recenter_rebase_joint_qd_to_output_root(
+    joint_q_local: wp.array(dtype=float),
+    joint_qd_input_frame: wp.array(dtype=float),
+    coord_per_env: int,
+    dof_per_env: int,
+    joint_qd_output_frame: wp.array(dtype=float),
+):
+    """Express a free-root twist about the output root's horizontal origin.
+
+    ``joint_q_local`` and ``joint_qd_input_frame`` are the result of a Moreau
+    substep evaluated about the input root's horizontal origin. If the root
+    moved by ``delta`` during that substep, translating the spatial frame to
+    the output root requires ``v' = v + omega x delta``. Keeping the old
+    bottom component while recentering the next substep changes the physical
+    root/contact velocity by ``-omega x delta`` and injects energy.
+
+    Source and destination are deliberately distinct. Besides making the
+    forward frame transform explicit, this preserves the correct reverse-mode
+    adjoint (an in-place update re-reads values overwritten by the same launch).
+    """
+    i = wp.tid()
+    art = i / dof_per_env
+    local = i - art * dof_per_env
+    value = joint_qd_input_frame[i]
+
+    # Recentring already assumes a free root in coordinates 0:7 / dofs 0:6.
+    # Revolute joint rates (local >= 6) are invariant under translation.
+    if local >= 3 and local < 6:
+        q_base = art * coord_per_env
+        qd_base = art * dof_per_env
+        omega = wp.vec3(
+            joint_qd_input_frame[qd_base + 0],
+            joint_qd_input_frame[qd_base + 1],
+            joint_qd_input_frame[qd_base + 2],
+        )
+        delta = wp.vec3(
+            joint_q_local[q_base + 0],
+            0.0,
+            joint_q_local[q_base + 2],
+        )
+        shifted = wp.vec3(
+            joint_qd_input_frame[qd_base + 3],
+            joint_qd_input_frame[qd_base + 4],
+            joint_qd_input_frame[qd_base + 5],
+        ) + wp.cross(omega, delta)
+        value = shifted[local - 3]
+
+    joint_qd_output_frame[i] = value
 
 
 @wp.kernel
@@ -4013,43 +4139,6 @@ def recenter_shift_bundle_cache_to_world(
     if local == 2:
         v = v + p_ref[env][2]
     cache_q_world[i] = v
-
-
-@wp.kernel
-def recenter_compute_bundle_output_root_xz_ref(
-    main_joint_q: wp.array(dtype=float),
-    bundle_input_joint_q: wp.array(dtype=float),
-    do_average: wp.array(dtype=int),
-    articulation_coord_start: wp.array(dtype=int),
-    num_envs: int,
-    num_bundle_samples: int,
-    coord_per_env: int,
-    p_ref: wp.array(dtype=wp.vec3),
-):
-    """Reference frame for the merged bundle output kinematics.
-
-    Normal/held environments use the main substep input root. Environments
-    committing a bundle result use the mean root of the actual branch inputs
-    for that inner substep — the frame in which each branch integrated its
-    origin-referenced spatial velocity. Mirrors the rough integrator.
-    """
-    env_id = wp.tid()
-    if do_average[env_id] == 0:
-        base = articulation_coord_start[env_id]
-        p_ref[env_id] = wp.vec3(main_joint_q[base + 0], 0.0, main_joint_q[base + 2])
-        return
-
-    ref_base = env_id * coord_per_env
-    ref_x = bundle_input_joint_q[ref_base + 0]
-    ref_z = bundle_input_joint_q[ref_base + 2]
-    dx_sum = float(0.0)
-    dz_sum = float(0.0)
-    for s in range(1, num_bundle_samples):
-        base = (s * num_envs + env_id) * coord_per_env
-        dx_sum = dx_sum + (bundle_input_joint_q[base + 0] - ref_x)
-        dz_sum = dz_sum + (bundle_input_joint_q[base + 2] - ref_z)
-    inv_n = 1.0 / float(num_bundle_samples)
-    p_ref[env_id] = wp.vec3(ref_x + dx_sum * inv_n, 0.0, ref_z + dz_sum * inv_n)
 
 
 ##########################
@@ -5691,11 +5780,12 @@ class MoreauIntegrator:
 
         # --- Env-local recentering (see recenter_* kernels above) ---
         # Build a recentered copy of the input joint_q whose per-articulation
-        # base x,z are shifted to ~0 by a DETACHED reference. The whole
+        # base x,z are shifted to ~0 by a matched differentiable reference. The whole
         # contact-solve pipeline (halfstep -> FK -> eval_rigid_id -> Jc -> prox
         # -> integrate) then runs in the well-conditioned env-local frame; the
         # POSITION outputs (joint_q, body_q, point_vec) are shifted back to world
-        # afterwards while velocity outputs stay frame-invariant. Gated on the
+        # afterwards; the root spatial bottom is rebased to the output-root frame
+        # while physical inertial velocities remain unchanged. Gated on the
         # integrator's recenter_world_offset flag (set by the torch wrapper from
         # cfg.sim.recenter_world_offset; default True).
         recenter = bool(getattr(self, "recenter_world_offset", True))
@@ -5711,18 +5801,25 @@ class MoreauIntegrator:
         if recenter and model.joint_count:
             art_count = model.articulation_count
             coord_per_env = int(len(state_in.joint_q) // max(art_count, 1))
+            dof_per_env = int(len(state_in.joint_qd) // max(art_count, 1))
             self._recenter_coord_per_env = coord_per_env
+            self._recenter_dof_per_env = dof_per_env
             if _inner_pooled:
-                p_ref = self._scratch("in_p_ref", _inner_ss, art_count, wp.vec3, model.device)
+                p_ref = self._scratch(
+                    "in_p_ref", _inner_ss, art_count, wp.vec3, model.device,
+                    requires_grad=requires_grad,
+                )
             else:
-                p_ref = wp.zeros(art_count, dtype=wp.vec3, device=model.device)
+                p_ref = wp.zeros(
+                    art_count, dtype=wp.vec3, device=model.device,
+                    requires_grad=requires_grad,
+                )
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=art_count,
                 inputs=[state_in.joint_q, coord_per_env],
                 outputs=[p_ref],
                 device=model.device,
-                record_tape=False,
             )
             if _inner_pooled:
                 q_local_in = self._scratch(
@@ -5916,22 +6013,28 @@ class MoreauIntegrator:
         # Recentering: integrate in the SAME env-local frame as the contact
         # solve (the free-joint qdd is the origin-referenced spatial
         # acceleration, so mixing a world joint_q with a local qdd corrupts the
-        # base update). The new position lands in joint_q_local_out; the output
-        # FK below runs on it so body_q / point_vec come out env-local and are
-        # shifted to world afterwards, while state_out.joint_q is written in
-        # world by a single non-in-place shift. Without recentering both aliases
-        # are state_out.joint_q and q_local_in is state_in.joint_q -> identical
-        # to the legacy path.
+        # base update). The new position lands in joint_q_local_out and the
+        # velocity in joint_qd_input_frame_out. The latter is still a spatial
+        # twist about this substep's INPUT-root frame. Before returning it must
+        # be translated to the OUTPUT-root frame; otherwise the next substep
+        # recenters q about a new origin while retaining qd about the old one,
+        # producing a physical velocity jump -omega x delta.
         if recenter and p_ref is not None:
             if _inner_pooled:
                 joint_q_local_out = self._scratch(
                     "in_jq_out", _inner_ss, len(state_out.joint_q), float,
                     model.device, requires_grad=state_out.joint_q.requires_grad,
                 )
+                joint_qd_input_frame_out = self._scratch(
+                    "in_jqd_old_frame", _inner_ss, len(state_out.joint_qd), float,
+                    model.device, requires_grad=state_out.joint_qd.requires_grad,
+                )
             else:
                 joint_q_local_out = wp.zeros_like(state_out.joint_q)
+                joint_qd_input_frame_out = wp.zeros_like(state_out.joint_qd)
         else:
             joint_q_local_out = state_out.joint_q
+            joint_qd_input_frame_out = state_out.joint_qd
         wp.launch(
             kernel=eval_rigid_integrate,
             dim=model.body_count,
@@ -5944,7 +6047,7 @@ class MoreauIntegrator:
                 state_out.joint_qdd,
                 dt,
             ],
-            outputs=[joint_q_local_out, state_out.joint_qd],
+            outputs=[joint_q_local_out, joint_qd_input_frame_out],
             device=model.device,
         )
         if recenter and p_ref is not None:
@@ -5955,6 +6058,78 @@ class MoreauIntegrator:
                 outputs=[state_out.joint_q],
                 device=model.device,
             )
+
+            # Store qd about the ground-projected OUTPUT root. Source and
+            # destination are distinct so the translation has the correct
+            # reverse-mode adjoint.
+            wp.launch(
+                kernel=recenter_rebase_joint_qd_to_output_root,
+                dim=len(state_out.joint_qd),
+                inputs=[
+                    joint_q_local_out,
+                    joint_qd_input_frame_out,
+                    self._recenter_coord_per_env,
+                    self._recenter_dof_per_env,
+                ],
+                outputs=[state_out.joint_qd],
+                device=model.device,
+            )
+
+            # Evaluate final spatial quantities in the same output-root frame.
+            # The position subtraction/restoration and omega x delta velocity
+            # transform are all recorded, so this is one coherent coordinate
+            # change in both the forward and its adjoint.
+            if _inner_pooled:
+                output_delta_ref = self._scratch(
+                    "in_out_delta_ref", _inner_ss, model.articulation_count,
+                    wp.vec3, model.device, requires_grad=requires_grad,
+                )
+                joint_q_tail = self._scratch(
+                    "in_jq_tail", _inner_ss, len(state_out.joint_q), float,
+                    model.device, requires_grad=state_out.joint_q.requires_grad,
+                )
+                output_p_ref = self._scratch(
+                    "in_out_p_ref", _inner_ss, model.articulation_count,
+                    wp.vec3, model.device, requires_grad=requires_grad,
+                )
+            else:
+                output_delta_ref = wp.zeros(
+                    model.articulation_count, dtype=wp.vec3, device=model.device,
+                    requires_grad=requires_grad,
+                )
+                joint_q_tail = wp.zeros_like(state_out.joint_q)
+                output_p_ref = wp.zeros(
+                    model.articulation_count, dtype=wp.vec3, device=model.device,
+                    requires_grad=requires_grad,
+                )
+            wp.launch(
+                kernel=recenter_compute_root_xz_ref,
+                dim=model.articulation_count,
+                inputs=[joint_q_local_out, self._recenter_coord_per_env],
+                outputs=[output_delta_ref],
+                device=model.device,
+            )
+            wp.launch(
+                kernel=recenter_joint_q_xz,
+                dim=len(state_out.joint_q),
+                inputs=[
+                    joint_q_local_out,
+                    output_delta_ref,
+                    self._recenter_coord_per_env,
+                ],
+                outputs=[joint_q_tail],
+                device=model.device,
+            )
+            wp.launch(
+                kernel=recenter_add_xz_refs,
+                dim=model.articulation_count,
+                inputs=[p_ref, output_delta_ref],
+                outputs=[output_p_ref],
+                device=model.device,
+            )
+        else:
+            joint_q_tail = joint_q_local_out
+            output_p_ref = p_ref
 
         # evaluate final body transforms
         # kernel 2
@@ -5967,7 +6142,7 @@ class MoreauIntegrator:
                 model.joint_parent,
                 model.joint_q_start,
                 model.joint_qd_start,
-                joint_q_local_out,
+                joint_q_tail,
                 model.joint_X_p,  # now, originally joint_X_pj
                 model.joint_X_cm,
                 model.joint_axis,
@@ -5988,7 +6163,7 @@ class MoreauIntegrator:
                 model.joint_parent,
                 model.joint_q_start,
                 model.joint_qd_start,
-                joint_q_local_out,
+                joint_q_tail,
                 state_out.joint_qd,
                 model.joint_axis,
                 model.joint_axis_start,
@@ -6088,14 +6263,14 @@ class MoreauIntegrator:
             wp.launch(
                 kernel=recenter_shift_body_q_to_world,
                 dim=len(state_out.body_q),
-                inputs=[out_body_q, p_ref, model.bodies_per_env],
+                inputs=[out_body_q, output_p_ref, model.bodies_per_env],
                 outputs=[state_out.body_q],
                 device=model.device,
             )
             wp.launch(
                 kernel=recenter_shift_point_vec_to_world,
                 dim=len(state_out.point_vec),
-                inputs=[out_point_vec, p_ref, slots_per_env],
+                inputs=[out_point_vec, output_p_ref, slots_per_env],
                 outputs=[state_out.point_vec],
                 device=model.device,
             )
@@ -6191,28 +6366,32 @@ class MoreauIntegrator:
 
         # --- Env-local recentering of the WHOLE bundle substep (offset invariance) ---
         # Recenter the two position INPUTS (the main substep state_in and the
-        # per-sample bundle cache chain_in) to the env-local origin by a DETACHED
+        # per-sample bundle cache chain_in) to the env-local origin by the
         # main-root reference. Everything else (the perturbed branches, b_in, the
         # inner rollout, the averaged pending, the merge, the FK tail) is derived
         # from these, so the entire substep — normal candidate AND bundle branches
         # — runs at small |p| and is well-conditioned. The POSITION outputs
         # (state_out joint_q/body_q/point_vec and the updated cache chain_out) are
-        # shifted back to world at the end; velocities are frame-invariant. The
-        # shift is a detached constant, so the gradient is the exact same physical
-        # gradient. Each substep is self-contained: cross-substep / cross-step
+        # shifted back to world at the end; root spatial bottoms are rebased at
+        # each output while physical inertial velocities remain unchanged. The
+        # reference subtraction and restoration are both recorded as distinct
+        # writes, so their coordinate-transform adjoints cancel exactly. Each
+        # substep is self-contained: cross-substep / cross-step
         # state (the chain, the cache bridge) is kept in world between calls.
         recenter = bool(getattr(self, "recenter_world_offset", True)) and bool(model.joint_count)
         rc_p_ref = None
         rc_saved_state_in_q = None
         if recenter:
-            rc_p_ref = self._scratch("rc_p_ref", substep, num_envs, wp.vec3, device)
+            rc_p_ref = self._scratch(
+                "rc_p_ref", substep, num_envs, wp.vec3, device,
+                requires_grad=requires_grad,
+            )
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=num_envs,
                 inputs=[state_in.joint_q, coord_per_env],
                 outputs=[rc_p_ref],
                 device=device,
-                record_tape=False,
             )
             rc_saved_state_in_q = state_in.joint_q
             _q_local = self._scratch(
@@ -6404,6 +6583,13 @@ class MoreauIntegrator:
         # NOTE: result lands in state_out_pred (the NORMAL CANDIDATE buffer),
         # not state_out — the per-env merge below decides which envs actually
         # get this candidate as their final transition.
+        if recenter:
+            pred_qd_input_frame = self._scratch(
+                "rc_pred_qd_old_frame", substep, len(state_out_pred.joint_qd),
+                float, device, requires_grad=state_out_pred.joint_qd.requires_grad,
+            )
+        else:
+            pred_qd_input_frame = state_out_pred.joint_qd
         wp.launch(
             kernel=eval_rigid_integrate,
             dim=model.body_count,
@@ -6416,9 +6602,22 @@ class MoreauIntegrator:
                 state_out.joint_qdd,
                 dt,
             ],
-            outputs=[state_out_pred.joint_q, state_out_pred.joint_qd],
+            outputs=[state_out_pred.joint_q, pred_qd_input_frame],
             device=device,
         )
+        if recenter:
+            wp.launch(
+                kernel=recenter_rebase_joint_qd_to_output_root,
+                dim=len(state_out_pred.joint_qd),
+                inputs=[
+                    state_out_pred.joint_q,
+                    pred_qd_input_frame,
+                    coord_per_env,
+                    dof_per_env,
+                ],
+                outputs=[state_out_pred.joint_qd],
+                device=device,
+            )
 
         # ============================================================
         # Phase B: CONTACT DETECTION → NEW-TRIGGER MASK
@@ -6573,7 +6772,7 @@ class MoreauIntegrator:
         # chain_in feeds merge_bundle_input_state -> b_in -> the inner rollout, so
         # this keeps the continuing branches well-conditioned too. The gradient
         # bridge (chain[0] <- cache torch tensor for substep 0) flows through the
-        # detached-shift recenter, so the saved original carries the cache grad.
+        # paired recenter shifts, so the saved original carries the cache grad.
         rc_saved_chain_in_q = None
         if recenter:
             rc_saved_chain_in_q = chain_in.joint_q
@@ -6845,6 +7044,7 @@ class MoreauIntegrator:
                     coord_per_env,
                     dof_per_env,
                     root_q_dim,
+                    int(recenter),
                 ],
                 outputs=[pending_bundle_q_slot, pending_bundle_qd_slot],
                 device=device,
@@ -6897,8 +7097,9 @@ class MoreauIntegrator:
         # When recentering, the merge writes the joint position into a local
         # scratch (rc_merged_jq) so the FK tail below runs env-local and the
         # single world write happens once via the shift before return (avoids the
-        # in-place +constant adjoint doubling). joint_qd is frame-invariant and
-        # goes straight to state_out. Without recentering this is state_out.joint_q.
+        # in-place +constant adjoint doubling). joint_qd is already expressed in
+        # each transition's output-root frame and goes straight to state_out.
+        # Without recentering this is state_out.joint_q.
         if recenter:
             rc_merged_jq = (
                 self._scratch(
@@ -6959,39 +7160,26 @@ class MoreauIntegrator:
         # All other state_out fields (body transforms, body velocity, foot
         # positions, etc.) are derived from the merged joint state.
         #
-        # Recentering has two frames in bundle mode:
-        #   outer frame: the main step's input root (rc_p_ref), used to keep the
-        #     cache chain in world coordinates between calls.
-        #   FK frame: the input root of the transition that produced the merged
-        #     output. For a normal/held env this is the outer frame; for an
-        #     averaged bundle commit it is the mean root of b_in, i.e. the frame
-        #     in which the final inner substep produced the spatial velocity.
-        #
-        # body_qd = v + w x r is sensitive to that FK-frame origin. Running this
-        # tail directly on rc_merged_jq (outer-local) makes joint_q/joint_qd match
-        # soft mode while body_qd/foot_vel drift. Mirror moreau_rough: recenter
-        # the merged q into the FK frame for FK/ID, then shift only position
-        # outputs back by the combined frame offset.
+        # rc_merged_jq is expressed in the outer frame (the main substep input
+        # root), while every merged qd branch is now expressed about its own
+        # OUTPUT root. Recenter the merged q once more about that output root so
+        # FK/ID/body/foot velocities use the exact same spatial frame. This is
+        # valid for all transition branches: normal candidates were rebased in
+        # Phase A, held states were already root-centred on input, and bundle
+        # averages were encoded about their averaged output root.
         # ============================================================
         if recenter:
-            rc_fk_p_ref = self._scratch("rc_fk_p_ref", substep, num_envs, wp.vec3, device)
-            if any_avg:
-                wp.launch(
-                    kernel=recenter_compute_bundle_output_root_xz_ref,
-                    dim=num_envs,
-                    inputs=[
-                        state_in.joint_q,
-                        b_in.joint_q,
-                        do_average,
-                        model.articulation_coord_start,
-                        num_envs,
-                        num_bundle_samples,
-                        coord_per_env,
-                    ],
-                    outputs=[rc_fk_p_ref],
-                    device=device,
-                    record_tape=False,
-                )
+            rc_fk_p_ref = self._scratch(
+                "rc_fk_p_ref", substep, num_envs, wp.vec3, device,
+                requires_grad=requires_grad,
+            )
+            wp.launch(
+                kernel=recenter_compute_root_xz_ref,
+                dim=num_envs,
+                inputs=[rc_merged_jq, coord_per_env],
+                outputs=[rc_fk_p_ref],
+                device=device,
+            )
             rc_fk_jq = (
                 self._scratch(
                     "rc_fk_jq", substep, len(state_out.joint_q), float, device,
@@ -7006,14 +7194,16 @@ class MoreauIntegrator:
                 outputs=[rc_fk_jq],
                 device=device,
             )
-            rc_output_p_ref = self._scratch("rc_out_p_ref", substep, num_envs, wp.vec3, device)
+            rc_output_p_ref = self._scratch(
+                "rc_out_p_ref", substep, num_envs, wp.vec3, device,
+                requires_grad=requires_grad,
+            )
             wp.launch(
                 kernel=recenter_add_xz_refs,
                 dim=num_envs,
                 inputs=[rc_p_ref, rc_fk_p_ref],
                 outputs=[rc_output_p_ref],
                 device=device,
-                record_tape=False,
             )
         else:
             rc_fk_jq = rc_merged_jq
@@ -7183,7 +7373,7 @@ class MoreauIntegrator:
             # Restore the swapped input arrays so the wrapper's gradient reads
             # (init_state.joint_q for the input state, chain[0].joint_q for the
             # cache bridge) target the original world arrays — the tape connects
-            # them via the detached recenter shifts above.
+            # them through the paired recenter shifts above.
             state_in.joint_q = rc_saved_state_in_q
             chain_in.joint_q = rc_saved_chain_in_q
 

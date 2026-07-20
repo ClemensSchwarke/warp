@@ -6614,7 +6614,7 @@ class MoreauRoughIntegrator(Integrator):
                     do_average, num_bundle_samples, num_envs,
                     chain_out.joint_q, chain_out.joint_qd,
                     self.articulation_coord_start, self.articulation_dof_start,
-                    coord_per_env, dof_per_env, root_q_dim,
+                    coord_per_env, dof_per_env, root_q_dim, 0,
                 ],
                 outputs=[pending_bundle_q_slot, pending_bundle_qd_slot],
                 device=device,
