@@ -2209,7 +2209,7 @@ def prox_iteration_unrolled_soft(
 ):
     tid = wp.tid()
 
-    scale = scale_array[0]
+    scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
     point_0 = point_vec[tid * 8]
     point_1 = point_vec[tid * 8 + 1]
@@ -2303,7 +2303,7 @@ def prox_iteration_unrolled_soft_2contacts(
     """
     tid = wp.tid()
 
-    scale = scale_array[0]
+    scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
     point_0 = point_vec[tid * 8]
     point_1 = point_vec[tid * 8 + 1]
@@ -2396,7 +2396,7 @@ def prox_iteration_unrolled_soft_8contacts(
 ):
     tid = wp.tid()
 
-    scale = scale_array[0]
+    scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
     c_0 = wp.dot(n, point_vec[tid * 8 + 0])
     c_1 = wp.dot(n, point_vec[tid * 8 + 1])
