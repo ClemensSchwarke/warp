@@ -84,6 +84,35 @@ class ViewerBase(ABC):
     def _render_contact_normals(self, starts: np.ndarray, ends: np.ndarray) -> None:
         ...
 
+    # ------------------------------------------------------------------
+    # optional overlays (reference "ghost" robot + marker spheres)
+    #
+    # Backends that cannot draw them leave ``supports_overlays`` False and keep
+    # these no-ops, so callers can skip computing overlay data entirely.
+    # ------------------------------------------------------------------
+    supports_overlays: bool = False
+
+    def register_ghost(self, urdf_path: str, scale: float = 1.0, color=(0.3, 0.65, 1.0)) -> int:
+        """Register a second, tinted copy of the robot's URDF visual meshes.
+
+        The copy is world-anchored (not parented to simulated bodies) and is
+        posed explicitly via :meth:`log_ghost`. Returns the number of mesh
+        instances registered; 0 means the backend or the URDF provided none.
+        """
+        return 0
+
+    def log_ghost(self, body_tf) -> None:
+        """Pose the ghost from (num_bodies, 7) ``[pos, quat_xyzw]`` transforms."""
+
+    def hide_ghost(self) -> None:
+        """Move the ghost out of view without unregistering it."""
+
+    def log_markers(self, name: str, points, color, radius: float = 0.03) -> None:
+        """Draw a named set of colored spheres at ``points`` (N, 3)."""
+
+    def clear_markers(self, name: str) -> None:
+        """Remove a marker set previously drawn by :meth:`log_markers`."""
+
     def is_running(self) -> bool:
         return True
 

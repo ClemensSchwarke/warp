@@ -45,6 +45,11 @@ _COLLISION_COLOR = (0.78, 0.78, 0.80)  # warm grey for collision shapes
 _TERRAIN_COLOR = (0.30, 0.30, 0.32)
 _CONTACT_COLOR = (1.00, 0.40, 0.00)    # orange
 _NORMAL_COLOR = (1.00, 0.10, 0.10)     # red (contact normal arrows)
+_GHOST_COLOR = (0.30, 0.65, 1.00)      # default tint for the reference ghost robot
+# Where hidden ghost instances are parked. Far enough below the ground plane to
+# be out of any reasonable view, which is cheaper than re-uploading the whole
+# instance buffer just to scale them away (see hide_ghost).
+_GHOST_HIDDEN_POS = (0.0, -1.0e6, 0.0)
 
 # Sky / ground colors (modeled on newton viewer's neutral palette).
 _SKY_COLOR = (0.22, 0.24, 0.28)        # dark blue-grey background
@@ -69,6 +74,29 @@ _SUN_DIRECTION = (-0.5, 0.55, 0.4)
 # ``out[tid] = ...`` line. The sibling module deliberately omits that future
 # import so kernel parameter types stay as real objects.
 from .contact_filter import filter_ground_contacts_kernel as _filter_ground_contacts_kernel
+
+
+def _quat_rotate_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate (N, 3) vectors by (N, 4) ``[x, y, z, w]`` quaternions."""
+    xyz = q[:, 0:3]
+    w = q[:, 3:4]
+    t = 2.0 * np.cross(xyz, v)
+    return v + w * t + np.cross(xyz, t)
+
+
+def _quat_mul_np(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product of (N, 4) ``[x, y, z, w]`` quaternions."""
+    x1, y1, z1, w1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    x2, y2, z2, w2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+    return np.stack(
+        [
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        ],
+        axis=-1,
+    ).astype(np.float32)
 
 
 class _NeutralSimRendererOpenGL:
@@ -102,6 +130,8 @@ class ViewerGL(ViewerBase):
         left-mouse-drag to rotate, scroll to zoom, WASD to translate, ESC to
         close, SPACE to pause.
     """
+
+    supports_overlays = True
 
     def __init__(
         self,
@@ -137,6 +167,17 @@ class ViewerGL(ViewerBase):
         self._contact_normal_radius = contact_normal_radius
         self._contact_activation_dist = contact_activation_dist
         self._contact_dedup_radius = contact_dedup_radius
+
+        # Reference-motion overlays (see register_ghost / log_ghost / log_markers).
+        # Toggled live with G / K; the caller reads these flags to decide whether
+        # to compute the reference pose at all.
+        self.show_ghost = True
+        self.show_markers = True
+        self._urdf_path: Optional[str] = None
+        self._urdf_scale = 1.0
+        self._urdf_entries: Optional[list] = None
+        self._ghost_instances: list = []
+        self._ghost_hidden = False
 
         # Build a SimRendererOpenGL subclass that uses a neutral colour for
         # collision shapes instead of cycling tab10. SimRendererOpenGL forwards
@@ -252,12 +293,21 @@ class ViewerGL(ViewerBase):
     # ------------------------------------------------------------------
     # URDF visuals
     # ------------------------------------------------------------------
-    def _register_urdf_visuals(self, urdf_path: str, urdf_scale: float) -> int:
-        """Register URDF ``<visual>`` meshes as instances. Returns the number of
-        visual mesh instances actually registered (0 if none loaded)."""
+    def _load_urdf_entries(self, urdf_path: str, urdf_scale: float) -> list:
+        """Parse (once) the URDF ``<visual>`` meshes for the first env's bodies.
+
+        The result is cached so ``register_ghost`` can reuse the same geometry
+        without a second trimesh load.
+        """
+        if (
+            self._urdf_entries is not None
+            and self._urdf_path == urdf_path
+            and self._urdf_scale == urdf_scale
+        ):
+            return self._urdf_entries
         body_names = list(getattr(self.model, "body_name", []))
         if not body_names:
-            return 0
+            return []
         # The body_name list on `model` repeats across envs (one set of names
         # per env). `SimRenderer.populate` namespaces body names with index
         # prefixes so they collide-free across envs. To attach visuals only to
@@ -267,6 +317,15 @@ class ViewerGL(ViewerBase):
         first_env_body_names = body_names[:bodies_per_env]
 
         entries = load_urdf_visuals(urdf_path, first_env_body_names, scale=urdf_scale)
+        self._urdf_path = urdf_path
+        self._urdf_scale = urdf_scale
+        self._urdf_entries = entries
+        return entries
+
+    def _register_urdf_visuals(self, urdf_path: str, urdf_scale: float) -> int:
+        """Register URDF ``<visual>`` meshes as instances. Returns the number of
+        visual mesh instances actually registered (0 if none loaded)."""
+        entries = self._load_urdf_entries(urdf_path, urdf_scale)
         if not entries:
             return 0
 
@@ -330,6 +389,122 @@ class ViewerGL(ViewerBase):
             color1=color,
             color2=color,
         )
+
+    # ------------------------------------------------------------------
+    # reference "ghost" robot + marker spheres
+    # ------------------------------------------------------------------
+    def register_ghost(
+        self, urdf_path: str, scale: float = 1.0, color: tuple = _GHOST_COLOR
+    ) -> int:
+        """Register a tinted second copy of the URDF visual meshes as a ghost.
+
+        Unlike the regular visuals, ghost instances are anchored to the *world*
+        (``body = -1``) rather than to a simulated body, so their transforms come
+        straight from :meth:`log_ghost` instead of the state's ``body_q``. This
+        is what lets the ghost show a reference motion that no simulated body
+        follows. Returns the number of instances registered.
+        """
+        if self._ghost_instances:
+            return len(self._ghost_instances)
+        entries = self._load_urdf_entries(urdf_path, scale)
+        if not entries:
+            print(
+                f"[ViewerGL] No URDF visual meshes were loaded from {urdf_path!r}; "
+                "the reference ghost will not be shown."
+            )
+            return 0
+
+        color = tuple(float(c) for c in color)
+        for i, entry in enumerate(entries):
+            name = f"ghost_{i}"
+            # Deliberately no texture: a textured shape takes the shader's
+            # albedo-texture path and would ignore the ghost tint, making the
+            # ghost indistinguishable from the robot.
+            shape = self._sim_renderer.render_mesh(
+                name=name,
+                points=entry["vertices"],
+                indices=entry["indices"],
+                pos=(0.0, 0.0, 0.0),
+                rot=(0.0, 0.0, 0.0, 1.0),
+                scale=(1.0, 1.0, 1.0),
+                colors=[color] * len(entry["vertices"]),
+                is_template=True,
+            )
+            self._sim_renderer.add_shape_instance(
+                name,
+                shape,
+                None,                      # world-anchored: posed by log_ghost
+                _GHOST_HIDDEN_POS,         # parked until the first log_ghost
+                (0.0, 0.0, 0.0, 1.0),
+                (1.0, 1.0, 1.0),
+                color1=color,
+                color2=color,
+            )
+            self._ghost_instances.append(
+                (
+                    name,
+                    int(entry["body_idx"]),
+                    np.asarray(entry["pos"], dtype=np.float32),
+                    np.asarray(entry["rot"], dtype=np.float32),
+                )
+            )
+        self._ghost_hidden = True
+        return len(self._ghost_instances)
+
+    def log_ghost(self, body_tf) -> None:
+        """Pose the ghost from body transforms.
+
+        Args:
+            body_tf: (num_bodies, 7) array of ``[px, py, pz, qx, qy, qz, qw]``
+                for one robot's bodies, indexed like the model's first env.
+        """
+        if not self._ghost_instances:
+            return
+        if not self.show_ghost:
+            self.hide_ghost()
+            return
+        tf = np.asarray(body_tf, dtype=np.float32).reshape(-1, 7)
+        idx = np.array([e[1] for e in self._ghost_instances], dtype=np.int64)
+        if idx.max(initial=-1) >= len(tf):
+            return
+        body_p = tf[idx, 0:3]
+        body_q = tf[idx, 3:7]
+        local_p = np.stack([e[2] for e in self._ghost_instances])
+        local_q = np.stack([e[3] for e in self._ghost_instances])
+        world_p = body_p + _quat_rotate_np(body_q, local_p)
+        world_q = _quat_mul_np(body_q, local_q)
+        for (name, _, _, _), p, q in zip(self._ghost_instances, world_p, world_q):
+            self._sim_renderer.update_shape_instance(name, tuple(p), tuple(q))
+        self._ghost_hidden = False
+
+    def hide_ghost(self) -> None:
+        """Park the ghost instances out of view (cheaper than re-allocating)."""
+        if not self._ghost_instances or self._ghost_hidden:
+            return
+        for name, _, _, _ in self._ghost_instances:
+            self._sim_renderer.update_shape_instance(
+                name, _GHOST_HIDDEN_POS, (0.0, 0.0, 0.0, 1.0)
+            )
+        self._ghost_hidden = True
+
+    def log_markers(self, name: str, points, color, radius: float = 0.03) -> None:
+        """Draw a named set of same-colored spheres at ``points`` (N, 3)."""
+        if not self.show_markers:
+            self.clear_markers(name)
+            return
+        pts = np.ascontiguousarray(np.asarray(points, dtype=np.float32).reshape(-1, 3))
+        if len(pts) == 0:
+            self.clear_markers(name)
+            return
+        self._sim_renderer.render_points(
+            name=name,
+            points=pts,
+            radius=float(radius),
+            colors=[tuple(float(c) for c in color)] * len(pts),
+        )
+
+    def clear_markers(self, name: str) -> None:
+        self._drop_instancer(name)
 
     # ------------------------------------------------------------------
     # filtered ground-contact rendering
@@ -496,7 +671,8 @@ class ViewerGL(ViewerBase):
         instancers.pop(name, None)
 
     def _on_key_press(self, symbol, modifiers):
-        """Toggle filtered-contact display ('P') and normal arrows ('N')."""
+        """Toggle contacts ('P'), normal arrows ('N'), the reference ghost ('G')
+        and the reference/policy key-point markers ('K')."""
         import pyglet
         if symbol == pyglet.window.key.P:
             self.show_contacts = not self.show_contacts
@@ -506,6 +682,12 @@ class ViewerGL(ViewerBase):
             self.show_normals = not self.show_normals
             if not self.show_normals:
                 self._drop_instancer(self._CONTACT_NORMAL_INSTANCER)
+        elif symbol == pyglet.window.key.G:
+            self.show_ghost = not self.show_ghost
+            if not self.show_ghost:
+                self.hide_ghost()
+        elif symbol == pyglet.window.key.K:
+            self.show_markers = not self.show_markers
 
     # ------------------------------------------------------------------
     # contact rendering
@@ -579,7 +761,12 @@ class ViewerGL(ViewerBase):
         for name, (instance_id, body, shape, transform, scale, c1, c2) in list(
             renderer._instances.items()
         ):
-            if name == "ground" or name.startswith("terrain") or name.startswith("visual_"):
+            if (
+                name == "ground"
+                or name.startswith("terrain")
+                or name.startswith("visual_")
+                or name.startswith("ghost_")
+            ):
                 continue
             renderer._instances[name] = (
                 instance_id,
