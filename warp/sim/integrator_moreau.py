@@ -10,10 +10,22 @@ models + state forward in time.
 
 """
 
+import re as _re
+
 import torch
 import warp as wp
 from .articulation import eval_articulation_fk
 from .model import ModelShapeGeometry, ModelShapeMaterials
+
+# Numbered per-column dense-solve scratch blocks of a Moreau State.
+# ``_eval_inv_m_times_jct_split`` writes ``tmp_<i>`` / ``Inv_M_times_Jc_t_<i>``
+# for EVERY dof of the column before anything reads them, and ``create_matrix``
+# re-assembles the dense ``Inv_M_times_Jc_t`` from them, so a pooled slot's
+# stale values are fully overwritten before any read. Re-zeroing them on reuse
+# is therefore pure launch overhead (~72 of the ~103 memsets a full State
+# costs). This is the same criterion diffsimrl's ``_CKPT_DENSE_BLOCK_RE``
+# already applies to the non-bundle checkpointed path.
+_DENSE_BLOCK_RE = _re.compile(r"^(Jc|Inv_M_times_Jc_t|tmp)_\d+$")
 
 
 def _ensure_motor_limit_arrays(model, max_torque, peak_torque, velocity_limit):
@@ -942,6 +954,50 @@ def eval_dense_solve_batched(
     x: wp.array(dtype=float),
 ):
     wp.dense_solve_batched(b_start, A_start, A_dim, A, L, b, tmp, x)
+
+
+@wp.kernel
+def accum_adj_H_from_fused_solve(
+    ncols: int,
+    H_start: wp.array(dtype=int),
+    H_rows: wp.array(dtype=int),
+    b_start: wp.array(dtype=int),
+    tmp: wp.array(dtype=float),
+    x: wp.array(dtype=float),
+    adj_H: wp.array(dtype=float),
+):
+    """Race-free replacement for dense_solve's ``adj_A`` accumulation.
+
+    ``adj_dense_solve`` (warp/native/matnn.h) ends with the NON-atomic
+
+        adj_A[dense_index(n, i, j)] += -tmp[i] * x[j]
+
+    which is why the 24 contact-dim columns of an env cannot share one fused
+    adjoint launch: all 24 threads would read-modify-write the same H block and
+    lose updates. This kernel computes the identical quantity summed over the
+    columns, but threaded over the ELEMENTS of H — one thread owns exactly one
+    ``(env, i, j)``, so the accumulation is private and no atomics are needed.
+
+    It runs in the backward pass only (recorded via ``Tape.record_func``), after
+    the fused solve's own adjoint has filled ``tmp`` with ``A^-1 adj_x`` for each
+    column, and reads ``x`` (the forward solution, still live) — so it needs no
+    extra memory.
+
+    The launch is sized to the max row count; ``n`` is read per articulation
+    from the same ``H_rows`` array the solve uses as ``A_dim``, and
+    ``dense_index(n, i, j) == i * n + j``.
+    """
+    e, i, j = wp.tid()
+    n = H_rows[e]
+    if i >= n or j >= n:
+        return
+    s = float(0.0)
+    for c in range(ncols):
+        off = b_start[e * ncols + c]
+        s += -tmp[off + i] * x[off + j]
+    # One thread per (e, i, j), so this index is private; the add still has to
+    # accumulate because other tape kernels also contribute to H's adjoint.
+    wp.atomic_add(adj_H, H_start[e] + i * n + j, s)
 
 
 @wp.kernel
@@ -4219,6 +4275,13 @@ class MoreauIntegrator:
         # WpInterface from cfg.sim.fused_contact_solve.
         self.fused_contact_solve = True
 
+        # Extend the fusion to the TAPE-RECORDING case as well. The racy
+        # `adj_H` write is avoided by passing H through a gradient-less alias
+        # and recovering its adjoint in a separate kernel threaded over H's
+        # elements (see _solve_inv_m_times_jct_fused_grad). Set by WpInterface
+        # from cfg.sim.fused_contact_solve_grad.
+        self.fused_contact_solve_grad = False
+
     @staticmethod
     def _ensure_contact_metadata(model):
         """Provide backward-compatible defaults for flat contact selection."""
@@ -4383,16 +4446,25 @@ class MoreauIntegrator:
             and (bundle_inner_mode or "soft") == "soft"
         )
 
-    @staticmethod
-    def _zero_state_arrays(state):
+    def _zero_state_arrays(self, state):
         """Restore the fresh-allocation zero VALUE state of a reused State —
         mirrors WpInterface._ckpt_zero_shared_substep_buffers. Sparse writers
         (construct_contact_jacobian -> Jc_<i>, the prox kernels, ...) leave
         never-written entries untouched, so a reused buffer must be zeroed to
         match the fresh-alloc semantics. .grad is handled separately by
-        tape.reset() in _reset_tape_state."""
-        for val in vars(state).values():
+        tape.reset() in _reset_tape_state.
+
+        Each ``zero_()`` is a separate memset kernel launch, and a full (non-lite)
+        State holds ~103 arrays — at 4 substeps x (forward + checkpointed
+        recompute) this dominates the bundle launch count. The numbered
+        dense-solve blocks are densely rewritten before any read, so they are
+        skipped unless ``_bundle_fast_zero`` is disabled (see _DENSE_BLOCK_RE).
+        """
+        fast = getattr(self, "_bundle_fast_zero", True)
+        for name, val in vars(state).items():
             if isinstance(val, wp.array) and val.ptr is not None:
+                if fast and _DENSE_BLOCK_RE.match(name):
+                    continue
                 val.zero_()
 
     def _pooled_state(self, bundle_model, key, substep, requires_grad, lite):
@@ -7553,8 +7625,13 @@ class MoreauIntegrator:
         # forward, 24x the GPU occupancy, 26 launches -> 1. The per-column path
         # runs whenever a tape is active because dense_solve's non-atomic adjoint
         # on H would race across an env's 24 columns in one fused adjoint launch.
+        # With fused_contact_solve_grad the tape path is fused too: H is passed
+        # gradient-less and its adjoint is recovered by a separate race-free
+        # kernel (see _solve_inv_m_times_jct_fused_grad).
         if self.fused_contact_solve and wp.context.runtime.tape is None:
             self._solve_inv_m_times_jct_fused(model, state_mid)
+        elif self.fused_contact_solve and getattr(self, "fused_contact_solve_grad", False):
+            self._solve_inv_m_times_jct_fused_grad(model, state_mid)
         else:
             self._eval_inv_m_times_jct_split(model, state_mid)
 
@@ -8168,6 +8245,125 @@ class MoreauIntegrator:
                 model.L,
                 model.Jc,
                 state_mid.Inv_M_times_Jc_t,  # tmp — unused by the forward solve
+            ],
+            outputs=[state_mid.Inv_M_times_Jc_t],
+            device=model.device,
+        )
+
+    def _ensure_fused_grad_solve_buffers(self, model):
+        """Scratch for the tape-safe fused solve: a real ``tmp`` (the non-tape
+        fused call aliases tmp onto its output, which is fine for a forward but
+        would corrupt the adjoint) and a decoy ALIAS of model.H.
+
+        The alias shares H's memory, so the forward reads identical values, but
+        it owns a SEPARATE, never-read gradient buffer. dense_solve's racy
+        ``adj_A += -tmp[i]*x[j]`` therefore lands in the decoy (where the lost
+        updates are harmless) instead of in the real ``model.H.grad``, which is
+        filled correctly afterwards by ``accum_adj_H_from_fused_solve``.
+
+        The decoy cannot simply be a null gradient: ``adj_dense_solve_batched``
+        dereferences ``adj_A`` unconditionally, so a missing buffer faults.
+        It costs one H-sized array (dof^2 per articulation).
+        """
+        tmp = getattr(model, "_fused_grad_tmp", None)
+        if tmp is None or len(tmp) != model.Jc_size:
+            tmp = wp.zeros(model.Jc_size, dtype=float, device=model.device)
+            model._fused_grad_tmp = tmp
+        # Keyed by H's pointer, NOT a single slot: in bundle mode
+        # _pooled_alloc_mm cycles bundle_model.H through one slot per substep,
+        # so a single-slot cache would rebuild (cudaMalloc + cudaFree, both
+        # synchronizing) on every substep forever.
+        cache = getattr(model, "_fused_grad_H_decoys", None)
+        if cache is None:
+            cache = {}
+            model._fused_grad_H_decoys = cache
+        alias = cache.get(model.H.ptr)
+        if alias is None:
+            alias = wp.array(
+                ptr=model.H.ptr, dtype=float, shape=model.H.shape,
+                device=model.H.device, owner=False,
+            )
+            alias.grad = wp.zeros(
+                model.H.shape, dtype=float, device=model.H.device
+            )
+            cache[model.H.ptr] = alias
+        return tmp, alias
+
+    def _solve_inv_m_times_jct_fused_grad(self, model, state_mid):
+        """Tape-recording fused solve of X = H^-1 * Jc^T (all 24 columns).
+
+        Same single launch as ``_solve_inv_m_times_jct_fused``, but safe to
+        record on a Warp tape. Two things make it safe:
+
+          * ``H`` is passed through a decoy alias that owns a separate, never-read
+            gradient buffer, so dense_solve's non-atomic ``adj_A += -tmp[i]*x[j]``
+            (the read-modify-write that 24 threads per env would race on) lands
+            somewhere harmless instead of in the real ``H.grad``. The forward
+            reads the same memory, so the solution is unchanged.
+          * The missing ``adj_H`` term is then added by a custom backward pass
+            threaded over H's elements (race-free). It is recorded BEFORE the
+            solve so the tape — which replays in reverse — runs it AFTER the
+            solve's adjoint, when ``tmp`` holds ``A^-1 adj_x`` per column.
+
+        The other adjoints the fused launch does produce (``adj_b`` into
+        model.Jc.grad, read of ``adj_x`` from Inv_M_times_Jc_t.grad) index by
+        the per-(env, column) ``b_start``, so each thread owns a distinct slice
+        and needs no atomics. ``adj_L`` is never written by dense_solve.
+
+        Replaces split_matrix + 24 solves + create_matrix (26 launches of
+        articulation_count threads) with 1 launch of articulation_count*24
+        threads plus 1 small backward kernel.
+        """
+        self._ensure_fused_solve_index(model)
+        tmp, H_decoy = self._ensure_fused_grad_solve_buffers(model)
+
+        n_art = int(model.articulation_count)
+        # Launch bound for the adj-H kernel; it reads the true per-articulation
+        # row count from articulation_H_rows and masks off the excess.
+        max_rows = int(model.joint_dof_count / n_art)
+        tape = wp.context.runtime.tape
+
+        # H without a gradient buffer means nothing downstream wants d/dH, so
+        # there is no term to recover and the decoy already absorbs the racy
+        # write. (record_func would also raise on a grad-less array.)
+        if tape is not None and model.H.grad is not None:
+            # Bind EVERY array this substep uses at RECORD time. In bundle mode
+            # _pooled_alloc_mm rebinds bundle_model.H (and friends) to a
+            # different pooled slot on every substep, so a closure that looked
+            # up model.H.grad lazily would, at backward time, accumulate into
+            # whichever slot happened to be bound last — silently corrupting
+            # the gradient of every substep but the final one.
+            b_start = model._fused_solve_b_start
+            H_start = model.articulation_H_start
+            H_rows = model.articulation_H_rows
+            x = state_mid.Inv_M_times_Jc_t
+            device = model.device
+            H_arr = model.H
+            H_grad = H_arr.grad
+
+            def _adj_H_backward():
+                wp.launch(
+                    kernel=accum_adj_H_from_fused_solve,
+                    dim=(n_art, max_rows, max_rows),
+                    inputs=[24, H_start, H_rows, b_start, tmp, x],
+                    outputs=[H_grad],
+                    device=device,
+                )
+
+            # Recorded first => replayed last (after the solve's adjoint).
+            tape.record_func(_adj_H_backward, arrays=[H_arr])
+
+        wp.launch(
+            kernel=eval_dense_solve_batched,
+            dim=n_art * 24,
+            inputs=[
+                model._fused_solve_b_start,
+                model.articulation_H_start_matrix,
+                model.articulation_H_rows_matrix,
+                H_decoy,
+                model.L,
+                model.Jc,
+                tmp,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t],
             device=model.device,
