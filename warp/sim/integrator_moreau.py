@@ -628,11 +628,17 @@ def eval_rigid_fk(
     joint_X_cm: wp.array(dtype=wp.transform),
     joint_axis: wp.array(dtype=wp.vec3),
     joint_axis_start: wp.array(dtype=int),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     body_X_sc: wp.array(dtype=wp.transform),
     body_X_sm: wp.array(dtype=wp.transform),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     start = articulation_start[tid]
     end = articulation_start[tid + 1]
@@ -672,6 +678,8 @@ def eval_rigid_id(
     body_X_sm: wp.array(dtype=wp.transform),
     joint_X_pj: wp.array(dtype=wp.transform),
     gravity: wp.vec3,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_I_s: wp.array(dtype=wp.spatial_matrix),
@@ -681,6 +689,10 @@ def eval_rigid_id(
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     start = articulation_start[tid]
     end = articulation_start[tid + 1]
@@ -735,12 +747,18 @@ def eval_rigid_tau(
     joint_axis: wp.array(dtype=wp.vec3),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
     body_fb_s: wp.array(dtype=wp.spatial_vector),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     body_ft_s: wp.array(dtype=wp.spatial_vector),
     tau: wp.array(dtype=float),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     start = articulation_start[tid]
     end = articulation_start[tid + 1]
@@ -787,12 +805,20 @@ def eval_rigid_integrate(
     joint_qd: wp.array(dtype=float),
     joint_qdd: wp.array(dtype=float),
     dt: float,
+    bodies_per_articulation: int,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     joint_q_new: wp.array(dtype=float),
     joint_qd_new: wp.array(dtype=float),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        articulation = tid / bodies_per_articulation
+        if active_mask[articulation % active_mask_num_envs] == 0:
+            return
 
     type = joint_type[tid]
     coord_start = joint_q_start[tid]
@@ -808,11 +834,17 @@ def eval_rigid_jacobian(
     joint_parent: wp.array(dtype=int),
     joint_qd_start: wp.array(dtype=int),
     joint_S_s: wp.array(dtype=wp.spatial_vector),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     J: wp.array(dtype=float),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     joint_start = articulation_start[tid]
     joint_end = articulation_start[tid + 1]
@@ -828,11 +860,17 @@ def eval_rigid_mass(
     articulation_start: wp.array(dtype=int),
     articulation_M_start: wp.array(dtype=int),
     body_I_s: wp.array(dtype=wp.spatial_matrix),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     M: wp.array(dtype=float),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     joint_start = articulation_start[tid]
     joint_end = articulation_start[tid + 1]
@@ -848,11 +886,17 @@ def inertial_body_pos_vel(
     articulation_start: wp.array(dtype=int),
     body_X_sc: wp.array(dtype=wp.transform),
     body_v_s: wp.array(dtype=wp.spatial_vector),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     start = articulation_start[tid]
     end = articulation_start[tid + 1]
@@ -898,8 +942,14 @@ def eval_dense_gemm_batched(
     C_start: wp.array(dtype=int),
     A: wp.array(dtype=float),
     B: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     C: wp.array(dtype=float),
 ):
+    if active_mask:
+        articulation = wp.tid() / 256
+        if active_mask[articulation % active_mask_num_envs] == 0:
+            return
     wp.dense_gemm_batched(m, n, p, t1, t2, A_start, B_start, C_start, A, B, C)
 
 
@@ -916,8 +966,14 @@ def eval_dense_cholesky_batched(
     A_dim: wp.array(dtype=int),
     A: wp.array(dtype=float),
     regularization: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     L: wp.array(dtype=float),
 ):
+    tid = wp.tid()
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
     wp.dense_chol_batched(A_start, A_dim, A, regularization, L)
 
 
@@ -951,8 +1007,15 @@ def eval_dense_solve_batched(
     L: wp.array(dtype=float),
     b: wp.array(dtype=float),
     tmp: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
+    solves_per_articulation: int,
     x: wp.array(dtype=float),
 ):
+    if active_mask:
+        articulation = wp.tid() / solves_per_articulation
+        if active_mask[articulation % active_mask_num_envs] == 0:
+            return
     wp.dense_solve_batched(b_start, A_start, A_dim, A, L, b, tmp, x)
 
 
@@ -964,6 +1027,8 @@ def accum_adj_H_from_fused_solve(
     b_start: wp.array(dtype=int),
     tmp: wp.array(dtype=float),
     x: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     adj_H: wp.array(dtype=float),
 ):
     """Race-free replacement for dense_solve's ``adj_A`` accumulation.
@@ -988,6 +1053,9 @@ def accum_adj_H_from_fused_solve(
     ``dense_index(n, i, j) == i * n + j``.
     """
     e, i, j = wp.tid()
+    if active_mask:
+        if active_mask[e % active_mask_num_envs] == 0:
+            return
     n = H_rows[e]
     if i >= n or j >= n:
         return
@@ -1028,14 +1096,22 @@ def eval_dense_add_batched(
     a: wp.array(dtype=float),
     b: wp.array(dtype=float),
     dt: float,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     c: wp.array(dtype=float),
 ):
     tid = wp.tid()
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
     for i in range(0, n[tid]):
         c[start[tid] + i] = a[start[tid] + i] + b[start[tid] + i] * dt
 
 
-def matmul_batched(batch_count, m, n, k, t1, t2, A_start, B_start, C_start, A, B, C, device):
+def matmul_batched(
+    batch_count, m, n, k, t1, t2, A_start, B_start, C_start,
+    A, B, C, device, active_mask=None, active_mask_num_envs=0,
+):
     if device == "cpu":
         threads = batch_count
     else:
@@ -1044,7 +1120,8 @@ def matmul_batched(batch_count, m, n, k, t1, t2, A_start, B_start, C_start, A, B
     wp.launch(
         kernel=eval_dense_gemm_batched,
         dim=threads,
-        inputs=[m, n, k, t1, t2, A_start, B_start, C_start, A, B],
+        inputs=[m, n, k, t1, t2, A_start, B_start, C_start, A, B,
+                active_mask, active_mask_num_envs],
         outputs=[C],
         device=device,
     )
@@ -1118,11 +1195,19 @@ def integrate_q_halfstep(
     joint_q: wp.array(dtype=float),
     joint_qd: wp.array(dtype=float),
     dt: float,
+    bodies_per_articulation: int,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     joint_q_new: wp.array(dtype=float),
 ):
     # one thread per-articulation
     tid = wp.tid()
+
+    if active_mask:
+        articulation = tid / bodies_per_articulation
+        if active_mask[articulation % active_mask_num_envs] == 0:
+            return
 
     type = joint_type[tid]
     coord_start = joint_q_start[tid]
@@ -1248,11 +1333,17 @@ def construct_contact_jacobian(
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
     use_binning: int,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     Jc: wp.array(dtype=float),
     c_body_vec: wp.array(dtype=int),
     point_vec: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     # Pre-initialize all 8 foot slots above ground so unused slots are never
     # mistaken for in-contact feet.
@@ -2220,10 +2311,16 @@ def prox_iteration_unrolled(
     # mu: float,
     prox_iter: int,
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()  # number of envs/articulations
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     c_vec_0 = c_vec[tid, 0]
     c_vec_1 = c_vec[tid, 1]
@@ -2260,10 +2357,16 @@ def prox_iteration_unrolled_soft(
     prox_iter: int,
     scale_array: wp.array(dtype=float),
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
@@ -2309,6 +2412,8 @@ def prox_iteration_unrolled_2contacts(
     c_vec: wp.array2d(dtype=wp.vec3),
     prox_iter: int,
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
@@ -2317,6 +2422,10 @@ def prox_iteration_unrolled_2contacts(
     Slots 2 and 3 are explicitly set to zero to avoid wp.inverse(zero_matrix) → NaN.
     """
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     c_vec_0 = c_vec[tid, 0]
     c_vec_1 = c_vec[tid, 1]
@@ -2350,6 +2459,8 @@ def prox_iteration_unrolled_soft_2contacts(
     prox_iter: int,
     scale_array: wp.array(dtype=float),
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     percussion: wp.array2d(dtype=wp.vec3),
 ):
@@ -2358,6 +2469,10 @@ def prox_iteration_unrolled_soft_2contacts(
     Slots 2 and 3 are explicitly set to zero to avoid wp.inverse(zero_matrix) → NaN.
     """
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
@@ -2398,9 +2513,15 @@ def prox_iteration_unrolled_8contacts(
     c_vec: wp.array2d(dtype=wp.vec3),
     prox_iter: int,
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     c_vec_0 = c_vec[tid, 0]
     c_vec_1 = c_vec[tid, 1]
@@ -2448,9 +2569,15 @@ def prox_iteration_unrolled_soft_8contacts(
     prox_iter: int,
     scale_array: wp.array(dtype=float),
     shape_materials: ModelShapeMaterials,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     percussion: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     scale = scale_array[tid]  # per-articulation contact-stiffness (domain-randomizable)
     n = wp.vec3(0.0, 1.0, 0.0)
@@ -2503,8 +2630,18 @@ def prox_iteration_unrolled_soft_8contacts(
 
 
 @wp.kernel
-def convert_G_to_matrix(G_start: wp.array(dtype=int), G: wp.array(dtype=float), G_mat: wp.array3d(dtype=wp.mat33)):
+def convert_G_to_matrix(
+    G_start: wp.array(dtype=int),
+    G: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
+    G_mat: wp.array3d(dtype=wp.mat33),
+):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(8):
         for j in range(8):
@@ -2554,8 +2691,17 @@ def dense_G_index(G_start: wp.array(dtype=int), tid: int, i: int, j: int, k: int
 
 
 @wp.kernel
-def convert_c_to_vector(c: wp.array(dtype=float), c_vec: wp.array2d(dtype=wp.vec3)):
+def convert_c_to_vector(
+    c: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
+    c_vec: wp.array2d(dtype=wp.vec3),
+):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(8):
         c_start = tid * 3 * 8 + i * 3
@@ -2563,8 +2709,17 @@ def convert_c_to_vector(c: wp.array(dtype=float), c_vec: wp.array2d(dtype=wp.vec
 
 
 @wp.kernel
-def vectorize_percussion(percussion: wp.array2d(dtype=wp.vec3), percussion_vec: wp.array(dtype=float)):
+def vectorize_percussion(
+    percussion: wp.array2d(dtype=wp.vec3),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
+    percussion_vec: wp.array(dtype=float),
+):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(8):
         start = tid * 3 * 8 + i * 3
@@ -2580,10 +2735,16 @@ def p_to_f_s(
     point_vec: wp.array(dtype=wp.vec3),
     percussion: wp.array2d(dtype=wp.vec3),
     dt: float,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # output
     body_f_s: wp.array(dtype=wp.spatial_vector),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(8):
         c_body = c_body_vec[tid * 8 + i]
@@ -2600,6 +2761,8 @@ def split_matrix(
     dof_count: int,
     A_start: wp.array(dtype=int),
     a_start: wp.array(dtype=int),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     a_1: wp.array(dtype=float),
     a_2: wp.array(dtype=float),
     a_3: wp.array(dtype=float),
@@ -2626,6 +2789,10 @@ def split_matrix(
     a_24: wp.array(dtype=float),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(dof_count):
         a_1[a_start[tid] + i] = A[A_start[tid] + i]
@@ -2683,9 +2850,15 @@ def create_matrix(
     a_22: wp.array(dtype=float),
     a_23: wp.array(dtype=float),
     a_24: wp.array(dtype=float),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     A: wp.array(dtype=float),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(dof_count):
         A[A_start[tid] + i] = a_1[a_start[tid] + i]
@@ -2718,10 +2891,16 @@ def create_matrix(
 def copy_relevant_states(
     # input
     percussion_in: wp.array2d(dtype=wp.vec3),
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # ouput
     percussion_out: wp.array2d(dtype=wp.vec3),
 ):
     tid = wp.tid()
+
+    if active_mask:
+        if active_mask[tid % active_mask_num_envs] == 0:
+            return
 
     for i in range(8):
         percussion_out[tid, i] = percussion_in[tid, i]
@@ -2752,6 +2931,8 @@ def get_foot_states(
     env_contact_count: wp.array(dtype=int),
     max_contacts_per_env: int,
     use_binning: int,
+    active_mask: wp.array(dtype=int),
+    active_mask_num_envs: int,
     # outputs
     point_vec: wp.array(dtype=wp.vec3),
     foot_vel: wp.array(dtype=wp.vec3),
@@ -3737,7 +3918,7 @@ def compute_bundle_substep_flags(
     Layout of ``readback`` (size 8 + 2*num_envs):
       [0] trigger count           [1] any active-after
       [2] any reperturb           [3] any do_average
-      [4] any continuation (pre-clear)
+      [4] any continuation (pre-clear)  [5] active-after count
       [8 : 8+num_envs]            per-env trigger mask
       [8+num_envs : 8+2*num_envs] per-env contact_feet_mask
     The racy ``readback[i] = 1`` writes are same-value and benign.
@@ -3770,6 +3951,7 @@ def compute_bundle_substep_flags(
         wp.atomic_add(readback, 0, 1)
     if active_after == 1:
         readback[1] = 1
+        wp.atomic_add(readback, 5, 1)
     if rep == 1:
         readback[2] = 1
     if do_avg == 1:
@@ -4251,6 +4433,10 @@ class MoreauIntegrator:
         self._bundle_perturbation_tol = 1e-5
         self._bundle_perturbation_clamp_q = 0.1
         self._bundle_perturbation_clamp_qd = 0.5
+        # Skip inactive main-env slots throughout the sample-major inner
+        # bundle pipeline. False retains the original full-batch execution as
+        # an A/B correctness and performance escape hatch.
+        self._bundle_active_masking = True
 
         # Per-env contact binning. True (default) -> contact kernels iterate the
         # compact per-env bucket built by bin_contacts_by_env (fast). False ->
@@ -4586,7 +4772,9 @@ class MoreauIntegrator:
             record_tape=False,
         )
 
-    def _run_fk_foot_pos(self, model, sync=True, skip_contact_bins=False):
+    def _run_fk_foot_pos(
+        self, model, sync=True, skip_contact_bins=False, active_mask=None
+    ):
         """Evaluate FK using self._fk_scratch_joint_q/_qd; return foot positions.
 
         The caller must write the desired joint configuration into
@@ -4616,7 +4804,7 @@ class MoreauIntegrator:
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                None,
+                active_mask,
                 self._fk_scratch_joint_q,
                 self._fk_scratch_joint_qd,
                 model.joint_q_start,
@@ -4661,6 +4849,8 @@ class MoreauIntegrator:
                 model.env_contact_count,
                 model.max_contacts_per_env,
                 int(self.contact_binning),
+                active_mask,
+                model.articulation_count,
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=device,
@@ -4712,7 +4902,22 @@ class MoreauIntegrator:
 
         return J_fd
 
-    def _ensure_fdfk_cmds(self, model, max_perturb_dof):
+    def _ensure_fdfk_active_mask(self, model):
+        """Return the persistent main-env mask used by recorded FD-FK commands.
+
+        Launch commands retain pointers to their arguments, so the mask array
+        must remain stable while its values change for each triggered subset.
+        """
+        key = (id(model), model.articulation_count, str(model.device))
+        if getattr(self, "_fdfk_active_mask_key", None) != key:
+            self._fdfk_active_mask = wp.zeros(
+                model.articulation_count, dtype=wp.int32, device=model.device
+            )
+            self._fdfk_active_mask_key = key
+            self._fdfk_key = None
+        return self._fdfk_active_mask
+
+    def _ensure_fdfk_cmds(self, model, max_perturb_dof, active_mask):
         """Pre-recorded Launch command objects + persistent collection buffers
         for the FD FK Jacobian sweep.
 
@@ -4734,6 +4939,7 @@ class MoreauIntegrator:
             int(max_perturb_dof),
             self._fk_scratch_joint_q.ptr,
             state.point_vec.ptr,
+            active_mask.ptr if active_mask is not None else 0,
         )
         if getattr(self, "_fdfk_key", None) == key:
             return self._fdfk_cmds
@@ -4744,7 +4950,7 @@ class MoreauIntegrator:
             dim=model.articulation_count,
             inputs=[
                 model.articulation_start,
-                None,
+                active_mask,
                 self._fk_scratch_joint_q,
                 self._fk_scratch_joint_qd,
                 model.joint_q_start,
@@ -4788,6 +4994,8 @@ class MoreauIntegrator:
                 model.env_contact_count,
                 model.max_contacts_per_env,
                 int(self.contact_binning),
+                active_mask,
+                model.articulation_count,
             ],
             outputs=[state.point_vec, state.foot_vel],
             device=model.device,
@@ -4824,6 +5032,12 @@ class MoreauIntegrator:
         fk_jq_t = wp.to_torch(self._fk_scratch_joint_q)
         e_tensor = torch.tensor(triggered_env_ids, device=torch_device, dtype=torch.long)
         dof_base = e_tensor * coord_per_env + root_q_dim  # (n_triggered,)
+        fdfk_active_mask = None
+        if getattr(self, "_bundle_active_masking", True):
+            fdfk_active_mask = self._ensure_fdfk_active_mask(model)
+            fdfk_active_mask_t = wp.to_torch(fdfk_active_mask)
+            fdfk_active_mask_t.zero_()
+            fdfk_active_mask_t[e_tensor] = 1
 
         # Run all 2*max_perturb_dof FK evaluations on torch's stream so the
         # interleaved torch writes to fk_jq_t and the Warp FK launches are
@@ -4843,7 +5057,7 @@ class MoreauIntegrator:
             # math (mean over the same slot values, subtract, divide) is
             # identical to the per-iteration version — bit-exact.
             fk_cmd, foot_cmd, pv_t, plus_buf, minus_buf = self._ensure_fdfk_cmds(
-                model, max_perturb_dof
+                model, max_perturb_dof, fdfk_active_mask
             )
             with wp.ScopedStream(wp.stream_from_torch()):
                 for i in range(max_perturb_dof):
@@ -4883,10 +5097,20 @@ class MoreauIntegrator:
                     fk_jq_t[dof_indices] = main_jq_snap[dof_indices] + epsilon
                     # .clone() is required: _run_fk_foot_pos returns a view of state.point_vec, so
                     # the second FK call would overwrite fp_plus in-place without it.
-                    fp_plus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True).clone()
+                    fp_plus = self._run_fk_foot_pos(
+                        model,
+                        sync=False,
+                        skip_contact_bins=True,
+                        active_mask=fdfk_active_mask,
+                    ).clone()
 
                     fk_jq_t[dof_indices] = main_jq_snap[dof_indices] - epsilon
-                    fp_minus = self._run_fk_foot_pos(model, sync=False, skip_contact_bins=True)
+                    fp_minus = self._run_fk_foot_pos(
+                        model,
+                        sync=False,
+                        skip_contact_bins=True,
+                        active_mask=fdfk_active_mask,
+                    )
 
                     fk_jq_t[dof_indices] = main_jq_snap[dof_indices]  # restore
 
@@ -5151,6 +5375,7 @@ class MoreauIntegrator:
         num_envs = model.articulation_count
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
+        bodies_per_articulation = int(model.body_count / num_envs)
         leg_dof_count = dof_per_env - root_qd_dim
 
         # --- Checkpointed-backward replay fast path -------------------------
@@ -5825,6 +6050,13 @@ class MoreauIntegrator:
         # otherwise leak stale Jc entries for inactive contact slots into the
         # next substep's prox solve. Default False keeps SHAC bit-identical.
         zero_sparse_buffers=False,
+        # Optional per-original-env mask for sparse bundle rollouts. Bundle
+        # samples are laid out sample-major, so articulation ``a`` belongs to
+        # original env ``a % active_mask_num_envs``. Inactive branch slots are
+        # never consumed by the bundle merge and can skip all dynamics/contact
+        # work (including the generated adjoint kernels).
+        active_mask=None,
+        active_mask_num_envs=0,
     ):
         _ensure_motor_limit_arrays(model, max_torque, peak_torque, velocity_limit)
         if mode == "bundle":
@@ -5839,6 +6071,7 @@ class MoreauIntegrator:
             )
 
         self._ensure_contact_metadata(model)
+        bodies_per_articulation = int(model.body_count / model.articulation_count)
 
         if zero_sparse_buffers:
             # Match SHAC's per-substep fresh-zero allocation for the matrices
@@ -5923,6 +6156,9 @@ class MoreauIntegrator:
                 q_local_in,
                 state_in.joint_qd,
                 dt,
+                bodies_per_articulation,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_mid.joint_q],
             device=model.device,
@@ -5944,6 +6180,8 @@ class MoreauIntegrator:
                 model.joint_X_cm,
                 model.joint_axis,
                 model.joint_axis_start,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_mid.body_X_sc, state_mid.body_X_sm],
             device=model.device,
@@ -5971,6 +6209,8 @@ class MoreauIntegrator:
                 state_mid.body_X_sm,
                 model.joint_X_p,  # now, originally joint_X_pj
                 model.gravity,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[
                 state_mid.joint_S_s,
@@ -5984,7 +6224,7 @@ class MoreauIntegrator:
 
         # eval mass matrix
         if update_mass_matrix:
-            self.eval_mass_matrix(model, state_mid)
+            self.eval_mass_matrix(model, state_mid, active_mask, active_mask_num_envs)
 
         # eval_tau (tau will be h)
         # kernel 17
@@ -6016,16 +6256,22 @@ class MoreauIntegrator:
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_mid.body_ft_s, state_mid.joint_tau],
             device=model.device,
         )
 
         # eval Jc, G, and c
-        self.eval_contact_quantities(model, state_in, state_mid, dt)
+        self.eval_contact_quantities(
+            model, state_in, state_mid, dt, active_mask, active_mask_num_envs
+        )
 
         # prox iteration
-        self.eval_contact_forces(model, state_mid, dt, prox_iter, mode)
+        self.eval_contact_forces(
+            model, state_mid, dt, prox_iter, mode, active_mask, active_mask_num_envs
+        )
 
         # recompute tau with contact forces
         # kernel 5
@@ -6057,6 +6303,8 @@ class MoreauIntegrator:
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_out.body_ft_s, state_out.joint_tau],
             device=model.device,
@@ -6075,6 +6323,9 @@ class MoreauIntegrator:
                 model.L,
                 state_out.joint_tau,
                 state_out.tmp,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_out.joint_qdd],
             device=model.device,
@@ -6118,6 +6369,9 @@ class MoreauIntegrator:
                 state_in.joint_qd,
                 state_out.joint_qdd,
                 dt,
+                bodies_per_articulation,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[joint_q_local_out, joint_qd_input_frame_out],
             device=model.device,
@@ -6219,6 +6473,8 @@ class MoreauIntegrator:
                 model.joint_X_cm,
                 model.joint_axis,
                 model.joint_axis_start,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_out.body_X_sc, state_out.body_X_sm],
             device=model.device,
@@ -6246,6 +6502,8 @@ class MoreauIntegrator:
                 state_out.body_X_sm,
                 model.joint_X_p,  # now, originally joint_X_pj
                 model.gravity,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[
                 state_out.joint_S_s,
@@ -6275,7 +6533,8 @@ class MoreauIntegrator:
         wp.launch(
             kernel=inertial_body_pos_vel,
             dim=model.articulation_count,
-            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
+            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s,
+                    active_mask, active_mask_num_envs],
             outputs=[out_body_q, state_out.body_qd],
         )
 
@@ -6284,7 +6543,7 @@ class MoreauIntegrator:
         wp.launch(
             kernel=copy_relevant_states,
             dim=model.articulation_count,
-            inputs=[state_mid.percussion],
+            inputs=[state_mid.percussion, active_mask, active_mask_num_envs],
             outputs=[state_out.percussion],
         )
         # get_foot_states
@@ -6324,6 +6583,8 @@ class MoreauIntegrator:
                 model.env_contact_count,
                 model.max_contacts_per_env,
                 int(self.contact_binning),
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[out_point_vec, state_out.foot_vel],
         )
@@ -6422,6 +6683,7 @@ class MoreauIntegrator:
         num_envs = model.articulation_count
         coord_per_env = int(model.joint_coord_count / num_envs)
         dof_per_env = int(model.joint_dof_count / num_envs)
+        bodies_per_articulation = int(model.body_count / num_envs)
 
         # Lazily allocate integrator-owned bundle buffers. Also derives and
         # caches root_q_dim / root_qd_dim from model metadata.
@@ -6499,6 +6761,9 @@ class MoreauIntegrator:
                 state_in.joint_q,
                 state_in.joint_qd,
                 dt,
+                bodies_per_articulation,
+                None,
+                0,
             ],
             outputs=[state_mid.joint_q],
             device=device,
@@ -6519,6 +6784,8 @@ class MoreauIntegrator:
                 model.joint_X_cm,
                 model.joint_axis,
                 model.joint_axis_start,
+                None,
+                0,
             ],
             outputs=[state_mid.body_X_sc, state_mid.body_X_sm],
             device=device,
@@ -6545,6 +6812,8 @@ class MoreauIntegrator:
                 state_mid.body_X_sm,
                 model.joint_X_p,
                 model.gravity,
+                None,
+                0,
             ],
             outputs=[
                 state_mid.joint_S_s,
@@ -6589,6 +6858,8 @@ class MoreauIntegrator:
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
+                None,
+                0,
             ],
             outputs=[state_mid.body_ft_s, state_mid.joint_tau],
             device=device,
@@ -6629,6 +6900,8 @@ class MoreauIntegrator:
                 model.joint_axis,
                 state_mid.joint_S_s,
                 state_mid.body_f_s,
+                None,
+                0,
             ],
             outputs=[state_out.body_ft_s, state_out.joint_tau],
             device=device,
@@ -6646,6 +6919,9 @@ class MoreauIntegrator:
                 model.L,
                 state_out.joint_tau,
                 state_out.tmp,
+                None,
+                0,
+                1,
             ],
             outputs=[state_out.joint_qdd],
             device=device,
@@ -6673,6 +6949,9 @@ class MoreauIntegrator:
                 state_in.joint_qd,
                 state_out.joint_qdd,
                 dt,
+                bodies_per_articulation,
+                None,
+                0,
             ],
             outputs=[state_out_pred.joint_q, pred_qd_input_frame],
             device=device,
@@ -6732,7 +7011,7 @@ class MoreauIntegrator:
         if self._bundle_delta_mode == "replay" and self._bundle_delta_store is not None:
             _replay_flags = self._bundle_delta_store.get(("flags", substep))
         if _replay_flags is not None:
-            (_trig_count, any_active, any_reperturb, any_avg,
+            (_trig_count, _active_count, any_active, any_reperturb, any_avg,
              any_continuation, triggered_list, feet_mask_list) = _replay_flags
         else:
             flags_readback = self._scratch(
@@ -6758,6 +7037,7 @@ class MoreauIntegrator:
             )
             rb = wp.to_torch(flags_readback).cpu()  # the substep's single D2H sync
             _trig_count = int(rb[0])
+            _active_count = int(rb[5])
             any_active = bool(rb[1])
             any_reperturb = bool(rb[2])
             any_avg = bool(rb[3])
@@ -6767,7 +7047,7 @@ class MoreauIntegrator:
             feet_mask_list = rb[8 + num_envs:8 + 2 * num_envs].tolist()
             if self._bundle_delta_mode == "record" and self._bundle_delta_store is not None:
                 self._bundle_delta_store[("flags", substep)] = (
-                    _trig_count, any_active, any_reperturb, any_avg,
+                    _trig_count, _active_count, any_active, any_reperturb, any_avg,
                     any_continuation, triggered_list, feet_mask_list,
                 )
 
@@ -6871,6 +7151,8 @@ class MoreauIntegrator:
         # the count comes from the fused flags readback above.
         self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
         self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
+        self._bundle_active_count_total = getattr(self, "_bundle_active_count_total", 0) + _active_count
+        self._bundle_active_env_substeps = getattr(self, "_bundle_active_env_substeps", 0) + num_envs
         any_triggered = _trig_count > 0
         if any_triggered:
             # 1) Initialize perturbed branches into init_state (fresh
@@ -7016,12 +7298,19 @@ class MoreauIntegrator:
             # scratch allocations can be pooled per (name, outer substep).
             self._scratch_inner_substep = substep
             try:
+                inner_active_mask = (
+                    bundle_active_snapshot
+                    if getattr(self, "_bundle_active_masking", True)
+                    else None
+                )
                 self.simulate(
                     bundle_model, b_in, b_out_pred, b_mid, chain_out,
                     dt, requires_grad, update_mass_matrix, prox_iter, max_torque,
                     peak_torque, velocity_limit,
                     mode=inner_mode,
                     substep=0, num_substeps=1,
+                    active_mask=inner_active_mask,
+                    active_mask_num_envs=num_envs if inner_active_mask is not None else 0,
                 )
             finally:
                 self._scratch_inner_substep = None
@@ -7296,6 +7585,8 @@ class MoreauIntegrator:
                 model.joint_X_cm,
                 model.joint_axis,
                 model.joint_axis_start,
+                None,
+                0,
             ],
             outputs=[state_out.body_X_sc, state_out.body_X_sm],
             device=device,
@@ -7322,6 +7613,8 @@ class MoreauIntegrator:
                 state_out.body_X_sm,
                 model.joint_X_p,
                 model.gravity,
+                None,
+                0,
             ],
             outputs=[
                 state_out.joint_S_s,
@@ -7348,7 +7641,8 @@ class MoreauIntegrator:
         wp.launch(
             kernel=inertial_body_pos_vel,
             dim=num_envs,
-            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s],
+            inputs=[model.articulation_start, state_out.body_X_sc, state_out.body_v_s,
+                    None, 0],
             outputs=[rc_out_body_q, state_out.body_qd],
         )
 
@@ -7356,7 +7650,7 @@ class MoreauIntegrator:
         wp.launch(
             kernel=copy_relevant_states,
             dim=num_envs,
-            inputs=[state_mid.percussion],
+            inputs=[state_mid.percussion, None, 0],
             outputs=[state_out.percussion],
         )
 
@@ -7397,6 +7691,8 @@ class MoreauIntegrator:
                 model.env_contact_count,
                 model.max_contacts_per_env,
                 int(self.contact_binning),
+                None,
+                0,
             ],
             outputs=[rc_out_point_vec, state_out.foot_vel],
         )
@@ -7451,7 +7747,7 @@ class MoreauIntegrator:
 
         return state_out
 
-    def eval_mass_matrix(self, model, state_mid):
+    def eval_mass_matrix(self, model, state_mid, active_mask=None, active_mask_num_envs=0):
         # build J
         # kernel 22
         wp.launch(
@@ -7464,6 +7760,8 @@ class MoreauIntegrator:
                 model.joint_parent,
                 model.joint_qd_start,
                 state_mid.joint_S_s,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[model.J],
             device=model.device,
@@ -7479,6 +7777,8 @@ class MoreauIntegrator:
                 model.articulation_start,  # now, originally articulation_joint_start
                 model.articulation_M_start,
                 state_mid.body_I_s,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[model.M],
             device=model.device,
@@ -7500,6 +7800,8 @@ class MoreauIntegrator:
             model.J,
             model.P,
             device=model.device,
+            active_mask=active_mask,
+            active_mask_num_envs=active_mask_num_envs,
         )
 
         # form H = J^T*P
@@ -7518,6 +7820,8 @@ class MoreauIntegrator:
             model.P,
             model.H,
             device=model.device,
+            active_mask=active_mask,
+            active_mask_num_envs=active_mask_num_envs,
         )
 
         # compute decomposition
@@ -7525,7 +7829,9 @@ class MoreauIntegrator:
         wp.launch(
             kernel=eval_dense_cholesky_batched,
             dim=model.articulation_count,
-            inputs=[model.articulation_H_start, model.articulation_H_rows, model.H, model.joint_armature],
+            inputs=[model.articulation_H_start, model.articulation_H_rows,
+                    model.H, model.joint_armature, active_mask,
+                    active_mask_num_envs],
             outputs=[model.L],
             device=model.device,
         )
@@ -7580,7 +7886,10 @@ class MoreauIntegrator:
             record_tape=False,
         )
 
-    def eval_contact_quantities(self, model, state_in, state_mid, dt):
+    def eval_contact_quantities(
+        self, model, state_in, state_mid, dt,
+        active_mask=None, active_mask_num_envs=0,
+    ):
         # Bucket contacts per env so the contact kernels skip the O(N^2) scan.
         self._ensure_contact_bins(model)
         # construct J_c
@@ -7613,6 +7922,8 @@ class MoreauIntegrator:
                 model.env_contact_count,
                 model.max_contacts_per_env,
                 int(self.contact_binning),
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[model.Jc, model.c_body_vec, state_mid.point_vec],
             device=model.device,
@@ -7629,11 +7940,17 @@ class MoreauIntegrator:
         # gradient-less and its adjoint is recovered by a separate race-free
         # kernel (see _solve_inv_m_times_jct_fused_grad).
         if self.fused_contact_solve and wp.context.runtime.tape is None:
-            self._solve_inv_m_times_jct_fused(model, state_mid)
+            self._solve_inv_m_times_jct_fused(
+                model, state_mid, active_mask, active_mask_num_envs
+            )
         elif self.fused_contact_solve and getattr(self, "fused_contact_solve_grad", False):
-            self._solve_inv_m_times_jct_fused_grad(model, state_mid)
+            self._solve_inv_m_times_jct_fused_grad(
+                model, state_mid, active_mask, active_mask_num_envs
+            )
         else:
-            self._eval_inv_m_times_jct_split(model, state_mid)
+            self._eval_inv_m_times_jct_split(
+                model, state_mid, active_mask, active_mask_num_envs
+            )
 
         # compute G = Jc*(H^-1*Jc^T)
         # kernel 14
@@ -7651,6 +7968,8 @@ class MoreauIntegrator:
             state_mid.Inv_M_times_Jc_t,
             model.G,
             device=model.device,
+            active_mask=active_mask,
+            active_mask_num_envs=active_mask_num_envs,
         )
 
         # convert G to matrix
@@ -7658,7 +7977,8 @@ class MoreauIntegrator:
         wp.launch(
             kernel=convert_G_to_matrix,
             dim=model.articulation_count,
-            inputs=[model.articulation_G_start, model.G],
+            inputs=[model.articulation_G_start, model.G, active_mask,
+                    active_mask_num_envs],
             outputs=[model.G_mat],
             device=model.device,
         )
@@ -7676,6 +7996,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.joint_tau,
                 state_mid.tmp_inv_m_times_h,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.inv_m_times_h],
             device=model.device,
@@ -7697,6 +8020,8 @@ class MoreauIntegrator:
             state_mid.inv_m_times_h,
             state_mid.Jc_times_inv_m_times_h,
             device=model.device,
+            active_mask=active_mask,
+            active_mask_num_envs=active_mask_num_envs,
         )
 
         # compute Jc*qd
@@ -7715,6 +8040,8 @@ class MoreauIntegrator:
             state_in.joint_qd,
             state_mid.Jc_qd,
             device=model.device,
+            active_mask=active_mask,
+            active_mask_num_envs=active_mask_num_envs,
         )
 
         # compute Jc*qd + Jc*(H^-1*h(tau)) * dt
@@ -7728,6 +8055,8 @@ class MoreauIntegrator:
                 state_mid.Jc_qd,
                 state_mid.Jc_times_inv_m_times_h,
                 dt,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_mid.c],
             device=model.device,
@@ -7738,12 +8067,14 @@ class MoreauIntegrator:
         wp.launch(
             kernel=convert_c_to_vector,
             dim=model.articulation_count,
-            inputs=[state_mid.c],
+            inputs=[state_mid.c, active_mask, active_mask_num_envs],
             outputs=[state_mid.c_vec],
             device=model.device,
         )
 
-    def _eval_inv_m_times_jct_split(self, model, state_mid):
+    def _eval_inv_m_times_jct_split(
+        self, model, state_mid, active_mask=None, active_mask_num_envs=0,
+    ):
         """Legacy per-column solve of X = H^-1 * Jc^T (24 contact-dim columns).
 
         Splits model.Jc into 24 per-column vectors, launches 24 separate
@@ -7760,6 +8091,8 @@ class MoreauIntegrator:
                 int(model.joint_dof_count / model.articulation_count),
                 model.articulation_Jc_start,
                 model.articulation_dof_start,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[
                 state_mid.Jc_1,
@@ -7801,6 +8134,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_1,
                 state_mid.tmp_1,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_1],
             device=model.device,
@@ -7817,6 +8153,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_2,
                 state_mid.tmp_2,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_2],
             device=model.device,
@@ -7833,6 +8172,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_3,
                 state_mid.tmp_3,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_3],
             device=model.device,
@@ -7849,6 +8191,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_4,
                 state_mid.tmp_4,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_4],
             device=model.device,
@@ -7865,6 +8210,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_5,
                 state_mid.tmp_5,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_5],
             device=model.device,
@@ -7881,6 +8229,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_6,
                 state_mid.tmp_6,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_6],
             device=model.device,
@@ -7897,6 +8248,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_7,
                 state_mid.tmp_7,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_7],
             device=model.device,
@@ -7913,6 +8267,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_8,
                 state_mid.tmp_8,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_8],
             device=model.device,
@@ -7929,6 +8286,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_9,
                 state_mid.tmp_9,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_9],
             device=model.device,
@@ -7945,6 +8305,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_10,
                 state_mid.tmp_10,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_10],
             device=model.device,
@@ -7961,6 +8324,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_11,
                 state_mid.tmp_11,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_11],
             device=model.device,
@@ -7977,6 +8343,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_12,
                 state_mid.tmp_12,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_12],
             device=model.device,
@@ -7993,6 +8362,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_13,
                 state_mid.tmp_13,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_13],
             device=model.device,
@@ -8009,6 +8381,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_14,
                 state_mid.tmp_14,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_14],
             device=model.device,
@@ -8025,6 +8400,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_15,
                 state_mid.tmp_15,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_15],
             device=model.device,
@@ -8041,6 +8419,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_16,
                 state_mid.tmp_16,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_16],
             device=model.device,
@@ -8057,6 +8438,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_17,
                 state_mid.tmp_17,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_17],
             device=model.device,
@@ -8073,6 +8457,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_18,
                 state_mid.tmp_18,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_18],
             device=model.device,
@@ -8089,6 +8476,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_19,
                 state_mid.tmp_19,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_19],
             device=model.device,
@@ -8105,6 +8495,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_20,
                 state_mid.tmp_20,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_20],
             device=model.device,
@@ -8121,6 +8514,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_21,
                 state_mid.tmp_21,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_21],
             device=model.device,
@@ -8137,6 +8533,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_22,
                 state_mid.tmp_22,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_22],
             device=model.device,
@@ -8153,6 +8552,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_23,
                 state_mid.tmp_23,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_23],
             device=model.device,
@@ -8169,6 +8571,9 @@ class MoreauIntegrator:
                 model.L,
                 state_mid.Jc_24,
                 state_mid.tmp_24,
+                active_mask,
+                active_mask_num_envs,
+                1,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t_24],
             device=model.device,
@@ -8205,6 +8610,8 @@ class MoreauIntegrator:
                 state_mid.Inv_M_times_Jc_t_22,
                 state_mid.Inv_M_times_Jc_t_23,
                 state_mid.Inv_M_times_Jc_t_24,
+                active_mask,
+                active_mask_num_envs,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t],
         )
@@ -8226,7 +8633,9 @@ class MoreauIntegrator:
             b_start, dtype=wp.int32, device=model.device
         )
 
-    def _solve_inv_m_times_jct_fused(self, model, state_mid):
+    def _solve_inv_m_times_jct_fused(
+        self, model, state_mid, active_mask=None, active_mask_num_envs=0,
+    ):
         """Fused single-launch solve of X = H^-1 * Jc^T for all 24 contact-dim
         columns at once: one dense_solve_batched over (articulation_count * 24)
         threads, reading model.Jc and writing state_mid.Inv_M_times_Jc_t in the
@@ -8245,6 +8654,9 @@ class MoreauIntegrator:
                 model.L,
                 model.Jc,
                 state_mid.Inv_M_times_Jc_t,  # tmp — unused by the forward solve
+                active_mask,
+                active_mask_num_envs,
+                24,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t],
             device=model.device,
@@ -8289,7 +8701,9 @@ class MoreauIntegrator:
             cache[model.H.ptr] = alias
         return tmp, alias
 
-    def _solve_inv_m_times_jct_fused_grad(self, model, state_mid):
+    def _solve_inv_m_times_jct_fused_grad(
+        self, model, state_mid, active_mask=None, active_mask_num_envs=0,
+    ):
         """Tape-recording fused solve of X = H^-1 * Jc^T (all 24 columns).
 
         Same single launch as ``_solve_inv_m_times_jct_fused``, but safe to
@@ -8345,7 +8759,8 @@ class MoreauIntegrator:
                 wp.launch(
                     kernel=accum_adj_H_from_fused_solve,
                     dim=(n_art, max_rows, max_rows),
-                    inputs=[24, H_start, H_rows, b_start, tmp, x],
+                    inputs=[24, H_start, H_rows, b_start, tmp, x,
+                            active_mask, active_mask_num_envs],
                     outputs=[H_grad],
                     device=device,
                 )
@@ -8364,12 +8779,18 @@ class MoreauIntegrator:
                 model.L,
                 model.Jc,
                 tmp,
+                active_mask,
+                active_mask_num_envs,
+                24,
             ],
             outputs=[state_mid.Inv_M_times_Jc_t],
             device=model.device,
         )
 
-    def eval_contact_forces(self, model, state_mid, dt, prox_iter, mode):
+    def eval_contact_forces(
+        self, model, state_mid, dt, prox_iter, mode,
+        active_mask=None, active_mask_num_envs=0,
+    ):
         # Select prox kernel variant based on number of contacts per env
         n_contacts = getattr(model, "num_contacts_per_env", 4)
         if n_contacts >= 8:
@@ -8388,7 +8809,9 @@ class MoreauIntegrator:
             wp.launch(
                 kernel=_unrolled,
                 dim=model.articulation_count,
-                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
+                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec,
+                        prox_iter, model.shape_materials, active_mask,
+                        active_mask_num_envs],
                 outputs=[state_mid.percussion],
                 device=model.device,
             )
@@ -8404,6 +8827,8 @@ class MoreauIntegrator:
                     prox_iter,
                     model.sigmoid_scale,
                     model.shape_materials,
+                    active_mask,
+                    active_mask_num_envs,
                 ],
                 outputs=[state_mid.percussion],
                 device=model.device,
@@ -8421,6 +8846,8 @@ class MoreauIntegrator:
                     prox_iter,
                     model.sigmoid_scale,
                     model.shape_materials,
+                    active_mask,
+                    active_mask_num_envs,
                 ],
                 outputs=[state_mid.percussion],
                 device=model.device,
@@ -8429,7 +8856,9 @@ class MoreauIntegrator:
             wp.launch(
                 kernel=_unrolled,
                 dim=model.articulation_count,
-                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec, prox_iter, model.shape_materials],
+                inputs=[model.articulation_count, model.G_mat, state_mid.c_vec,
+                        prox_iter, model.shape_materials, active_mask,
+                        active_mask_num_envs],
                 outputs=[state_mid.percussion],
                 device=model.device,
                 record_tape=False,
@@ -8441,7 +8870,8 @@ class MoreauIntegrator:
         wp.launch(
             kernel=p_to_f_s,
             dim=model.articulation_count,
-            inputs=[model.c_body_vec, state_mid.point_vec, state_mid.percussion, dt],
+            inputs=[model.c_body_vec, state_mid.point_vec, state_mid.percussion,
+                    dt, active_mask, active_mask_num_envs],
             outputs=[state_mid.body_f_s],
             device=model.device,
         )
