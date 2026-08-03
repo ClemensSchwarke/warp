@@ -4468,6 +4468,30 @@ class MoreauIntegrator:
         # from cfg.sim.fused_contact_solve_grad.
         self.fused_contact_solve_grad = False
 
+        # Cache the per-env contact buckets across substeps. The buckets are a
+        # pure function of `rigid_contact_body0`, and the FLAT moreau path runs
+        # `wp.sim.collide` exactly once (at WpInterface init — ground-plane
+        # contacts only, never refreshed), so the bucket assignment is a
+        # constant of the model and re-deriving it every substep is pure waste.
+        # `sort_env_contact_bins` alone costs ~1.2 ms per launch (an O(k^2)
+        # insertion sort on only `articulation_count` threads) and ran ~96
+        # times per SHAC iteration. Cleared by `invalidate_contact_bins` if
+        # the bucket arrays are ever (re)allocated. Set by WpInterface from
+        # cfg.sim.cache_contact_bins.
+        self.cache_contact_bins = True
+
+        # Reuse the per-substep env-local-recentering scratch arrays (9 per
+        # simulate() call) instead of allocating them fresh. Each fresh
+        # wp.zeros is a device allocation whose eventual free synchronizes;
+        # they measured ~14% of the host time in a SHAC rollout forward. The
+        # slots are value-zeroed on reuse, so the caller sees exactly what a
+        # fresh allocation would have given it. Set by WpInterface from
+        # cfg.sim.reuse_scratch_buffers -- and ONLY when checkpointing is on,
+        # because without it every (step, substep) tape stays live until
+        # backward and a shared buffer would be read by more than one tape.
+        self.pool_step_scratch = False
+        self._step_scratch_pool = {}
+
     @staticmethod
     def _ensure_contact_metadata(model):
         """Provide backward-compatible defaults for flat contact selection."""
@@ -4696,6 +4720,35 @@ class MoreauIntegrator:
         else:
             arr.zero_()
         return arr
+
+    def _step_scratch(self, key, substep, shape, dtype, device, requires_grad=False):
+        """Per-(key, substep) pooled scratch for the FLAT (non-bundle) path.
+
+        Mirrors :meth:`_scratch` but keeps its own dict so an outer-step slot
+        can never alias a bundle inner slot. Only used when WpInterface set
+        ``pool_step_scratch`` (checkpointing on), where at most one substep's
+        tape is live at a time -- the same safety argument the bundle pool
+        documents. Each slot is value-zeroed on reuse, so the caller sees the
+        fresh-allocation state a ``wp.zeros`` would have given it.
+        """
+        pool = self._step_scratch_pool
+        pool_key = (key, substep)
+        # Compare against the REQUESTED spec, not the array's resolved
+        # attributes: callers pass Python `float`, which warp resolves to
+        # wp.float32, so an `arr.dtype is dtype` test would miss every time and
+        # silently reallocate.
+        spec = (shape, dtype, requires_grad, str(device))
+        cached = pool.get(pool_key)
+        if cached is None or cached[0] != spec:
+            entry = wp.zeros(shape, dtype=dtype, device=device,
+                             requires_grad=requires_grad)
+            pool[pool_key] = (spec, entry)
+            return entry
+        entry = cached[1]
+        entry.zero_()
+        if entry.grad is not None:
+            entry.grad.zero_()
+        return entry
 
     def _pooled_alloc_mm(self, bundle_model, substep, requires_grad):
         """Bind bundle_model's mass/contact matrices for this substep: a pooled
@@ -6101,6 +6154,32 @@ class MoreauIntegrator:
         # semantics, no cudaMalloc/cudaFree churn.
         _inner_ss = getattr(self, "_scratch_inner_substep", None)
         _inner_pooled = getattr(self, "_pool_active", False) and _inner_ss is not None
+        # Same pooling for the FLAT (non-bundle) SHAC path, keyed by the outer
+        # substep index and living in its own dict so it can never alias the
+        # bundle inner pool. Enabled by `pool_step_scratch`, which WpInterface
+        # only sets when checkpointing is on -- without checkpointing every
+        # (step, substep) tape stays live until backward, so a buffer shared
+        # across steps would be read by more than one tape.
+        #
+        # Restricted to `_inner_ss is None`, i.e. genuine outer substeps: every
+        # inner bundle substep is invoked with substep=0, so keying on
+        # `substep` there would alias a whole bundle horizon onto one slot
+        # within a single live tape. Inner calls therefore either use the
+        # bundle pool (_inner_pooled) or fall back to fresh wp.zeros, exactly
+        # as before this flag existed.
+        _outer_pooled = (_inner_ss is None) and bool(
+            getattr(self, "pool_step_scratch", False))
+
+        def _recenter_scratch(key, shape, dtype, requires_grad):
+            if _inner_pooled:
+                return self._scratch(key, _inner_ss, shape, dtype, model.device,
+                                     requires_grad=requires_grad)
+            if _outer_pooled:
+                return self._step_scratch(key, substep, shape, dtype, model.device,
+                                          requires_grad=requires_grad)
+            return wp.zeros(shape, dtype=dtype, device=model.device,
+                            requires_grad=requires_grad)
+
         p_ref = None
         q_local_in = state_in.joint_q
         if recenter and model.joint_count:
@@ -6109,16 +6188,7 @@ class MoreauIntegrator:
             dof_per_env = int(len(state_in.joint_qd) // max(art_count, 1))
             self._recenter_coord_per_env = coord_per_env
             self._recenter_dof_per_env = dof_per_env
-            if _inner_pooled:
-                p_ref = self._scratch(
-                    "in_p_ref", _inner_ss, art_count, wp.vec3, model.device,
-                    requires_grad=requires_grad,
-                )
-            else:
-                p_ref = wp.zeros(
-                    art_count, dtype=wp.vec3, device=model.device,
-                    requires_grad=requires_grad,
-                )
+            p_ref = _recenter_scratch("in_p_ref", art_count, wp.vec3, requires_grad)
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=art_count,
@@ -6126,16 +6196,8 @@ class MoreauIntegrator:
                 outputs=[p_ref],
                 device=model.device,
             )
-            if _inner_pooled:
-                q_local_in = self._scratch(
-                    "in_q_local", _inner_ss, len(state_in.joint_q), float,
-                    model.device, requires_grad=requires_grad,
-                )
-            else:
-                q_local_in = wp.zeros(
-                    len(state_in.joint_q), dtype=float, device=model.device,
-                    requires_grad=requires_grad,
-                )
+            q_local_in = _recenter_scratch(
+                "in_q_local", len(state_in.joint_q), float, requires_grad)
             wp.launch(
                 kernel=recenter_joint_q_xz,
                 dim=len(state_in.joint_q),
@@ -6343,18 +6405,12 @@ class MoreauIntegrator:
         # recenters q about a new origin while retaining qd about the old one,
         # producing a physical velocity jump -omega x delta.
         if recenter and p_ref is not None:
-            if _inner_pooled:
-                joint_q_local_out = self._scratch(
-                    "in_jq_out", _inner_ss, len(state_out.joint_q), float,
-                    model.device, requires_grad=state_out.joint_q.requires_grad,
-                )
-                joint_qd_input_frame_out = self._scratch(
-                    "in_jqd_old_frame", _inner_ss, len(state_out.joint_qd), float,
-                    model.device, requires_grad=state_out.joint_qd.requires_grad,
-                )
-            else:
-                joint_q_local_out = wp.zeros_like(state_out.joint_q)
-                joint_qd_input_frame_out = wp.zeros_like(state_out.joint_qd)
+            joint_q_local_out = _recenter_scratch(
+                "in_jq_out", len(state_out.joint_q), float,
+                state_out.joint_q.requires_grad)
+            joint_qd_input_frame_out = _recenter_scratch(
+                "in_jqd_old_frame", len(state_out.joint_qd), float,
+                state_out.joint_qd.requires_grad)
         else:
             joint_q_local_out = state_out.joint_q
             joint_qd_input_frame_out = state_out.joint_qd
@@ -6405,29 +6461,13 @@ class MoreauIntegrator:
             # The position subtraction/restoration and omega x delta velocity
             # transform are all recorded, so this is one coherent coordinate
             # change in both the forward and its adjoint.
-            if _inner_pooled:
-                output_delta_ref = self._scratch(
-                    "in_out_delta_ref", _inner_ss, model.articulation_count,
-                    wp.vec3, model.device, requires_grad=requires_grad,
-                )
-                joint_q_tail = self._scratch(
-                    "in_jq_tail", _inner_ss, len(state_out.joint_q), float,
-                    model.device, requires_grad=state_out.joint_q.requires_grad,
-                )
-                output_p_ref = self._scratch(
-                    "in_out_p_ref", _inner_ss, model.articulation_count,
-                    wp.vec3, model.device, requires_grad=requires_grad,
-                )
-            else:
-                output_delta_ref = wp.zeros(
-                    model.articulation_count, dtype=wp.vec3, device=model.device,
-                    requires_grad=requires_grad,
-                )
-                joint_q_tail = wp.zeros_like(state_out.joint_q)
-                output_p_ref = wp.zeros(
-                    model.articulation_count, dtype=wp.vec3, device=model.device,
-                    requires_grad=requires_grad,
-                )
+            output_delta_ref = _recenter_scratch(
+                "in_out_delta_ref", model.articulation_count, wp.vec3, requires_grad)
+            joint_q_tail = _recenter_scratch(
+                "in_jq_tail", len(state_out.joint_q), float,
+                state_out.joint_q.requires_grad)
+            output_p_ref = _recenter_scratch(
+                "in_out_p_ref", model.articulation_count, wp.vec3, requires_grad)
             wp.launch(
                 kernel=recenter_compute_root_xz_ref,
                 dim=model.articulation_count,
@@ -6520,14 +6560,9 @@ class MoreauIntegrator:
         # The body_X_sc above is env-local, so body_q lands local and is shifted
         # to world below; body_qd is frame-invariant.
         if recenter and p_ref is not None:
-            if _inner_pooled:
-                out_body_q = self._scratch(
-                    "in_body_q", _inner_ss, len(state_out.body_q),
-                    state_out.body_q.dtype, model.device,
-                    requires_grad=state_out.body_q.requires_grad,
-                )
-            else:
-                out_body_q = wp.zeros_like(state_out.body_q)
+            out_body_q = _recenter_scratch(
+                "in_body_q", len(state_out.body_q), state_out.body_q.dtype,
+                state_out.body_q.requires_grad)
         else:
             out_body_q = state_out.body_q
         wp.launch(
@@ -6549,14 +6584,9 @@ class MoreauIntegrator:
         # get_foot_states
         # kernel -2
         if recenter and p_ref is not None:
-            if _inner_pooled:
-                out_point_vec = self._scratch(
-                    "in_point_vec", _inner_ss, len(state_out.point_vec),
-                    state_out.point_vec.dtype, model.device,
-                    requires_grad=state_out.point_vec.requires_grad,
-                )
-            else:
-                out_point_vec = wp.zeros_like(state_out.point_vec)
+            out_point_vec = _recenter_scratch(
+                "in_point_vec", len(state_out.point_vec), state_out.point_vec.dtype,
+                state_out.point_vec.requires_grad)
         else:
             out_point_vec = state_out.point_vec
         wp.launch(
@@ -7844,6 +7874,11 @@ class MoreauIntegrator:
         O(num_contacts) binning pass groups each env's contacts so those
         kernels iterate only their own handful of slots. Buffers live on the
         passed-in model so this works for both the main model and bundle_model.
+
+        With ``cache_contact_bins`` the bin+sort pair runs once per model
+        instead of once per substep: the buckets depend only on
+        ``rigid_contact_body0``, which the flat moreau path fills a single time
+        (one ``wp.sim.collide`` at WpInterface init) and never refreshes.
         """
         nart = model.articulation_count
         rcm = model.rigid_contact_max
@@ -7855,10 +7890,15 @@ class MoreauIntegrator:
             model.env_contact_ids = wp.zeros(nart * maxc, dtype=wp.int32, device=model.device)
             model.env_contact_count = wp.zeros(nart, dtype=wp.int32, device=model.device)
             model.max_contacts_per_env = int(maxc)
+            model._moreau_contact_bins_valid = False
         # Binning disabled: the consumer kernels do the full-table scan and never
         # read the buckets, so skip the (useless) bin + sort launches. The arrays
         # stay allocated so the kernel launch arguments remain valid.
         if not self.contact_binning:
+            return
+        # Already binned this (static) contact table -- the buckets still hold
+        # exactly what the launches below would rewrite.
+        if self.cache_contact_bins and getattr(model, "_moreau_contact_bins_valid", False):
             return
         model.env_contact_count.zero_()
         wp.launch(
@@ -7885,6 +7925,17 @@ class MoreauIntegrator:
             device=model.device,
             record_tape=False,
         )
+        model._moreau_contact_bins_valid = True
+
+    @staticmethod
+    def invalidate_contact_bins(model):
+        """Force the next `_ensure_contact_bins` to re-derive the buckets.
+
+        Call this if anything ever rewrites ``model.rigid_contact_body0`` after
+        init (a second ``wp.sim.collide``, a changed body layout). Nothing in
+        the flat moreau path does, which is why the cache is safe by default.
+        """
+        model._moreau_contact_bins_valid = False
 
     def eval_contact_quantities(
         self, model, state_in, state_mid, dt,
