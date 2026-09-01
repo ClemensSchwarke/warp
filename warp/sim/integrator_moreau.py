@@ -242,6 +242,7 @@ def jcalc_tau(
     limit_k_d: float,
     joint_static_friction: float,
     joint_dynamic_friction: float,
+    joint_friction_vel_scale: float,
     max_torque: wp.array(dtype=float),
     peak_torque: wp.array(dtype=float),
     velocity_limit: wp.array(dtype=float),
@@ -290,7 +291,26 @@ def jcalc_tau(
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
         t_2 = wp.clamp(t_2 + act, min_torque_limit, max_torque_limit)
 
-        tau[dof_start] = t_1 + t_2
+        # Dry (Coulomb) joint friction -- MuJoCo's `frictionloss`, the gearbox
+        # breakaway torque. It is a PASSIVE joint property, so unlike the
+        # viscous term above it sits OUTSIDE the actuator's torque clamp: a
+        # gearbox does not stop rubbing when the motor saturates.
+        #
+        # sign(qd) is replaced by tanh(qd / v_s) so the term is differentiable
+        # everywhere -- SHAC backpropagates through this. v_s is the Stribeck
+        # velocity below which the joint is "stuck"; the model is therefore
+        # regularised Coulomb friction (a steep viscous ramp through zero),
+        # which is what a smooth first-order integrator can represent. It does
+        # NOT capture true stiction (zero velocity is not an attractor).
+        #
+        # joint_friction_vel_scale == 0 disables the term outright, which keeps
+        # every robot that does not configure dry friction bit-identical.
+        if joint_friction_vel_scale > 0.0:
+            tau[dof_start] = (
+                t_1 + t_2 - joint_static_friction * wp.tanh(qd / joint_friction_vel_scale)
+            )
+        else:
+            tau[dof_start] = t_1 + t_2
 
     # ball
     if type == 2:
@@ -545,6 +565,7 @@ def compute_link_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
+    joint_friction_vel_scale: float,
     max_torque: wp.array(dtype=float),
     peak_torque: wp.array(dtype=float),
     velocity_limit: wp.array(dtype=float),
@@ -592,6 +613,7 @@ def compute_link_tau(
         limit_k_d,
         static_friction,
         dynamic_friction,
+        joint_friction_vel_scale,
         max_torque,
         peak_torque,
         velocity_limit,
@@ -736,6 +758,7 @@ def eval_rigid_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
+    joint_friction_vel_scale: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -781,6 +804,7 @@ def eval_rigid_tau(
             joint_target_kd,
             joint_static_friction,
             joint_dynamic_friction,
+            joint_friction_vel_scale,
             max_torque,
             peak_torque,
             velocity_limit,
@@ -6307,6 +6331,7 @@ class MoreauIntegrator:
                 model.joint_target_kd,
                 model.joint_static_friction,
                 model.joint_dynamic_friction,
+                model.joint_friction_vel_scale,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -6354,6 +6379,7 @@ class MoreauIntegrator:
                 model.joint_target_kd,
                 model.joint_static_friction,
                 model.joint_dynamic_friction,
+                model.joint_friction_vel_scale,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -6877,6 +6903,7 @@ class MoreauIntegrator:
                 model.joint_target_kd,
                 model.joint_static_friction,
                 model.joint_dynamic_friction,
+                model.joint_friction_vel_scale,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,
@@ -6919,6 +6946,7 @@ class MoreauIntegrator:
                 model.joint_target_kd,
                 model.joint_static_friction,
                 model.joint_dynamic_friction,
+                model.joint_friction_vel_scale,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,

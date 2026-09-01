@@ -407,6 +407,7 @@ def jcalc_tau(
     limit_k_d: float,
     joint_static_friction: float,
     joint_dynamic_friction: float,
+    joint_friction_vel_scale: float,
     max_torque: wp.array(dtype=float),
     peak_torque: wp.array(dtype=float),
     velocity_limit: wp.array(dtype=float),
@@ -449,11 +450,6 @@ def jcalc_tau(
 
         # friction
         t_2 = 0.0 - target_k_e * (q - target) - target_k_d * qd  # ideal pd torque
-        # NOTE: we currently ignore if-else, since it's not diff'able and assume static friction is 0
-        # if wp.abs(t_2) > joint_static_friction:
-        #     t_2 += 0.0 - joint_dynamic_friction * qd
-        # else:
-        #     t_2 = 0.0
         t_2 += 0.0 - joint_dynamic_friction * qd
 
         # Optional DC-motor torque-speed envelope; otherwise effort clamp only.
@@ -474,7 +470,18 @@ def jcalc_tau(
         t_1 = 0.0 - wp.spatial_dot(S_s, body_f_s)
         t_2 = wp.clamp(t_2 + act + limit_f + damping_f, min_torque_limit, max_torque_limit)
 
-        tau[dof_start] = t_1 + t_2
+        # Dry (Coulomb) joint friction, smoothed to tanh(qd / v_s) so it stays
+        # differentiable, and applied OUTSIDE the actuator clamp because it is a
+        # passive gearbox loss. See integrator_moreau.jcalc_tau for the full
+        # rationale. This replaces the non-differentiable stick/slip branch that
+        # used to sit above, commented out, and left joint_static_friction dead.
+        # v_s == 0 disables it, which is bit-identical to that dead behaviour.
+        if joint_friction_vel_scale > 0.0:
+            tau[dof_start] = (
+                t_1 + t_2 - joint_static_friction * wp.tanh(qd / joint_friction_vel_scale)
+            )
+        else:
+            tau[dof_start] = t_1 + t_2
 
     # ball
     if type == 2:
@@ -760,6 +767,7 @@ def compute_link_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
+    joint_friction_vel_scale: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -808,6 +816,7 @@ def compute_link_tau(
         limit_k_d,
         static_friction,
         dynamic_friction,
+        joint_friction_vel_scale,
         max_torque,
         peak_torque,
         velocity_limit,
@@ -938,6 +947,7 @@ def eval_rigid_tau(
     joint_target_kd: wp.array(dtype=float),
     joint_static_friction: wp.array(dtype=float),
     joint_dynamic_friction: wp.array(dtype=float),
+    joint_friction_vel_scale: float,
     joint_limit_lower: wp.array(dtype=float),
     joint_limit_upper: wp.array(dtype=float),
     joint_limit_ke: wp.array(dtype=float),
@@ -978,6 +988,7 @@ def eval_rigid_tau(
             joint_target_kd,
             joint_static_friction,
             joint_dynamic_friction,
+            joint_friction_vel_scale,
             joint_limit_lower,
             joint_limit_upper,
             joint_limit_ke,
@@ -1425,6 +1436,7 @@ class SemiImplicitArticulationIntegrator:
                 model.joint_target_kd,
                 model.joint_static_friction,
                 model.joint_dynamic_friction,
+                model.joint_friction_vel_scale,
                 model.joint_limit_lower,
                 model.joint_limit_upper,
                 model.joint_limit_ke,

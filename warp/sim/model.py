@@ -596,6 +596,11 @@ class Model:
         self.joint_name = None
         self.joint_static_friction = None
         self.joint_dynamic_friction = None
+        # Stribeck velocity [rad/s] for the smooth-sign dry-friction model in
+        # `jcalc_tau`: tau_fric = -joint_static_friction * tanh(qd / this).
+        # 0.0 (the default) disables dry friction entirely and is bit-identical
+        # to the integrator before dry friction existed.
+        self.joint_friction_vel_scale = 0.0
 
         self.composite_rigid_body_alg = False
 
@@ -1168,6 +1173,9 @@ class ModelBuilder:
         self.joint_act = []
         self.joint_static_friction = []
         self.joint_dynamic_friction = []
+        # See Model.joint_friction_vel_scale. Carried on the builder so
+        # add_builder / finalize / finalize_bundle propagate it.
+        self.joint_friction_vel_scale = 0.0
 
         self.joint_twist_lower = []
         self.joint_twist_upper = []
@@ -1289,6 +1297,21 @@ class ModelBuilder:
             update_num_env_count: if True, the number of environments is incremented by 1.
             separate_collision_group: if True, the shapes from the articulation will all be put into a single new collision group, otherwise, only the shapes in collision group > -1 will be moved to a new group.
         """
+
+        # Scalar plant settings are per-builder, not per-element, so they are not
+        # part of the list copies below. Adopt the articulation's value (every
+        # articulation added to one builder shares one integrator, so they cannot
+        # differ); a builder that was already configured is left alone.
+        if getattr(articulation, "joint_friction_vel_scale", 0.0):
+            if not self.joint_friction_vel_scale:
+                self.joint_friction_vel_scale = articulation.joint_friction_vel_scale
+            elif self.joint_friction_vel_scale != articulation.joint_friction_vel_scale:
+                raise ValueError(
+                    "add_builder: joint_friction_vel_scale differs between builders "
+                    f"({self.joint_friction_vel_scale} vs "
+                    f"{articulation.joint_friction_vel_scale}); it is a single "
+                    "integrator-wide scalar and cannot vary per articulation."
+                )
 
         start_body_idx = self.body_count
         start_shape_idx = self.shape_count
@@ -3893,6 +3916,10 @@ class ModelBuilder:
 
         bundle_builder = ModelBuilder(up_vector=self.up_vector, gravity=self.gravity)
         bundle_builder.composite_rigid_body_alg = self.composite_rigid_body_alg
+        # Scalar plant settings are not part of `plain_attrs` (which are all
+        # per-element lists), so carry them across explicitly or the bundle
+        # samples silently run a different plant from the main model.
+        bundle_builder.joint_friction_vel_scale = self.joint_friction_vel_scale
         # Inherit ground plane parameters from the source builder
         if hasattr(self, '_ground_params'):
             bundle_builder._ground_params = copy.deepcopy(self._ground_params)
@@ -4182,6 +4209,7 @@ class ModelBuilder:
             m.joint_act = wp.array(self.joint_act, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_static_friction = wp.array(self.joint_static_friction, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_dynamic_friction = wp.array(self.joint_dynamic_friction, dtype=wp.float32, requires_grad=requires_grad)
+            m.joint_friction_vel_scale = float(self.joint_friction_vel_scale)
 
             m.joint_limit_lower = wp.array(self.joint_limit_lower, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_limit_upper = wp.array(self.joint_limit_upper, dtype=wp.float32, requires_grad=requires_grad)
