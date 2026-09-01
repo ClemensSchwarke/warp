@@ -438,6 +438,11 @@ class Model:
         joint_X_c (wp.array): Joint mass frame in child frame, shape [joint_count, 7], float
         joint_axis (wp.array): Joint axis in child frame, shape [joint_axis_count, 3], float
         joint_armature (wp.array): Armature for each joint, shape [joint_count], float
+        joint_armature_bwd (wp.array): Optional BACKWARD-ONLY armature, same shape/layout as
+            ``joint_armature``. When set, the moreau integrator re-factors the mass matrix with this
+            regulariser at the end of a differentiable substep, so the reverse pass solves against
+            ``H + diag(joint_armature_bwd)`` while the forward physics keeps ``H + diag(joint_armature)``.
+            ``None`` (the default) is a no-op.
         joint_target (wp.array): Joint target position/velocity (depending on joint axis mode), shape [joint_axis_count], float
         joint_target_ke (wp.array): Joint stiffness, shape [joint_axis_count], float
         joint_target_kd (wp.array): Joint damping, shape [joint_axis_count], float
@@ -575,6 +580,9 @@ class Model:
         self.joint_X_cm = None
         self.joint_axis = None
         self.joint_armature = None
+        # Optional backward-only armature (see the class docstring). Never set by
+        # ModelBuilder.finalize(); callers assign it post-finalize. None = disabled.
+        self.joint_armature_bwd = None
         self.joint_target = None
         self.joint_target_ke = None
         self.joint_target_kd = None

@@ -6664,6 +6664,16 @@ class MoreauIntegrator:
                 device=model.device,
             )
 
+        # Backward-only armature. Every forward solve of this substep has now
+        # consumed model.L, so re-factoring H with the (larger) backward
+        # armature here changes NOTHING in the forward while handing the
+        # reverse replay a better-conditioned factor. Gated on
+        # update_mass_matrix so L is only ever overwritten in a substep that
+        # built it from scratch -- a later substep sharing this L would
+        # otherwise pick the backward factor up in its forward.
+        if requires_grad and update_mass_matrix:
+            self.apply_backward_armature(model, active_mask, active_mask_num_envs)
+
         return state_out
 
     def _simulate_bundle(
@@ -7803,6 +7813,12 @@ class MoreauIntegrator:
             state_in.joint_q = rc_saved_state_in_q
             chain_in.joint_q = rc_saved_chain_in_q
 
+        # Backward-only armature for the NOMINAL rollout, which solves against
+        # model.H / model.L inline here (the perturbed branches go through
+        # simulate(bundle_model, ...), which applies it on bundle_model itself).
+        if requires_grad and update_mass_matrix:
+            self.apply_backward_armature(model)
+
         return state_out
 
     def eval_mass_matrix(self, model, state_mid, active_mask=None, active_mask_num_envs=0):
@@ -7884,6 +7900,17 @@ class MoreauIntegrator:
 
         # compute decomposition
         # kernel 18
+        #
+        # record_tape: warp's generated adjoint for this kernel replays the
+        # forward `dense_chol_batched` before calling the (no-op) adjoint, so
+        # taping it makes the reverse pass REWRITE model.L with the forward
+        # armature. That is harmless normally -- this kernel is recorded first
+        # in the substep, so its adjoint runs last, after every solve adjoint
+        # has read L -- but it would silently undo apply_backward_armature for
+        # anything ordered after it. With a backward armature in play we drop
+        # it from the tape instead; it contributes nothing else, since
+        # adj_dense_chol_batched touches neither adj_A nor adj_regularization
+        # (the gradient of the solve flows through eval_dense_solve's adjoint).
         wp.launch(
             kernel=eval_dense_cholesky_batched,
             dim=model.articulation_count,
@@ -7892,6 +7919,45 @@ class MoreauIntegrator:
                     active_mask_num_envs],
             outputs=[model.L],
             device=model.device,
+            record_tape=getattr(model, "joint_armature_bwd", None) is None,
+        )
+
+    @staticmethod
+    def apply_backward_armature(model, active_mask=None, active_mask_num_envs=0):
+        """Swap the Cholesky factor over to the BACKWARD-only armature, in place.
+
+        The moreau reverse pass never re-factors the mass matrix: ``dense_chol``
+        has a no-op adjoint and every ``eval_dense_solve``'s adjoint reuses the
+        ``L`` the forward left behind (``adj_b += (L L^T)^-1 adj_x`` and
+        ``adj_A += -tmp x^T``). So the ONLY thing that decides which armature the
+        gradient is computed with is the content of ``model.L`` at the moment
+        ``tape.backward()`` runs.
+
+        This re-runs the batched Cholesky with ``model.joint_armature_bwd`` as
+        the diagonal regulariser and overwrites ``model.L``. Called at the very
+        END of a differentiable substep, after every forward solve has already
+        consumed the forward factor, it leaves the forward physics bit-identical
+        while the reverse pass solves against ``H + diag(joint_armature_bwd)``.
+        Small armature makes ``H`` nearly singular and blows the adjoint up; a
+        larger backward-only armature damps that without touching the plant.
+
+        No-op unless ``model.joint_armature_bwd`` is set (an array with exactly
+        the same per-articulation/per-DOF layout as ``model.joint_armature``).
+        The launch is NOT recorded on the tape: it must not appear in the reverse
+        replay, it only has to have run by the time the replay starts.
+        """
+        armature_bwd = getattr(model, "joint_armature_bwd", None)
+        if armature_bwd is None:
+            return
+        wp.launch(
+            kernel=eval_dense_cholesky_batched,
+            dim=model.articulation_count,
+            inputs=[model.articulation_H_start, model.articulation_H_rows,
+                    model.H, armature_bwd, active_mask,
+                    active_mask_num_envs],
+            outputs=[model.L],
+            device=model.device,
+            record_tape=False,
         )
 
     def _ensure_contact_bins(self, model):
