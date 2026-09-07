@@ -4462,6 +4462,25 @@ class MoreauIntegrator:
         # an A/B correctness and performance escape hatch.
         self._bundle_active_masking = True
 
+        # --- Sample-efficiency accounting (see code/utils/step_counting.py) ---
+        # MONOTONIC host-side counts of the integrator advances this bundle
+        # path performs, so a training run can plot its learning curves against
+        # simulation steps instead of iterations. Never reset here: consumers
+        # take deltas, so several of them can read the same counters.
+        #   _bundle_main_substeps_total   env-substeps of the NOMINAL pipeline
+        #                                 (Phase A runs on the full batch)
+        #   _bundle_branch_substeps_total articulation-substeps of the inner
+        #                                 branch rollout (samples included)
+        #   _bundle_active_substeps_total env-substeps with a window OPEN
+        #   _bundle_open_substeps_total   env-substeps that OPENED a window
+        # Set _bundle_count_paused around a checkpointed backward's recompute:
+        # that re-runs a forward the rollout already counted.
+        self._bundle_count_paused = False
+        self._bundle_main_substeps_total = 0
+        self._bundle_branch_substeps_total = 0
+        self._bundle_active_substeps_total = 0
+        self._bundle_open_substeps_total = 0
+
         # Per-env contact binning. True (default) -> contact kernels iterate the
         # compact per-env bucket built by bin_contacts_by_env (fast). False ->
         # the pre-binning behavior: each articulation scans the full contact
@@ -7217,10 +7236,31 @@ class MoreauIntegrator:
 
         # Contact-trigger diagnostic (how many envs opened a bundle window) —
         # the count comes from the fused flags readback above.
-        self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
-        self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
-        self._bundle_active_count_total = getattr(self, "_bundle_active_count_total", 0) + _active_count
-        self._bundle_active_env_substeps = getattr(self, "_bundle_active_env_substeps", 0) + num_envs
+        #
+        # Skipped while _bundle_count_paused: a checkpointed backward re-runs
+        # this forward to rebuild the tape, and that recompute is not new
+        # simulation. (Rates read off these pairs were already immune — both
+        # halves doubled — but the absolute step counts below are not.)
+        if not self._bundle_count_paused:
+            self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
+            self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
+            self._bundle_active_count_total = getattr(self, "_bundle_active_count_total", 0) + _active_count
+            self._bundle_active_env_substeps = getattr(self, "_bundle_active_env_substeps", 0) + num_envs
+
+            # Sample-efficiency accounting. Phase A always advances every env
+            # once; the inner rollout below advances num_bundle_samples
+            # branches for each env that has a window open — and is skipped
+            # wholesale when none has (`if any_active`). Without
+            # _bundle_active_masking the inner pipeline runs the full
+            # sample-major batch instead of just the open envs, so the branch
+            # cost is the full num_envs * num_bundle_samples whenever it runs.
+            self._bundle_main_substeps_total += num_envs
+            self._bundle_active_substeps_total += _active_count
+            self._bundle_open_substeps_total += _trig_count
+            if _active_count > 0:
+                branch_envs = _active_count if self._bundle_active_masking else num_envs
+                self._bundle_branch_substeps_total += branch_envs * num_bundle_samples
+
         any_triggered = _trig_count > 0
         if any_triggered:
             # 1) Initialize perturbed branches into init_state (fresh
@@ -7901,16 +7941,18 @@ class MoreauIntegrator:
         # compute decomposition
         # kernel 18
         #
-        # record_tape: warp's generated adjoint for this kernel replays the
-        # forward `dense_chol_batched` before calling the (no-op) adjoint, so
-        # taping it makes the reverse pass REWRITE model.L with the forward
-        # armature. That is harmless normally -- this kernel is recorded first
-        # in the substep, so its adjoint runs last, after every solve adjoint
-        # has read L -- but it would silently undo apply_backward_armature for
-        # anything ordered after it. With a backward armature in play we drop
-        # it from the tape instead; it contributes nothing else, since
-        # adj_dense_chol_batched touches neither adj_A nor adj_regularization
-        # (the gradient of the solve flows through eval_dense_solve's adjoint).
+        # NEVER recorded on the tape. adj_dense_chol_batched touches neither
+        # adj_A nor adj_regularization -- the gradient of the linear solve flows
+        # entirely through eval_dense_solve's adjoint, which reuses the L this
+        # forward leaves behind -- so the tape entry contributes nothing to any
+        # gradient. What it does cost is real: warp's generated backward replays
+        # the forward `dense_chol_batched` before calling that no-op adjoint, so
+        # every taped substep pays a second full batched Cholesky in the reverse
+        # pass (~1.2 ms per substep at 128 envs, the third-largest kernel in the
+        # backward) purely to rewrite model.L with values it already holds.
+        # Dropping it is gradient-identical and, as a bonus, removes the replay
+        # that would otherwise undo apply_backward_armature for anything ordered
+        # after it (which is why the backward-armature path already skipped it).
         wp.launch(
             kernel=eval_dense_cholesky_batched,
             dim=model.articulation_count,
@@ -7919,7 +7961,7 @@ class MoreauIntegrator:
                     active_mask_num_envs],
             outputs=[model.L],
             device=model.device,
-            record_tape=getattr(model, "joint_armature_bwd", None) is None,
+            record_tape=False,
         )
 
     @staticmethod

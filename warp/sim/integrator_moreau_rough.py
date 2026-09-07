@@ -5000,6 +5000,19 @@ class MoreauRoughIntegrator(Integrator):
         self._bundle_perturbation_clamp_q = 0.1
         self._bundle_perturbation_clamp_qd = 0.5
 
+        # --- Sample-efficiency accounting (see code/utils/step_counting.py) ---
+        # MONOTONIC host-side counts of the integrator advances this bundle
+        # path performs. Never reset here: consumers take deltas. Unlike the
+        # flat moreau bundle, this path has no per-env active masking, so an
+        # inner rollout costs the full sample-major batch whenever any env has
+        # a window open. Set _bundle_count_paused around a checkpointed
+        # backward's recompute (it re-runs an already-counted forward).
+        self._bundle_count_paused = False
+        self._bundle_main_substeps_total = 0
+        self._bundle_branch_substeps_total = 0
+        self._bundle_active_substeps_total = 0
+        self._bundle_open_substeps_total = 0
+
         self.compute_articulation_indices(model)
         self.allocate_model_aux_vars(model)
 
@@ -6433,8 +6446,6 @@ class MoreauRoughIntegrator(Integrator):
         # diagnostic (how many envs opened a bundle window). Off-tape, no extra
         # device sync vs the original .any() check.
         _trig_count = int(wp.to_torch(bundle_trigger).sum().item())
-        self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
-        self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
         any_triggered = _trig_count > 0
         if any_triggered:
             self._init_bundle_branches(
@@ -6499,7 +6510,25 @@ class MoreauRoughIntegrator(Integrator):
             record_tape=False,
         )
 
-        any_active = bool(wp.to_torch(bundle_active).any().item())
+        # Sum, not any(): the same single sync also yields the number of envs
+        # with a window open, which the accounting block below needs.
+        _active_count = int(wp.to_torch(bundle_active).sum().item())
+        any_active = _active_count > 0
+
+        # Contact-trigger diagnostic + sample-efficiency accounting. Skipped
+        # while _bundle_count_paused: a checkpointed backward re-runs this
+        # forward to rebuild the tape, and that recompute is not new
+        # simulation. This path does no per-env masking, so when the inner
+        # rollout runs at all it advances the full sample-major batch.
+        if not self._bundle_count_paused:
+            self._bundle_trigger_count_total = getattr(self, "_bundle_trigger_count_total", 0) + _trig_count
+            self._bundle_trigger_env_substeps = getattr(self, "_bundle_trigger_env_substeps", 0) + num_envs
+            self._bundle_main_substeps_total += num_envs
+            self._bundle_active_substeps_total += _active_count
+            self._bundle_open_substeps_total += _trig_count
+            if any_active:
+                self._bundle_branch_substeps_total += num_envs * num_bundle_samples
+
         b_in = None
         if any_active:
             # b_in is the inner state_in (joint_q/qd only) -> lite.
